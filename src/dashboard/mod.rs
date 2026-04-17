@@ -4,7 +4,7 @@
 //! scaffolds share [`api`] — a set of framework-agnostic async functions
 //! that take an `Arc<dyn Backend>` and return JSON-serializable values. The
 //! framework-specific modules are thin adapters that plug those functions
-//! into [`axum::Router`] or [`actix_web::Scope`].
+//! into `axum::Router` or `actix_web::Scope`.
 //!
 //! The bundled UI is a single static HTML page (no build step) served at
 //! `/`. Production deployments will typically override the UI path or wire
@@ -31,8 +31,11 @@ use std::sync::Arc;
 use crate::backend::Backend;
 
 /// Shared state passed to dashboard endpoints.
+///
+/// Cheap to clone; holds an `Arc<dyn Backend>`.
 #[derive(Clone)]
 pub struct DashboardState {
+    /// The backend used for every endpoint.
     pub backend: Arc<dyn Backend>,
 }
 
@@ -43,6 +46,8 @@ impl std::fmt::Debug for DashboardState {
 }
 
 impl DashboardState {
+    /// Construct the state. Typically you'll call this implicitly through
+    /// `axum_router` or `actix_scope`.
     pub fn new(backend: Arc<dyn Backend>) -> Self {
         Self { backend }
     }

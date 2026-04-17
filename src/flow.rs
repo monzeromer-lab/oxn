@@ -25,10 +25,15 @@ use crate::options::JobOptions;
 /// parent unless they override.
 #[derive(Debug, Clone)]
 pub struct FlowNode {
+    /// Name of the queue this node is submitted to.
     pub queue: String,
+    /// Logical name of the job.
     pub name: String,
+    /// JSON-encoded payload.
     pub data: Value,
+    /// Job-level options (priority, delay, attempts, etc.).
     pub opts: JobOptions,
+    /// Children whose completion this node depends on.
     pub children: Vec<FlowNode>,
 }
 
@@ -67,6 +72,9 @@ pub struct FlowProducer {
 }
 
 impl FlowProducer {
+    /// Construct a producer around an existing backend. You can obtain the
+    /// backend from any [`Queue`](crate::Queue) via
+    /// [`Queue::backend`](crate::Queue::backend).
     pub fn new(backend: Arc<dyn Backend>) -> Self {
         Self { backend }
     }

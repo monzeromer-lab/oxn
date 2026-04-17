@@ -51,12 +51,30 @@ impl<D> Queue<D>
 where
     D: Serialize + DeserializeOwned + Send + Sync + 'static,
 {
-    /// Start a builder.
+    /// Start building a queue.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use oxn::Queue;
+    /// # use serde::{Deserialize, Serialize};
+    /// # #[derive(Clone, Serialize, Deserialize)]
+    /// # struct Email;
+    /// # async fn demo() -> oxn::Result<()> {
+    /// let q: Queue<Email> = Queue::builder("emails")
+    ///     .redis("redis://127.0.0.1:6379")
+    ///     .build()
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
     pub fn builder(name: impl Into<String>) -> QueueBuilder<D> {
         QueueBuilder::new(name.into())
     }
 
     /// Construct from an already-built backend.
+    ///
+    /// Use this when you want to share a single backend (and its pool)
+    /// across multiple queues, or when plugging in a custom backend.
     pub fn from_backend(
         name: impl Into<String>,
         backend: Arc<dyn Backend>,
@@ -70,17 +88,43 @@ where
         }
     }
 
-    /// Queue name.
+    /// Name the queue was constructed with.
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// Shared backend handle.
+    /// Shared backend handle. Clone this to build additional queues (of
+    /// possibly different types) against the same connection pool.
     pub fn backend(&self) -> Arc<dyn Backend> {
         self.backend.clone()
     }
 
     /// Submit a job.
+    ///
+    /// Returns the assigned [`JobId`]. If the job was deduplicated against
+    /// an existing id (see [`JobOptions::deduplicate`]), the existing id is
+    /// returned instead.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # use oxn::{Queue, JobOptions};
+    /// # use serde::{Deserialize, Serialize};
+    /// # #[derive(Clone, Serialize, Deserialize)]
+    /// # struct Email { to: String }
+    /// # async fn demo(q: Queue<Email>) -> oxn::Result<()> {
+    /// let id = q
+    ///     .add(
+    ///         Email { to: "alice@example.com".into() },
+    ///         JobOptions::new()
+    ///             .attempts(3)
+    ///             .delay(Duration::from_secs(2)),
+    ///     )
+    ///     .await?;
+    /// println!("queued job {id}");
+    /// # Ok(()) }
+    /// ```
     pub async fn add(&self, data: D, opts: JobOptions) -> Result<JobId> {
         let opts = merge_opts(&self.opts.default_job_options, opts);
         let insert = JobInsert {
@@ -95,7 +139,24 @@ where
         self.backend.add(&self.name, insert).await
     }
 
-    /// Bulk submission. For the Redis backend this is pipelined.
+    /// Bulk submission. For the Redis backend this is pipelined when the
+    /// backend provides a pipelined override; otherwise it falls back to
+    /// sequential `add`s.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use oxn::{Queue, JobOptions};
+    /// # use serde::{Deserialize, Serialize};
+    /// # #[derive(Clone, Serialize, Deserialize)]
+    /// # struct Task(u32);
+    /// # async fn demo(q: Queue<Task>) -> oxn::Result<()> {
+    /// let ids = q
+    ///     .add_bulk((0..100).map(|i| (Task(i), JobOptions::new())).collect())
+    ///     .await?;
+    /// assert_eq!(ids.len(), 100);
+    /// # Ok(()) }
+    /// ```
     pub async fn add_bulk(&self, jobs: Vec<(D, JobOptions)>) -> Result<Vec<JobId>> {
         let inserts = jobs
             .into_iter()
@@ -273,12 +334,14 @@ where
         }
     }
 
+    /// Override all [`QueueOptions`] at once.
     #[must_use]
     pub fn options(mut self, opts: QueueOptions) -> Self {
         self.opts = opts;
         self
     }
 
+    /// Set the Redis key prefix (default `"oxn"`).
     #[must_use]
     pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
         self.opts.prefix = prefix.into();

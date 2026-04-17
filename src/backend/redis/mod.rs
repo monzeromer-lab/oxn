@@ -1,8 +1,9 @@
 //! Redis backend.
 //!
-//! Uses [`redis-rs`](https://docs.rs/redis) via [`deadpool-redis`] for a
-//! pooled async client, plus a dedicated connection for blocking reads (so
-//! `BZPOPMIN` cannot starve the pool). All state transitions are Lua scripts
+//! Uses [`redis-rs`](https://docs.rs/redis) via
+//! [`deadpool-redis`](https://docs.rs/deadpool-redis) for a pooled async
+//! client, plus a dedicated connection for blocking reads (so `BZPOPMIN`
+//! cannot starve the pool). All state transitions are Lua scripts
 //! registered once (content-addressed via `EVALSHA`).
 
 mod keys;
@@ -31,15 +32,22 @@ use crate::options::{JobOptions, Removal};
 /// Construction config for [`RedisBackend`].
 #[derive(Debug, Clone)]
 pub struct RedisConfig {
+    /// Redis connection URL, e.g. `redis://127.0.0.1:6379/0` or
+    /// `rediss://host:6380` for TLS.
     pub url: String,
+    /// Key prefix applied to every Redis key. Default: `"oxn"`.
     pub prefix: String,
     /// Max pool size for non-blocking ops. Blocking fetches use a separate
     /// dedicated connection.
     pub pool_size: usize,
+    /// Cap on the events Redis Stream length. Stream is trimmed on
+    /// every XADD.
     pub max_stream_length: usize,
 }
 
 impl RedisConfig {
+    /// Build a config with sane defaults (prefix `"oxn"`, pool 16,
+    /// max stream 10_000).
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
@@ -49,18 +57,21 @@ impl RedisConfig {
         }
     }
 
+    /// Override the Redis key prefix.
     #[must_use]
     pub fn prefix(mut self, p: impl Into<String>) -> Self {
         self.prefix = p.into();
         self
     }
 
+    /// Override the connection pool size (floored at 1).
     #[must_use]
     pub fn pool_size(mut self, n: usize) -> Self {
         self.pool_size = n.max(1);
         self
     }
 
+    /// Override the events stream length cap.
     #[must_use]
     pub fn max_stream_length(mut self, n: usize) -> Self {
         self.max_stream_length = n;

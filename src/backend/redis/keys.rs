@@ -6,6 +6,22 @@
 //! builder is typed so nothing in Rust-land concatenates strings by hand.
 
 /// Helper for computing queue- and job-scoped Redis keys.
+///
+/// Most users don't need to touch this directly — it's exposed for anyone
+/// writing custom Lua scripts, a sibling Backend, or tooling that reads
+/// the Redis layout. Each method returns an owned `String` so it can be
+/// handed straight to `redis::cmd(...).arg(...)`.
+///
+/// # Examples
+///
+/// ```
+/// use oxn::backend::redis::KeyBuilder;
+///
+/// let k = KeyBuilder::new("oxn", "emails");
+/// assert_eq!(k.wait(),       "oxn:emails:wait");
+/// assert_eq!(k.job_hash("42"), "oxn:emails:42");
+/// assert_eq!(k.job_lock("42"), "oxn:emails:42:lock");
+/// ```
 #[derive(Debug, Clone)]
 pub struct KeyBuilder {
     prefix: String,
@@ -13,6 +29,7 @@ pub struct KeyBuilder {
 }
 
 impl KeyBuilder {
+    /// Build a new key helper for `{prefix}:{queue}`.
     pub fn new(prefix: &str, queue: &str) -> Self {
         Self {
             prefix: prefix.to_string(),
@@ -24,102 +41,128 @@ impl KeyBuilder {
         format!("{}:{}:{}", self.prefix, self.queue, suffix)
     }
 
+    /// The prefix passed to [`Self::new`].
     pub fn prefix(&self) -> &str {
         &self.prefix
     }
 
+    /// The queue name passed to [`Self::new`].
     pub fn queue(&self) -> &str {
         &self.queue
     }
 
+    /// `{prefix}:{queue}:wait` — FIFO list of ready job ids.
     pub fn wait(&self) -> String {
         self.q("wait")
     }
 
+    /// `{prefix}:{queue}:paused` — where `wait` is renamed to during pauses.
     pub fn paused(&self) -> String {
         self.q("paused")
     }
 
+    /// `{prefix}:{queue}:active` — list of jobs currently being processed.
     pub fn active(&self) -> String {
         self.q("active")
     }
 
+    /// `{prefix}:{queue}:delayed` — zset of future jobs, score = epoch-ms.
     pub fn delayed(&self) -> String {
         self.q("delayed")
     }
 
+    /// `{prefix}:{queue}:prioritized` — zset of prioritized jobs.
     pub fn prioritized(&self) -> String {
         self.q("prioritized")
     }
 
+    /// `{prefix}:{queue}:waiting-children` — parents blocked on children.
     pub fn waiting_children(&self) -> String {
         self.q("waiting-children")
     }
 
+    /// `{prefix}:{queue}:completed` — zset of completed jobs.
     pub fn completed(&self) -> String {
         self.q("completed")
     }
 
+    /// `{prefix}:{queue}:failed` — zset of permanently-failed jobs.
     pub fn failed(&self) -> String {
         self.q("failed")
     }
 
+    /// `{prefix}:{queue}:stalled` — set of recently-stalled jobs.
     pub fn stalled(&self) -> String {
         self.q("stalled")
     }
 
+    /// `{prefix}:{queue}:stalled-check` — rate-limit flag for the scanner.
     pub fn stalled_check(&self) -> String {
         self.q("stalled-check")
     }
 
+    /// `{prefix}:{queue}:meta` — hash of queue-wide config.
     pub fn meta(&self) -> String {
         self.q("meta")
     }
 
+    /// `{prefix}:{queue}:events` — Redis Stream of lifecycle events.
     pub fn events(&self) -> String {
         self.q("events")
     }
 
+    /// `{prefix}:{queue}:marker` — wake-up key for `BZPOPMIN` blocking.
     pub fn marker(&self) -> String {
         self.q("marker")
     }
 
+    /// `{prefix}:{queue}:id` — monotonically-increasing job id counter.
     pub fn id_counter(&self) -> String {
         self.q("id")
     }
 
+    /// `{prefix}:{queue}:pc` — counter breaking priority ties.
     pub fn priority_counter(&self) -> String {
         self.q("pc")
     }
 
+    /// `{prefix}:{queue}:limiter` — global token bucket.
     pub fn limiter(&self) -> String {
         self.q("limiter")
     }
 
+    /// `{prefix}:{queue}:de:{id}` — deduplication pointer.
     pub fn dedup(&self, id: &str) -> String {
         self.q(&format!("de:{id}"))
     }
 
+    /// `{prefix}:{queue}:{id}` — job record hash.
     pub fn job_hash(&self, id: &str) -> String {
         self.q(id)
     }
 
+    /// `{prefix}:{queue}:` — base prefix used by Lua scripts to form job
+    /// hashes from the id (`prefix .. id`).
     pub fn job_hash_prefix(&self) -> String {
         format!("{}:{}:", self.prefix, self.queue)
     }
 
+    /// `{prefix}:{queue}:{id}:lock` — lock token string, TTL `lockDuration`.
     pub fn job_lock(&self, id: &str) -> String {
         self.q(&format!("{id}:lock"))
     }
 
+    /// `{prefix}:{queue}:{id}:logs` — list of user-emitted log lines.
     pub fn job_logs(&self, id: &str) -> String {
         self.q(&format!("{id}:logs"))
     }
 
+    /// `{prefix}:{queue}:{id}:dependencies` — set of pending child job keys.
     pub fn job_deps(&self, id: &str) -> String {
         self.q(&format!("{id}:dependencies"))
     }
 
+    /// `{prefix}:{queue}:{id}:processed` — hash of child-key → returnvalue.
     pub fn job_processed(&self, id: &str) -> String {
         self.q(&format!("{id}:processed"))
     }

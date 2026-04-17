@@ -92,6 +92,7 @@ where
         }
     }
 
+    /// Override the default [`JobOptions`] used when enqueueing each tick.
     #[must_use]
     pub fn with_options(mut self, opts: JobOptions) -> Self {
         self.opts = opts;

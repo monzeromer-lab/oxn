@@ -66,7 +66,30 @@ where
     D: Serialize + DeserializeOwned + Send + Sync + 'static,
     R: Serialize + Send + 'static,
 {
-    /// Start a builder bound to `queue`.
+    /// Start a worker builder bound to `queue` with the given async handler.
+    ///
+    /// The handler is any `Fn(Job<D>) -> Future<Output = Result<R, Error>>`;
+    /// it will be called once per fetched job, concurrently up to
+    /// [`WorkerOptions::concurrency`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use oxn::{Queue, Worker, Job, Error};
+    /// # use serde::{Deserialize, Serialize};
+    /// # #[derive(Clone, Serialize, Deserialize)]
+    /// # struct Email { to: String }
+    /// # async fn demo(queue: Queue<Email>) -> oxn::Result<()> {
+    /// let worker = Worker::builder(queue, |job: Job<Email>| async move {
+    ///     println!("to: {}", job.data.to);
+    ///     Ok::<_, Error>(())
+    /// })
+    /// .concurrency(8)
+    /// .build();
+    ///
+    /// worker.run().await
+    /// # }
+    /// ```
     pub fn builder<F, Fut>(queue: Queue<D>, handler: F) -> WorkerBuilder<D, R>
     where
         F: Fn(Job<D>) -> Fut + Send + Sync + 'static,
@@ -86,7 +109,33 @@ where
         self.cancel.clone()
     }
 
-    /// Drive the worker until the cancellation token fires.
+    /// Drive the worker until its [`CancellationToken`] fires.
+    ///
+    /// This future completes once the cancel token has been triggered **and**
+    /// in-flight jobs have either finished or exceeded
+    /// [`WorkerOptions::shutdown_timeout`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use oxn::{Queue, Worker, Job, Error};
+    /// # use serde::{Deserialize, Serialize};
+    /// # #[derive(Clone, Serialize, Deserialize)]
+    /// # struct Task;
+    /// # async fn demo(queue: Queue<Task>) -> oxn::Result<()> {
+    /// let worker = Worker::builder(queue, |_: Job<Task>| async { Ok::<_, Error>(()) })
+    ///     .concurrency(4)
+    ///     .build();
+    ///
+    /// let cancel = worker.cancellation_token();
+    /// tokio::spawn(async move {
+    ///     tokio::signal::ctrl_c().await.ok();
+    ///     cancel.cancel();
+    /// });
+    ///
+    /// worker.run().await
+    /// # }
+    /// ```
     pub async fn run(self) -> Result<()> {
         let Self {
             id,
@@ -341,66 +390,83 @@ where
         }
     }
 
+    /// Replace the full [`WorkerOptions`] bag.
     #[must_use]
     pub fn options(mut self, opts: WorkerOptions) -> Self {
         self.opts = opts;
         self
     }
 
+    /// Maximum concurrent in-flight jobs. Floored at 1.
     #[must_use]
     pub fn concurrency(mut self, n: usize) -> Self {
         self.opts.concurrency = n.max(1);
         self
     }
 
+    /// How long each job's lock is valid. Must exceed
+    /// [`Self::lock_renew_interval`].
     #[must_use]
     pub fn lock_duration(mut self, d: Duration) -> Self {
         self.opts.lock_duration = d;
         self
     }
 
+    /// How often the worker renews in-flight job locks. Typically half of
+    /// [`Self::lock_duration`].
     #[must_use]
     pub fn lock_renew_interval(mut self, d: Duration) -> Self {
         self.opts.lock_renew_interval = d;
         self
     }
 
+    /// Cadence of the stalled-job scanner.
     #[must_use]
     pub fn stalled_interval(mut self, d: Duration) -> Self {
         self.opts.stalled_interval = d;
         self
     }
 
+    /// Maximum time a blocking fetch waits before it loops back to try
+    /// another non-blocking attempt. Lower values poll more often; higher
+    /// values reduce Redis chatter.
     #[must_use]
     pub fn drain_delay(mut self, d: Duration) -> Self {
         self.opts.drain_delay = d;
         self
     }
 
+    /// How many times a job may stall before it's force-failed.
     #[must_use]
     pub fn max_stalled(mut self, n: u32) -> Self {
         self.opts.max_stalled = n;
         self
     }
 
+    /// Disable the scanner if another process handles housekeeping.
     #[must_use]
     pub fn run_stalled_scanner(mut self, yes: bool) -> Self {
         self.opts.run_stalled_scanner = yes;
         self
     }
 
+    /// Apply a rate limit of at most `max` jobs per `per` window.
     #[must_use]
     pub fn rate_limit(mut self, max: u32, per: Duration) -> Self {
         self.opts.rate_limit = Some(crate::options::RateLimit { max, per });
         self
     }
 
+    /// How long [`Worker::run`] waits for in-flight jobs to drain after
+    /// cancellation before returning.
     #[must_use]
     pub fn shutdown_timeout(mut self, d: Duration) -> Self {
         self.opts.shutdown_timeout = d;
         self
     }
 
+    /// Inject an existing [`CancellationToken`] so multiple workers can
+    /// share a shutdown signal.
     #[must_use]
     pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);

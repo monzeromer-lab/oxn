@@ -2,8 +2,9 @@
 //!
 //! The [`Backend`] trait is the pluggable point: every operation the queue,
 //! worker, events subsystem and dashboard need goes through it. A
-//! [`RedisBackend`](redis::RedisBackend) ships out of the box, and the trait
-//! is object-safe so downstream crates can slot in alternative stores
+//! A `RedisBackend` (under `backend::redis`, enabled by the
+//! `redis-backend` feature) ships out of the box, and the trait is
+//! object-safe so downstream crates can slot in alternative stores
 //! (in-memory, SQL) without a source change.
 //!
 //! The trait speaks in **erased** job payloads (`data` is a raw JSON string).
@@ -28,58 +29,94 @@ use crate::options::JobOptions;
 pub mod redis;
 
 /// Erased job record as it's exchanged with the backend.
+///
+/// `Queue<D>` converts this into a typed [`Job<D>`](crate::Job) on the way
+/// out. Implementations of [`Backend`] construct these directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawJob {
+    /// Job id.
     pub id: JobId,
+    /// Job's logical name.
     pub name: String,
     /// JSON-encoded payload.
     pub data: String,
+    /// Options originally used to submit the job.
     pub opts: JobOptions,
+    /// Epoch-ms of the initial enqueue.
     pub timestamp_ms: i64,
+    /// Epoch-ms of the most recent `move_to_active`, if any.
     pub processed_on_ms: Option<i64>,
+    /// Epoch-ms of completion or terminal failure, if finished.
     pub finished_on_ms: Option<i64>,
+    /// Attempts already made (1-based after the first fetch).
     pub attempts_made: u32,
+    /// Most recent failure reason.
     pub failed_reason: Option<String>,
+    /// Stack trace strings, oldest first (user-appended).
     pub stacktrace: Vec<String>,
     /// JSON-encoded progress value.
     pub progress_json: Option<String>,
     /// JSON-encoded return value.
     pub return_value_json: Option<String>,
+    /// Current lock token, if held.
     pub lock_token: Option<String>,
+    /// Resolved state, when the backend knows it (e.g. on `get`).
     pub state: Option<JobState>,
 }
 
 /// Input for a new job submission.
+///
+/// Constructed by [`Queue::add`](crate::Queue::add) and friends before
+/// handing off to a [`Backend`] implementation.
 #[derive(Debug, Clone)]
 pub struct JobInsert {
+    /// Job name used for named-handler routing.
     pub name: String,
     /// JSON-encoded payload.
     pub data: String,
+    /// Options (priority, delay, attempts, …).
     pub opts: JobOptions,
+    /// Epoch-ms at submission.
     pub timestamp_ms: i64,
 }
 
 /// A fetched job plus the lock token that authorizes operations on it.
+///
+/// The worker must pass `token` to subsequent `complete`/`fail`/`extend_lock`
+/// calls — tokens are the only authorization on a job's state transitions.
 #[derive(Debug, Clone)]
 pub struct Fetched {
+    /// The job record as it lives in storage.
     pub job: RawJob,
+    /// Lock token this fetch acquired.
     pub token: String,
 }
 
 /// Counts of jobs per state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StateCounts {
+    /// Jobs in the `wait` list.
     pub waiting: u64,
+    /// Jobs in the `paused` list.
     pub paused: u64,
+    /// Jobs currently held in `active` by a worker.
     pub active: u64,
+    /// Jobs scheduled for a future timestamp.
     pub delayed: u64,
+    /// Jobs in the prioritized zset.
     pub prioritized: u64,
+    /// Parent jobs blocked on pending child dependencies.
     pub waiting_children: u64,
+    /// Completed jobs retained per `Removal` policy.
     pub completed: u64,
+    /// Permanently-failed jobs retained per `Removal` policy.
     pub failed: u64,
 }
 
 /// A half-open range into one of the job state lists/zsets.
+///
+/// Follows Redis `LRANGE`/`ZRANGE` semantics: `start` and `end` are
+/// inclusive, and `-1` means "the last element".
 #[derive(Debug, Clone, Copy)]
 pub struct JobRange {
     /// Zero-based start index (inclusive).
@@ -91,6 +128,7 @@ pub struct JobRange {
 }
 
 impl JobRange {
+    /// First `n` entries, oldest-first.
     pub const fn first(n: i64) -> Self {
         Self {
             start: 0,
@@ -98,6 +136,7 @@ impl JobRange {
             descending: false,
         }
     }
+    /// Last `n` entries, newest-first.
     pub const fn last(n: i64) -> Self {
         Self {
             start: 0,

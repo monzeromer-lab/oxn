@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::job::Backoff;
 
 /// Construction-time options for a [`Queue`](crate::Queue).
+///
+/// Start with [`QueueOptions::default`] and chain the `with_*` methods,
+/// or use [`crate::queue::QueueBuilder::options`] to pass an existing bag.
 #[derive(Debug, Clone)]
 pub struct QueueOptions {
     /// Redis key prefix. BullMQ defaults to `"bull"`; we default to `"oxn"`.
@@ -100,13 +103,22 @@ impl Default for JobOptions {
 }
 
 impl JobOptions {
-    /// Named constructor.
+    /// Equivalent to [`Self::default`]. Useful for chainable construction:
+    ///
+    /// ```
+    /// use oxn::JobOptions;
+    /// let opts = JobOptions::new().attempts(5);
+    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Assign an explicit id.
+    /// Assign an explicit id. If omitted, the backend auto-increments one.
+    ///
+    /// Explicit ids are useful for idempotent producers — adding the same
+    /// id twice without [`Self::deduplicate`] still overwrites the job
+    /// hash, so prefer deduplication when collisions are possible.
     #[must_use]
     pub fn id(mut self, id: impl Into<String>) -> Self {
         self.id = Some(id.into());
@@ -178,6 +190,8 @@ impl JobOptions {
 }
 
 /// Deduplication configuration.
+///
+/// Attached to a [`JobOptions`] via [`JobOptions::deduplicate`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dedup {
     /// Dedup key — multiple submissions with the same id collapse to one.
@@ -187,6 +201,9 @@ pub struct Dedup {
 }
 
 /// Retention policy for finished jobs.
+///
+/// Applied after completion or terminal failure via
+/// [`JobOptions::remove_on_complete`] / [`JobOptions::remove_on_fail`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Removal {
     /// Keep the job hash indefinitely.
@@ -200,6 +217,10 @@ pub enum Removal {
 }
 
 /// Construction-time options for a [`Worker`](crate::Worker).
+///
+/// Most users start with [`WorkerOptions::default`] and tune only
+/// `concurrency` + `lock_duration`. See the individual field docs for the
+/// full knob list.
 #[derive(Debug, Clone)]
 pub struct WorkerOptions {
     /// Max concurrent in-flight jobs for this worker.
@@ -240,59 +261,69 @@ impl Default for WorkerOptions {
 }
 
 impl WorkerOptions {
+    /// Equivalent to [`Self::default`]; chainable.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Set concurrency (floored at 1).
     #[must_use]
     pub fn concurrency(mut self, n: usize) -> Self {
         self.concurrency = n.max(1);
         self
     }
 
+    /// Set the lock duration.
     #[must_use]
     pub fn lock_duration(mut self, d: Duration) -> Self {
         self.lock_duration = d;
         self
     }
 
+    /// Set the lock renewal interval (half of `lock_duration` is typical).
     #[must_use]
     pub fn lock_renew_interval(mut self, d: Duration) -> Self {
         self.lock_renew_interval = d;
         self
     }
 
+    /// Set the stalled-scanner cadence.
     #[must_use]
     pub fn stalled_interval(mut self, d: Duration) -> Self {
         self.stalled_interval = d;
         self
     }
 
+    /// Set the max stall count before a job is force-failed.
     #[must_use]
     pub fn max_stalled(mut self, n: u32) -> Self {
         self.max_stalled = n;
         self
     }
 
+    /// Set the blocking fetch drain delay.
     #[must_use]
     pub fn drain_delay(mut self, d: Duration) -> Self {
         self.drain_delay = d;
         self
     }
 
+    /// Toggle the stalled-job scanner.
     #[must_use]
     pub fn run_stalled_scanner(mut self, yes: bool) -> Self {
         self.run_stalled_scanner = yes;
         self
     }
 
+    /// Apply a rate limit to this worker's fetches.
     #[must_use]
     pub fn rate_limit(mut self, max: u32, per: Duration) -> Self {
         self.rate_limit = Some(RateLimit { max, per });
         self
     }
 
+    /// Set the graceful-shutdown drain timeout.
     #[must_use]
     pub fn shutdown_timeout(mut self, d: Duration) -> Self {
         self.shutdown_timeout = d;
@@ -301,6 +332,9 @@ impl WorkerOptions {
 }
 
 /// Rate-limit configuration.
+///
+/// Applied per worker via [`WorkerOptions::rate_limit`]. The worker blocks
+/// for up to `per` after issuing `max` jobs in a window.
 #[derive(Debug, Clone, Copy)]
 pub struct RateLimit {
     /// Max tokens issued per `per` window.

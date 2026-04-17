@@ -19,11 +19,13 @@ use crate::options::JobOptions;
 pub struct JobId(pub String);
 
 impl JobId {
+    /// Wrap an arbitrary string as a job id.
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
+    /// Borrow the inner id as a `&str`.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -54,17 +56,27 @@ impl From<&str> for JobId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum JobState {
+    /// In the `wait` list, ready to be picked up.
     Waiting,
+    /// In the `paused` list; resumes when the queue is unpaused.
     Paused,
+    /// Held by a worker with an active lock.
     Active,
+    /// In the `delayed` zset; eligible once its scheduled time arrives.
     Delayed,
+    /// In the `prioritized` zset.
     Prioritized,
+    /// Parent job waiting on pending children.
     WaitingChildren,
+    /// Finished successfully.
     Completed,
+    /// Finished with a terminal error.
     Failed,
 }
 
 impl JobState {
+    /// Canonical string name, matching Redis key suffixes and stream event
+    /// tags (`waiting`, `active`, etc.).
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Waiting => "waiting",
@@ -78,6 +90,10 @@ impl JobState {
         }
     }
 
+    /// Parse a state name. Accepts the canonical form as well as `"wait"`
+    /// (the legacy BullMQ alias for `waiting`).
+    ///
+    /// Returns `None` for unrecognized input.
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "waiting" | "wait" => Self::Waiting,
@@ -103,6 +119,10 @@ impl fmt::Display for JobState {
 ///
 /// `D` is the user-defined payload type; `R` is the return value captured
 /// on success. Both are `serde`-round-trippable.
+///
+/// Handlers receive `Job<D>` (with `R = ()`) by default. The full record
+/// (including `progress`, `return_value`, `failed_reason`, `stacktrace`)
+/// is available via [`Queue::get`](crate::Queue::get).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job<D, R = ()> {
     /// Backend-assigned or user-provided id.
@@ -139,18 +159,25 @@ pub struct Job<D, R = ()> {
 }
 
 impl<D, R> Job<D, R> {
-    /// `true` if the job can be retried (attempts remaining).
+    /// `true` if the job has attempts remaining (i.e. a retry is still
+    /// possible).
     pub fn can_retry(&self) -> bool {
         self.attempts_made < self.opts.attempts
     }
 }
 
-/// A reference to a parent job.
+/// Reference to a parent job for flow-produced children.
+///
+/// Stored on a child's [`Job::parent`] when the job is enqueued via
+/// [`FlowProducer`](crate::FlowProducer). Only available with the `flow`
+/// feature.
 #[cfg(feature = "flow")]
 #[cfg_attr(docsrs, doc(cfg(feature = "flow")))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParentRef {
+    /// Parent's job id.
     pub id: JobId,
+    /// Parent's queue name.
     pub queue: String,
 }
 

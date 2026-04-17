@@ -5,14 +5,35 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 /// Strategy used to compute the delay before the next attempt.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+/// use oxn::Backoff;
+///
+/// // Retry 5s after every failure.
+/// let fixed = Backoff::Fixed { delay: Duration::from_secs(5) };
+///
+/// // 200ms, 400ms, 800ms, 1.6s, …, capped at 30s.
+/// let exp = Backoff::Exponential {
+///     initial: Duration::from_millis(200),
+///     max: Some(Duration::from_secs(30)),
+/// };
+/// ```
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Backoff {
     /// Constant `delay` between attempts.
-    Fixed { delay: Duration },
-    /// `delay * 2^(attempt - 1)`, optionally capped by `max`.
+    Fixed {
+        /// Delay between retries.
+        delay: Duration,
+    },
+    /// `initial * 2^(attempt - 1)`, optionally capped by `max`.
     Exponential {
+        /// Delay before the first retry (attempt 1).
         initial: Duration,
+        /// Optional upper bound on computed delays.
         max: Option<Duration>,
     },
 }

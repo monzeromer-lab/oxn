@@ -1,9 +1,9 @@
 //! Error types for `oxn`.
 //!
-//! [`Error`] is the crate's single error enum. The negative integer codes
-//! returned by Lua scripts (mirroring BullMQ's scheme) are translated into
-//! typed [`ScriptError`] variants so callers do not have to match on magic
-//! numbers.
+//! [`enum@Error`] is the crate's single error enum. The negative integer
+//! codes returned by Lua scripts (mirroring BullMQ's scheme) are translated
+//! into typed [`ScriptError`] variants so callers do not have to match on
+//! magic numbers.
 
 use std::io;
 
@@ -109,23 +109,36 @@ impl Error {
 /// BullMQ uses raw negative ints; `oxn` translates them at the boundary so
 /// the rest of the codebase never has to match on `-4`.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScriptError {
+    /// The referenced job's hash does not exist.
     #[error("job does not exist")]
     JobNotFound,
+    /// The job lock key is missing (expired or already released).
     #[error("lock does not exist")]
     LockNotFound,
+    /// The Lua script found the job in a state it wasn't expecting
+    /// (e.g. retrying a job that's already completed).
     #[error("job is not in the expected state")]
     NotInExpectedState,
+    /// A parent job still has pending children and cannot be resolved.
     #[error("parent still has pending children")]
     PendingChildren,
+    /// A child references a parent whose hash isn't present.
     #[error("parent job does not exist")]
     ParentNotFound,
+    /// The token passed to a finalization script doesn't match the held lock.
     #[error("lock token does not match worker token")]
     LockMismatch,
+    /// A parent has children that failed permanently.
     #[error("parent has failed children")]
     FailedChildren,
+    /// Reserved for future or unmapped script return codes.
     #[error("unknown script error code ({0})")]
-    Unknown(i64),
+    Unknown(
+        /// The raw integer returned by the Lua script.
+        i64,
+    ),
 }
 
 impl ScriptError {

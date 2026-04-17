@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum Progress {
+    /// Percentage progress, clamped to `0.0..=100.0`.
     Percent(f64),
+    /// Arbitrary JSON-serializable progress payload.
     Arbitrary(serde_json::Value),
 }
 
