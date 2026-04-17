@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>oxn dashboard</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0e0e12; --fg: #eaeaf0; --muted: #8b8ea0;
+      --card: #1a1a22; --accent: #7c8cff; --danger: #f07178;
+      --ok: #7bd389; --warn: #f5c969;
+      --border: #2a2a36;
+    }
+    @media (prefers-color-scheme: light) {
+      :root { --bg:#f7f7fb; --fg:#16161d; --muted:#5b5f75; --card:#fff; --border:#dcdce6; }
+    }
+    * { box-sizing: border-box; }
+    html, body { background: var(--bg); color: var(--fg); margin: 0; font: 14px/1.5 system-ui, -apple-system, sans-serif; }
+    header { padding: 16px 24px; border-bottom: 1px solid var(--border); display:flex; align-items:center; gap:16px; }
+    header h1 { font-size: 16px; margin: 0; letter-spacing: 0.5px; }
+    header .tag { font-size: 11px; color: var(--muted); padding: 2px 8px; border: 1px solid var(--border); border-radius: 10px; }
+    main { display: grid; grid-template-columns: 260px 1fr; min-height: calc(100vh - 58px); }
+    nav { border-right: 1px solid var(--border); padding: 12px 0; overflow-y: auto; }
+    nav .q { padding: 10px 20px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; border-left: 2px solid transparent; }
+    nav .q:hover { background: var(--card); }
+    nav .q.active { border-color: var(--accent); background: var(--card); }
+    nav .q small { color: var(--muted); }
+    nav .q.paused::after { content: 'paused'; font-size: 10px; color: var(--warn); }
+    section { padding: 18px 24px; }
+    .counts { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin-bottom: 16px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; }
+    .card b { font-size: 20px; display: block; }
+    .card small { color: var(--muted); text-transform: uppercase; font-size: 10px; letter-spacing: 0.8px; }
+    .card.selected { border-color: var(--accent); }
+    .card button { cursor: pointer; background: none; border: 0; color: inherit; padding: 0; text-align: left; display: block; width: 100%; }
+    .toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+    button.btn { background: var(--accent); color: white; border: 0; border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 12px; }
+    button.btn.ghost { background: transparent; color: var(--fg); border: 1px solid var(--border); }
+    button.btn.danger { background: var(--danger); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 8px 12px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; }
+    tr:hover { background: var(--card); }
+    code { font-family: ui-monospace, SFMono-Regular, monospace; color: var(--accent); }
+    .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; border: 1px solid var(--border); }
+    .pill.completed { color: var(--ok); border-color: var(--ok); }
+    .pill.failed { color: var(--danger); border-color: var(--danger); }
+    .pill.active { color: var(--accent); border-color: var(--accent); }
+    .pill.delayed { color: var(--warn); border-color: var(--warn); }
+    .pill.waiting { color: var(--muted); }
+    .empty { padding: 40px; text-align: center; color: var(--muted); }
+    .reason { color: var(--danger); font-size: 12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>oxn</h1>
+    <span class="tag" id="base">/</span>
+    <span style="flex:1"></span>
+    <button class="btn ghost" onclick="refresh()">Refresh</button>
+  </header>
+  <main>
+    <nav id="queues"></nav>
+    <section id="detail"><div class="empty">Select a queue to begin.</div></section>
+  </main>
+  <script>
+    const STATES = ['waiting','active','delayed','prioritized','completed','failed','paused','waiting-children'];
+    let BASE = '';
+    let selectedQueue = null;
+    let selectedState = 'waiting';
+
+    // Auto-detect base path: this file is served at the dashboard root.
+    (function detectBase() {
+      const p = window.location.pathname;
+      BASE = p.endsWith('/') ? p.slice(0, -1) : p.replace(/\/[^/]+$/, '');
+      document.getElementById('base').textContent = BASE || '/';
+    })();
+
+    async function api(path, opts) {
+      const res = await fetch(BASE + path, opts);
+      if (!res.ok) throw new Error(await res.text());
+      if (res.status === 204) return null;
+      return res.json();
+    }
+
+    async function refresh() {
+      const queues = await api('/api/queues');
+      const nav = document.getElementById('queues');
+      nav.innerHTML = '';
+      for (const q of queues) {
+        const total = Object.values(q.counts).reduce((a,b)=>a+b,0);
+        const el = document.createElement('div');
+        el.className = 'q' + (q.paused ? ' paused' : '') + (selectedQueue === q.name ? ' active' : '');
+        el.innerHTML = `<span>${q.name}</span><small>${total}</small>`;
+        el.onclick = () => { selectedQueue = q.name; render(); };
+        nav.appendChild(el);
+      }
+      if (selectedQueue) await render();
+    }
+
+    async function render() {
+      const q = selectedQueue;
+      if (!q) return;
+      const counts = await api('/api/queues/' + encodeURIComponent(q) + '/counts');
+      const detail = document.getElementById('detail');
+      detail.innerHTML = `
+        <h2 style="margin-top:0">${q}</h2>
+        <div class="toolbar">
+          <button class="btn ghost" onclick="pause('${q}')">Pause</button>
+          <button class="btn ghost" onclick="resume('${q}')">Resume</button>
+          <button class="btn danger" onclick="drain('${q}')">Drain</button>
+        </div>
+        <div class="counts">
+          ${STATES.map(s => {
+            const key = s.replace('-','_');
+            const n = counts[key] ?? 0;
+            return `<div class="card ${selectedState === s ? 'selected' : ''}">
+              <button onclick="pickState('${s}')">
+                <small>${s}</small>
+                <b>${n}</b>
+              </button>
+            </div>`;
+          }).join('')}
+        </div>
+        <div id="jobs"></div>
+      `;
+      await renderJobs();
+    }
+
+    async function renderJobs() {
+      const q = selectedQueue;
+      const res = await api(`/api/queues/${encodeURIComponent(q)}/jobs?state=${selectedState}&start=0&end=49&desc=true`);
+      const out = document.getElementById('jobs');
+      if (!res.jobs.length) {
+        out.innerHTML = `<div class="empty">No ${selectedState} jobs.</div>`;
+        return;
+      }
+      out.innerHTML = `
+        <table>
+          <thead><tr>
+            <th>ID</th><th>Name</th><th>State</th><th>Attempts</th><th>Created</th><th>Finished</th><th></th>
+          </tr></thead>
+          <tbody>
+            ${res.jobs.map(j => `
+              <tr>
+                <td><code>${j.id}</code></td>
+                <td>${j.name}</td>
+                <td><span class="pill ${j.state}">${j.state ?? '-'}</span></td>
+                <td>${j.attempts_made} / ${j.attempts_total}</td>
+                <td>${new Date(j.timestamp_ms).toISOString().slice(0,19).replace('T',' ')}</td>
+                <td>${j.finished_on_ms ? new Date(j.finished_on_ms).toISOString().slice(0,19).replace('T',' ') : '-'}</td>
+                <td>
+                  ${j.state === 'failed' ? `<button class="btn ghost" onclick="retryJob('${q}','${j.id}')">Retry</button>` : ''}
+                  ${j.state === 'delayed' ? `<button class="btn ghost" onclick="promoteJob('${q}','${j.id}')">Promote</button>` : ''}
+                  <button class="btn danger" onclick="removeJob('${q}','${j.id}')">Remove</button>
+                </td>
+              </tr>
+              ${j.failed_reason ? `<tr><td colspan="7" class="reason">${j.failed_reason}</td></tr>` : ''}
+            `).join('')}
+          </tbody>
+        </table>
+      `;
+    }
+
+    function pickState(s) { selectedState = s; render(); }
+
+    async function pause(q) { await api(`/api/queues/${encodeURIComponent(q)}/pause`, {method:'POST'}); refresh(); }
+    async function resume(q) { await api(`/api/queues/${encodeURIComponent(q)}/resume`, {method:'POST'}); refresh(); }
+    async function drain(q) {
+      if (!confirm('Drain ' + q + '? This removes pending + prioritized jobs.')) return;
+      await api(`/api/queues/${encodeURIComponent(q)}/drain`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({include_delayed:false})});
+      refresh();
+    }
+    async function retryJob(q, id) { await api(`/api/queues/${encodeURIComponent(q)}/jobs/${id}/retry`, {method:'POST'}); renderJobs(); }
+    async function promoteJob(q, id) { await api(`/api/queues/${encodeURIComponent(q)}/jobs/${id}/promote`, {method:'POST'}); renderJobs(); }
+    async function removeJob(q, id) {
+      if (!confirm('Remove job ' + id + '?')) return;
+      await api(`/api/queues/${encodeURIComponent(q)}/jobs/${id}/remove`, {method:'POST'});
+      renderJobs();
+    }
+
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>

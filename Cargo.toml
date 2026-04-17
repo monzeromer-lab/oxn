@@ -1,0 +1,130 @@
+[package]
+name = "oxn"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Redis-backed async job queue for Rust, with optional web dashboard."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/monzer-omer/oxn"
+readme = "README.md"
+keywords = ["queue", "redis", "jobs", "async", "tokio"]
+categories = ["asynchronous", "database"]
+
+[features]
+default = ["redis-backend"]
+
+# Backends
+redis-backend = ["dep:redis", "dep:deadpool-redis"]
+
+# Optional subsystems
+scheduler = ["dep:cron", "dep:chrono"]
+flow = []
+metrics = ["dep:metrics"]
+
+# Dashboards (mutually compatible, but most users will pick one)
+dashboard = []
+dashboard-axum = ["dashboard", "dep:axum", "dep:tower", "dep:tower-http"]
+dashboard-actix = ["dashboard", "dep:actix-web"]
+
+# Convenience bundle
+full = [
+    "redis-backend",
+    "scheduler",
+    "flow",
+    "metrics",
+    "dashboard-axum",
+]
+
+[dependencies]
+tokio = { version = "1.40", features = [
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "macros",
+    "signal",
+    "io-util",
+] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+pin-project-lite = "0.2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+thiserror = "2"
+tracing = "0.1"
+bytes = "1"
+dashmap = "6"
+uuid = { version = "1", features = ["v4", "serde"] }
+parking_lot = "0.12"
+async-trait = "0.1"
+
+# Redis backend
+redis = { version = "0.27", default-features = false, optional = true, features = [
+    "tokio-comp",
+    "script",
+    "streams",
+    "connection-manager",
+    "aio",
+] }
+deadpool-redis = { version = "0.18", optional = true }
+
+# Scheduler
+cron = { version = "0.12", optional = true }
+chrono = { version = "0.4", optional = true, default-features = false, features = [
+    "serde",
+    "clock",
+] }
+
+# Metrics
+metrics = { version = "0.24", optional = true }
+
+# Dashboard — axum
+axum = { version = "0.7", optional = true, default-features = false, features = [
+    "tokio",
+    "http1",
+    "json",
+    "query",
+    "matched-path",
+] }
+tower = { version = "0.5", optional = true }
+tower-http = { version = "0.6", optional = true, features = ["cors", "trace"] }
+
+# Dashboard — actix
+actix-web = { version = "4", optional = true, default-features = false, features = [
+    "macros",
+] }
+
+[dev-dependencies]
+tokio = { version = "1.40", features = ["full", "test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+futures = "0.3"
+tokio-util = "0.7"
+redis = { version = "0.27", default-features = false, features = ["tokio-comp"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[[example]]
+name = "basic"
+path = "examples/basic.rs"
+required-features = ["redis-backend"]
+
+[[example]]
+name = "delayed"
+path = "examples/delayed.rs"
+required-features = ["redis-backend"]
+
+[[example]]
+name = "dashboard_axum"
+path = "examples/dashboard_axum.rs"
+required-features = ["redis-backend", "dashboard-axum"]
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
