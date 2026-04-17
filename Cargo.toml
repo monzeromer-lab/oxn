@@ -1,11 +1,11 @@
 [package]
 name = "oxn"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Redis-backed async job queue for Rust, with optional web dashboard."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/monzer-omer/oxn"
+repository = "https://github.com/monzeromer-lab/oxn"
 readme = "README.md"
 keywords = ["queue", "redis", "jobs", "async", "tokio"]
 categories = ["asynchronous", "database"]
