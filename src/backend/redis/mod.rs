@@ -2,9 +2,10 @@
 //!
 //! Uses [`redis-rs`](https://docs.rs/redis) via
 //! [`deadpool-redis`](https://docs.rs/deadpool-redis) for a pooled async
-//! client, plus a dedicated connection for blocking reads (so `BZPOPMIN`
-//! cannot starve the pool). All state transitions are Lua scripts
-//! registered once (content-addressed via `EVALSHA`).
+//! client. Blocking reads (`BZPOPMIN`) take a dedicated pool slot rather
+//! than sharing a multiplexed connection, so multiple concurrent workers
+//! never serialize on each other's blocking calls. All state transitions
+//! are Lua scripts registered once (content-addressed via `EVALSHA`).
 
 mod keys;
 mod scripts;
@@ -18,8 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use deadpool_redis::{Config as PoolConfig, Connection as PooledConn, Pool, Runtime};
 use futures::stream::{Stream, StreamExt};
-use redis::aio::ConnectionManager;
-use redis::{AsyncCommands, Client};
+use redis::AsyncCommands;
 
 use crate::backend::{
     Backend, EventStream, Fetched, JobInsert, JobRange, RawJob, StateCounts,
@@ -37,8 +37,9 @@ pub struct RedisConfig {
     pub url: String,
     /// Key prefix applied to every Redis key. Default: `"oxn"`.
     pub prefix: String,
-    /// Max pool size for non-blocking ops. Blocking fetches use a separate
-    /// dedicated connection.
+    /// Max pool size. The pool is shared between non-blocking commands
+    /// and blocking `BZPOPMIN` fetches; size it >= max concurrent workers
+    /// + a few slots for producers and dashboard.
     pub pool_size: usize,
     /// Cap on the events Redis Stream length. Stream is trimmed on
     /// every XADD.
@@ -111,7 +112,6 @@ impl RedisConfig {
 #[derive(Clone)]
 pub struct RedisBackend {
     pool: Pool,
-    blocking: ConnectionManager,
     prefix: String,
     max_stream_length: usize,
     scripts: Arc<scripts::Scripts>,
@@ -168,9 +168,6 @@ impl RedisBackend {
         // `PoolConfig::from_url` ignores `pool_size`; set it explicitly.
         pool_cfg.pool = Some(deadpool_redis::PoolConfig::new(cfg.pool_size));
         let pool = pool_cfg.create_pool(Some(Runtime::Tokio1))?;
-        // Dedicated connection for blocking pops.
-        let client = Client::open(cfg.url.clone())?;
-        let blocking = client.get_connection_manager().await?;
 
         // Keepalive task — spawned only if enabled via config. The task
         // holds a clone of the pool plus a CancellationToken, both of
@@ -189,7 +186,6 @@ impl RedisBackend {
 
         let backend = Self {
             pool,
-            blocking,
             prefix: cfg.prefix,
             max_stream_length: cfg.max_stream_length,
             scripts: Arc::new(scripts::Scripts::new()),
@@ -445,19 +441,30 @@ impl Backend for RedisBackend {
         if let Some(fetched) = parse_fetched(reply, worker_token)? {
             return Ok(Some(fetched));
         }
+        // Drop the slot before BZPOPMIN; we'll grab a fresh one for the
+        // blocking call so the second EVALSHA below isn't competing with
+        // ourselves for the same in-use connection.
+        drop(conn);
 
-        // Otherwise: block on BZPOPMIN(marker) for up to `block_for`, then
-        // retry the Lua once.
-        let mut blocking = self.blocking.clone();
+        // BZPOPMIN(marker) for up to `block_for`. Crucially, this is done
+        // on a **dedicated pool slot** rather than the shared
+        // [`ConnectionManager`]. Redis is single-threaded, so a blocking
+        // command holds the connection head-of-line — multiple workers
+        // sharing one multiplexed conn would serialize on each other and
+        // every non-blocking command would queue behind them. Holding one
+        // pool slot for at most `block_for` is the right trade.
+        let mut blocking = self.conn().await?;
         let secs = block_for.as_secs_f64().max(0.0);
         let _: Option<(String, String, f64)> = redis::cmd("BZPOPMIN")
             .arg(keys.marker())
             .arg(secs)
-            .query_async(&mut blocking)
+            .query_async(&mut *blocking)
             .await
             .ok()
             .flatten();
+        drop(blocking);
 
+        let mut conn = self.conn().await?;
         let reply: redis::Value = self
             .scripts
             .move_to_active
@@ -695,6 +702,10 @@ impl Backend for RedisBackend {
             cursor = next;
         }
         let _: () = conn.srem(format!("{}:queues", self.prefix), queue).await?;
+        // Drop the in-process cache entry so a future `add()` re-SADDs the
+        // queue back into the registry. Without this, the cache lies and the
+        // dashboard's queue listing won't show a re-created queue.
+        self.registered_queues.remove(queue);
         Ok(())
     }
 
