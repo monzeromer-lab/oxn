@@ -181,16 +181,22 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
     ) -> Result<Option<Fetched>>;
 
     /// Mark a job completed and record `return_value_json`.
+    ///
+    /// `removal` is the job's `JobOptions::remove_on_complete` policy; the
+    /// caller passes it from the in-memory job record so the backend
+    /// doesn't need a round trip to re-read it from storage.
     async fn complete(
         &self,
         queue: &str,
         id: &JobId,
         token: &str,
         return_value_json: Option<String>,
+        removal: crate::options::Removal,
     ) -> Result<()>;
 
     /// Mark a job failed. If `retry_at_ms` is `Some`, the job goes to
-    /// `delayed` for re-execution at that timestamp.
+    /// `delayed` for re-execution at that timestamp; otherwise it's moved
+    /// to `failed` with `removal` applied.
     async fn fail(
         &self,
         queue: &str,
@@ -198,6 +204,7 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
         token: &str,
         reason: &str,
         retry_at_ms: Option<i64>,
+        removal: crate::options::Removal,
     ) -> Result<()>;
 
     /// Renew the lock TTL.

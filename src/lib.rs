@@ -82,12 +82,40 @@
 //! | Feature            | Adds                                                          |
 //! |--------------------|---------------------------------------------------------------|
 //! | `redis-backend`    | Default. `backend::redis::RedisBackend`.                      |
+//! | `tls`              | `rediss://` URL support via rustls (recommended).             |
+//! | `tls-native`       | `rediss://` URL support via native-tls (OpenSSL/SChannel).    |
 //! | `scheduler`        | `JobScheduler` — cron and fixed-interval repeats.             |
 //! | `flow`             | `FlowProducer` — parent/child DAGs.                           |
 //! | `metrics`          | Emits counters/histograms via the `metrics` crate.            |
 //! | `dashboard-axum`   | `dashboard::axum_router` — mount on any axum app.             |
 //! | `dashboard-actix`  | `dashboard::actix_scope` — mount on any actix-web app.        |
-//! | `full`             | All of the above, with `dashboard-axum` selected.             |
+//! | `full`             | All of the above (rustls TLS), with `dashboard-axum` selected.|
+//!
+//! ## TLS (managed Redis)
+//!
+//! Connecting to managed Redis services (DigitalOcean Managed Redis, AWS
+//! ElastiCache Serverless, Upstash, Redis Cloud, …) typically requires TLS
+//! and a `rediss://` URL. Enable the `tls` feature:
+//!
+//! ```toml
+//! [dependencies]
+//! oxn = { version = "0.1", features = ["tls"] }
+//! ```
+//!
+//! Then build the queue exactly the same way:
+//!
+//! ```no_run
+//! # use oxn::Queue;
+//! # use serde::{Deserialize, Serialize};
+//! # #[derive(Clone, Serialize, Deserialize)]
+//! # struct Email;
+//! # async fn run() -> oxn::Result<()> {
+//! let queue: Queue<Email> = Queue::builder("emails")
+//!     .redis("rediss://default:PASS@host.example.com:25061")
+//!     .build()
+//!     .await?;
+//! # Ok(()) }
+//! ```
 //!
 //! Add them to your `Cargo.toml`:
 //!

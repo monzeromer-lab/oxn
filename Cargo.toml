@@ -1,6 +1,6 @@
 [package]
 name = "oxn"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.85"
 description = "Redis-backed async job queue for Rust, with optional web dashboard."
@@ -16,6 +16,22 @@ default = ["redis-backend"]
 # Backends
 redis-backend = ["dep:redis", "dep:deadpool-redis"]
 
+# TLS for the Redis backend (`rediss://` URLs).
+# `tls` uses rustls + webpki-roots — pure-Rust, recommended.
+# `tls-native` uses native-tls (OpenSSL/SChannel/Security.framework).
+# Pick one. Both opt-in.
+tls = [
+    "redis-backend",
+    "redis/tokio-rustls-comp",
+    "redis/tls-rustls-webpki-roots",
+    "deadpool-redis/rt_tokio_1",
+]
+tls-native = [
+    "redis-backend",
+    "redis/tokio-native-tls-comp",
+    "deadpool-redis/rt_tokio_1",
+]
+
 # Optional subsystems
 scheduler = ["dep:cron", "dep:chrono"]
 flow = []
@@ -29,6 +45,7 @@ dashboard-actix = ["dashboard", "dep:actix-web"]
 # Convenience bundle
 full = [
     "redis-backend",
+    "tls",
     "scheduler",
     "flow",
     "metrics",
@@ -121,6 +138,11 @@ required-features = ["redis-backend"]
 name = "dashboard_axum"
 path = "examples/dashboard_axum.rs"
 required-features = ["redis-backend", "dashboard-axum"]
+
+[[example]]
+name = "diag_managed_redis"
+path = "examples/diag_managed_redis.rs"
+required-features = ["tls"]
 
 [lib]
 path = "src/lib.rs"

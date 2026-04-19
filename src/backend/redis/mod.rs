@@ -87,6 +87,11 @@ pub struct RedisBackend {
     prefix: String,
     max_stream_length: usize,
     scripts: Arc<scripts::Scripts>,
+    /// Process-local set of queue names we've already SADD'd into the
+    /// `{prefix}:queues` registry. Eliminates an unconditional `SADD` round
+    /// trip on every `add()` — particularly painful against managed Redis
+    /// where it's a ~150 ms tax per submission.
+    registered_queues: Arc<dashmap::DashSet<String>>,
 }
 
 impl fmt::Debug for RedisBackend {
@@ -121,19 +126,62 @@ impl RedisBackend {
             prefix: cfg.prefix,
             max_stream_length: cfg.max_stream_length,
             scripts: Arc::new(scripts::Scripts::new()),
+            registered_queues: Arc::new(dashmap::DashSet::new()),
         };
         backend.warmup().await?;
         Ok(backend)
     }
 
-    /// Re-issue `SCRIPT LOAD` for every embedded Lua script.
+    /// Re-issue `SCRIPT LOAD` for every embedded Lua script on **every
+    /// connection in the pool**.
     ///
     /// Called automatically by [`Self::connect`]. Call manually after a
     /// `SCRIPT FLUSH`, after a Redis failover that wiped the script cache,
     /// or as a periodic safety net. The operation is idempotent.
+    ///
+    /// # Why every connection matters
+    ///
+    /// On standalone Redis, `SCRIPT LOAD` populates a server-wide cache, so
+    /// preloading on one connection is enough. On managed Redis services
+    /// that front multiple backend nodes through a proxy
+    /// (DigitalOcean Managed Redis, AWS ElastiCache Serverless, Upstash,
+    /// Redis Cloud, …), each TCP connection may land on a different
+    /// backend node and the script cache is **per-node**. Preloading on a
+    /// single connection leaves the rest of the pool cold; the first
+    /// `Queue::add()` that lands on an unprimed node still pays the
+    /// `EVALSHA` → `NOSCRIPT` → `SCRIPT LOAD` → retry round-trip — which
+    /// can stall for tens of seconds against managed Redis.
+    ///
+    /// This implementation acquires `pool.status().max_size` connections
+    /// simultaneously so each pool slot ends up holding a distinct TCP
+    /// connection, then runs `SCRIPT LOAD` on each in parallel.
+    ///
+    /// # Concurrency note
+    ///
+    /// While `warmup` runs it temporarily holds every pool slot, so any
+    /// other operations on the same backend will queue until preload
+    /// finishes. Inside [`Self::connect`] this is harmless (no other
+    /// callers exist yet); when calling manually under load, expect a
+    /// short stall on concurrent calls.
     pub async fn warmup(&self) -> Result<()> {
-        let mut conn = self.conn().await?;
-        scripts::Scripts::preload(&mut *conn).await
+        let pool_size = self.pool.status().max_size;
+        // Acquire pool_size connections **in parallel**. Each acquisition
+        // includes a fresh TCP + TLS handshake on managed Redis (~250–
+        // 500 ms each), so doing them sequentially turns a 16-slot pool
+        // into a several-second cliff during connect(). With try_join_all,
+        // every getter is polled simultaneously and deadpool mints all
+        // slots concurrently.
+        let conn_futures = (0..pool_size).map(|_| async {
+            self.pool.get().await.map_err(crate::Error::from)
+        });
+        let conns = futures::future::try_join_all(conn_futures).await?;
+        // Preload on every slot in parallel; each future owns its conn,
+        // and dropping it returns the slot to the pool.
+        let preloads = conns.into_iter().map(|mut conn| async move {
+            scripts::Scripts::preload(&mut *conn).await
+        });
+        futures::future::try_join_all(preloads).await?;
+        Ok(())
     }
 
     fn keys(&self, queue: &str) -> KeyBuilder {
@@ -145,9 +193,15 @@ impl RedisBackend {
     }
 
     async fn register_queue(&self, queue: &str) -> Result<()> {
+        // Cheap fast-path — once we've SADD'd a queue name from this process
+        // there's no reason to re-do it on every subsequent add().
+        if self.registered_queues.contains(queue) {
+            return Ok(());
+        }
         let key = format!("{}:queues", self.prefix);
         let mut conn = self.conn().await?;
         let _: () = conn.sadd(key, queue).await?;
+        self.registered_queues.insert(queue.to_string());
         Ok(())
     }
 }
@@ -302,14 +356,11 @@ impl Backend for RedisBackend {
         id: &JobId,
         token: &str,
         return_value_json: Option<String>,
+        removal: crate::options::Removal,
     ) -> Result<()> {
         let keys = self.keys(queue);
         let mut conn = self.conn().await?;
-        let opts = match self.get(queue, id).await? {
-            Some(j) => j.opts,
-            None => return Err(Error::NotFound(id.to_string())),
-        };
-        let remove = encode_removal(&opts.remove_on_complete);
+        let remove = encode_removal(&removal);
         let _: redis::Value = self
             .scripts
             .move_to_finished
@@ -338,13 +389,10 @@ impl Backend for RedisBackend {
         token: &str,
         reason: &str,
         retry_at_ms: Option<i64>,
+        removal: crate::options::Removal,
     ) -> Result<()> {
         let keys = self.keys(queue);
         let mut conn = self.conn().await?;
-        let opts = match self.get(queue, id).await? {
-            Some(j) => j.opts,
-            None => return Err(Error::NotFound(id.to_string())),
-        };
 
         if let Some(ts) = retry_at_ms {
             let _: redis::Value = self
@@ -366,7 +414,7 @@ impl Backend for RedisBackend {
             return Ok(());
         }
 
-        let remove = encode_removal(&opts.remove_on_fail);
+        let remove = encode_removal(&removal);
         let _: redis::Value = self
             .scripts
             .move_to_finished

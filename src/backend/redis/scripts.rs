@@ -85,14 +85,4 @@ impl Scripts {
         }
         Ok(())
     }
-
-    /// SHAs for every script in [`ALL_SCRIPTS`], in the same order.
-    /// Used by tests to assert preload succeeded.
-    #[cfg(test)]
-    pub fn all_shas() -> Vec<String> {
-        ALL_SCRIPTS
-            .iter()
-            .map(|body| Script::new(body).get_hash().to_string())
-            .collect()
-    }
 }

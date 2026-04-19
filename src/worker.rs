@@ -253,11 +253,23 @@ async fn process_one<D, R>(
     let attempts_made = raw.attempts_made;
     let attempts_total = raw.opts.attempts;
     let backoff = raw.opts.backoff;
+    // Snapshot the retention policies up front — we pass them to
+    // `complete()` / `fail()` so the backend doesn't need an extra round
+    // trip to re-read the job hash for them.
+    let remove_on_complete = raw.opts.remove_on_complete;
+    let remove_on_fail = raw.opts.remove_on_fail;
     let job: Job<D> = match decode_job::<D>(raw) {
         Ok(j) => j,
         Err(e) => {
             let _ = backend
-                .fail(&queue, &id, &token, &format!("decode error: {e}"), None)
+                .fail(
+                    &queue,
+                    &id,
+                    &token,
+                    &format!("decode error: {e}"),
+                    None,
+                    remove_on_fail,
+                )
                 .await;
             return;
         }
@@ -286,14 +298,24 @@ async fn process_one<D, R>(
     match outcome {
         Ok(ret) => {
             let json = serde_json::to_string(&ret).ok();
-            if let Err(e) = backend.complete(&queue, &id, &token, json).await {
+            if let Err(e) = backend
+                .complete(&queue, &id, &token, json, remove_on_complete)
+                .await
+            {
                 tracing::error!(job = %id, error = %e, "complete failed");
             }
         }
         Err(Error::Delayed { delay_ms }) => {
             let retry_at = chrono_like_now_ms() + delay_ms as i64;
             if let Err(e) = backend
-                .fail(&queue, &id, &token, "delayed by handler", Some(retry_at))
+                .fail(
+                    &queue,
+                    &id,
+                    &token,
+                    "delayed by handler",
+                    Some(retry_at),
+                    remove_on_fail,
+                )
                 .await
             {
                 tracing::error!(job = %id, error = %e, "delay requeue failed");
@@ -302,14 +324,24 @@ async fn process_one<D, R>(
         Err(Error::RateLimited { delay_ms }) => {
             let retry_at = chrono_like_now_ms() + delay_ms as i64;
             if let Err(e) = backend
-                .fail(&queue, &id, &token, "rate limited", Some(retry_at))
+                .fail(
+                    &queue,
+                    &id,
+                    &token,
+                    "rate limited",
+                    Some(retry_at),
+                    remove_on_fail,
+                )
                 .await
             {
                 tracing::error!(job = %id, error = %e, "rate-limit requeue failed");
             }
         }
         Err(Error::Unrecoverable(msg)) => {
-            if let Err(e) = backend.fail(&queue, &id, &token, &msg, None).await {
+            if let Err(e) = backend
+                .fail(&queue, &id, &token, &msg, None, remove_on_fail)
+                .await
+            {
                 tracing::error!(job = %id, error = %e, "fail permanent failed");
             }
         }
@@ -323,13 +355,20 @@ async fn process_one<D, R>(
                     .unwrap_or(Duration::ZERO);
                 let retry_at = chrono_like_now_ms() + delay.as_millis() as i64;
                 if let Err(e) = backend
-                    .fail(&queue, &id, &token, &err.to_string(), Some(retry_at))
+                    .fail(
+                        &queue,
+                        &id,
+                        &token,
+                        &err.to_string(),
+                        Some(retry_at),
+                        remove_on_fail,
+                    )
                     .await
                 {
                     tracing::error!(job = %id, error = %e, "retry requeue failed");
                 }
             } else if let Err(e) = backend
-                .fail(&queue, &id, &token, &err.to_string(), None)
+                .fail(&queue, &id, &token, &err.to_string(), None, remove_on_fail)
                 .await
             {
                 tracing::error!(job = %id, error = %e, "final fail failed");

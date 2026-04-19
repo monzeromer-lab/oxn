@@ -49,16 +49,28 @@ async fn submit_then_worker_completes_and_counts_reflect_state() {
     let cancel = worker.cancellation_token();
     let handle = tokio::spawn(worker.run());
 
-    // Wait for all jobs to process.
-    let ok = common::wait_for(Duration::from_secs(5), || {
-        let c = processed.clone();
-        async move { c.load(Ordering::SeqCst) == 3 }
+    // Poll the *backend state* — not the in-process counter — so we don't
+    // race the `complete()` write against high-RTT (e.g. managed Redis)
+    // connections. The handler counter increments before the worker calls
+    // `complete()`; on a slow link those two events can be tens of ms apart.
+    let q_for_check = q.clone();
+    let ok = common::wait_for(Duration::from_secs(15), move || {
+        let q = q_for_check.clone();
+        async move {
+            q.counts()
+                .await
+                .map(|c| c.completed == 3 && c.waiting == 0 && c.active == 0)
+                .unwrap_or(false)
+        }
     })
     .await;
-    assert!(ok, "handler never processed all 3 jobs");
-
-    // Post-run, counts reflect completion.
     let counts = q.counts().await.unwrap();
+    assert!(
+        ok,
+        "queue did not settle to completed=3/waiting=0/active=0 — counts={counts:?}, \
+         handler ran {} times",
+        processed.load(Ordering::SeqCst)
+    );
     assert_eq!(counts.waiting, 0);
     assert_eq!(counts.active, 0);
     assert_eq!(counts.completed, 3, "completed zset should hold 3");
@@ -85,7 +97,7 @@ async fn complete_preserves_return_value() {
     let cancel = worker.cancellation_token();
     let handle = tokio::spawn(worker.run());
 
-    let ok = common::wait_for(Duration::from_secs(5), || async {
+    let ok = common::wait_for(Duration::from_secs(15), || async {
         q.counts().await.map(|c| c.completed == 1).unwrap_or(false)
     })
     .await;

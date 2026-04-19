@@ -17,8 +17,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Serialize, Deserialize)]
 struct Dummy;
 
-// `SCRIPT FLUSH` is server-global. The two tests that issue it must not
-// interleave or one will pull the cache out from under the other.
+// `SCRIPT FLUSH` and `CONFIG RESETSTAT` are server-global. Tests that
+// touch them must not interleave or one will pull state out from under
+// the other.
 static SCRIPT_CACHE_LOCK: Mutex<()> = Mutex::new(());
 
 #[tokio::test(flavor = "multi_thread")]
@@ -101,6 +102,67 @@ async fn warmup_is_idempotent_and_recovers_from_script_flush() {
 
     // And calling it again is a no-op (no new SHAs change, no errors).
     backend.warmup().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn warmup_preloads_scripts_on_every_pool_connection() {
+    // Single-connection preload is insufficient against managed Redis
+    // (proxy fronts multiple backend nodes; SCRIPT cache is per-node).
+    // We verify here that warmup issues SCRIPT LOAD on `pool_size` distinct
+    // connections by counting Redis's per-command call counter via
+    // `INFO commandstats`.
+    let _guard = SCRIPT_CACHE_LOCK.lock().unwrap();
+
+    let mut admin = redis::Client::open(common::redis_url())
+        .unwrap()
+        .get_multiplexed_tokio_connection()
+        .await
+        .unwrap();
+
+    // Reset the counters so we measure only what this connect() does.
+    let _: redis::Value = redis::cmd("CONFIG")
+        .arg("RESETSTAT")
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+
+    const POOL_SIZE: usize = 4;
+    const SCRIPT_COUNT: u64 = 10; // matches ALL_SCRIPTS in scripts.rs
+
+    let cfg = RedisConfig::new(common::redis_url())
+        .prefix(common::TEST_PREFIX)
+        .pool_size(POOL_SIZE);
+    let _backend = RedisBackend::connect(cfg).await.unwrap();
+
+    // Read INFO commandstats; parse cmdstat_script.calls=N
+    let raw: String = redis::cmd("INFO")
+        .arg("commandstats")
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+
+    // Redis 7+ reports per-subcommand counters as `cmdstat_script|load`,
+    // older versions use `cmdstat_script`. Sum every line that mentions
+    // `script` so we're robust to the exact format.
+    let calls: u64 = raw
+        .lines()
+        .filter(|l| {
+            l.starts_with("cmdstat_script:") || l.starts_with("cmdstat_script|load:")
+        })
+        .filter_map(|l| {
+            l.split_once(':')
+                .and_then(|(_, rest)| rest.split(',').next())
+                .and_then(|kv| kv.strip_prefix("calls="))
+                .and_then(|n| n.parse::<u64>().ok())
+        })
+        .sum();
+
+    let expected = SCRIPT_COUNT * POOL_SIZE as u64;
+    assert!(
+        calls >= expected,
+        "expected ≥ {expected} SCRIPT calls (10 scripts × {POOL_SIZE} pool slots), \
+         got {calls} — looks like preload only ran on a single connection"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
