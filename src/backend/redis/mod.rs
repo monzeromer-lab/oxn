@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use deadpool_redis::{Config as PoolConfig, Pool, Runtime};
+use deadpool_redis::{Config as PoolConfig, Connection as PooledConn, Pool, Runtime};
 use futures::stream::{Stream, StreamExt};
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client};
@@ -43,17 +43,31 @@ pub struct RedisConfig {
     /// Cap on the events Redis Stream length. Stream is trimmed on
     /// every XADD.
     pub max_stream_length: usize,
+    /// How often a background task PINGs every pool slot to keep the TCP
+    /// connection alive. Managed-Redis providers (DigitalOcean, AWS
+    /// ElastiCache Serverless, Upstash, Redis Cloud) close idle TCP
+    /// connections at the proxy after 60–300s; without keepalive, the
+    /// first command on a stale slot hangs for seconds while the kernel
+    /// detects the dead socket and a fresh TLS handshake is paid. Set
+    /// to `None` to disable. Default: `Some(Duration::from_secs(25))`.
+    pub keepalive_interval: Option<Duration>,
+    /// Per-checkout health-check timeout for [`Self::keepalive_interval`].
+    /// If a slot's PING does not return within this window, the connection
+    /// is detached from the pool and a fresh one is minted. Default 2s.
+    pub health_check_timeout: Duration,
 }
 
 impl RedisConfig {
     /// Build a config with sane defaults (prefix `"oxn"`, pool 16,
-    /// max stream 10_000).
+    /// max stream 10 000, keepalive every 25s).
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
             prefix: "oxn".to_string(),
             pool_size: 16,
             max_stream_length: 10_000,
+            keepalive_interval: Some(Duration::from_secs(25)),
+            health_check_timeout: Duration::from_secs(2),
         }
     }
 
@@ -77,6 +91,20 @@ impl RedisConfig {
         self.max_stream_length = n;
         self
     }
+
+    /// Override the keepalive cadence. Pass `None` to disable.
+    #[must_use]
+    pub fn keepalive_interval(mut self, interval: Option<Duration>) -> Self {
+        self.keepalive_interval = interval;
+        self
+    }
+
+    /// Override the per-checkout PING timeout.
+    #[must_use]
+    pub fn health_check_timeout(mut self, d: Duration) -> Self {
+        self.health_check_timeout = d;
+        self
+    }
 }
 
 /// Redis-backed storage implementation.
@@ -92,6 +120,24 @@ pub struct RedisBackend {
     /// trip on every `add()` — particularly painful against managed Redis
     /// where it's a ~150 ms tax per submission.
     registered_queues: Arc<dashmap::DashSet<String>>,
+    /// Holds a [`tokio_util::sync::CancellationToken`] inside an `Arc`. When
+    /// the last clone of the backend drops, the inner [`Drop`] fires the
+    /// token, which signals the keepalive task to exit.
+    _keepalive: Option<Arc<KeepaliveGuard>>,
+}
+
+/// Drop-cancels the keepalive task when the last `RedisBackend` clone goes
+/// out of scope. Held inside `Arc` so cloning the backend doesn't drop the
+/// task.
+#[derive(Debug)]
+struct KeepaliveGuard {
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for KeepaliveGuard {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 impl fmt::Debug for RedisBackend {
@@ -115,11 +161,32 @@ impl RedisBackend {
     /// Re-call [`Self::warmup`] after a `SCRIPT FLUSH` or Redis restart
     /// to refill the cache without dropping the pool.
     pub async fn connect(cfg: RedisConfig) -> Result<Self> {
-        let pool_cfg = PoolConfig::from_url(cfg.url.clone());
+        // Honour `cfg.pool_size`: `Config::from_url` alone leaves the pool
+        // at deadpool's default (`num_cpus * 4`), silently ignoring whatever
+        // the caller asked for.
+        let mut pool_cfg = PoolConfig::from_url(cfg.url.clone());
+        // `PoolConfig::from_url` ignores `pool_size`; set it explicitly.
+        pool_cfg.pool = Some(deadpool_redis::PoolConfig::new(cfg.pool_size));
         let pool = pool_cfg.create_pool(Some(Runtime::Tokio1))?;
         // Dedicated connection for blocking pops.
-        let client = Client::open(cfg.url)?;
+        let client = Client::open(cfg.url.clone())?;
         let blocking = client.get_connection_manager().await?;
+
+        // Keepalive task — spawned only if enabled via config. The task
+        // holds a clone of the pool plus a CancellationToken, both of
+        // which the backend itself drops references to via [`KeepaliveGuard`].
+        let keepalive = cfg.keepalive_interval.map(|interval| {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            spawn_keepalive(
+                pool.clone(),
+                cfg.pool_size,
+                interval,
+                cfg.health_check_timeout,
+                cancel.clone(),
+            );
+            Arc::new(KeepaliveGuard { cancel })
+        });
+
         let backend = Self {
             pool,
             blocking,
@@ -127,6 +194,7 @@ impl RedisBackend {
             max_stream_length: cfg.max_stream_length,
             scripts: Arc::new(scripts::Scripts::new()),
             registered_queues: Arc::new(dashmap::DashSet::new()),
+            _keepalive: keepalive,
         };
         backend.warmup().await?;
         Ok(backend)
@@ -211,6 +279,67 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Spawn a background task that periodically PINGs every pool slot to
+/// prevent the managed-Redis proxy from FIN-ing idle TCP connections.
+///
+/// On every tick the task acquires every pool slot in parallel and issues
+/// a `PING` against each one with a `health_check_timeout` ceiling. Slots
+/// that fail or time out are detached from the pool via [`deadpool::managed::Object::take`]
+/// so the next user call mints a fresh connection rather than blocking on
+/// a dead socket.
+///
+/// The task exits when `cancel` fires, which happens automatically when
+/// the last [`RedisBackend`] clone is dropped (see [`KeepaliveGuard`]).
+fn spawn_keepalive(
+    pool: Pool,
+    pool_size: usize,
+    interval: Duration,
+    health_check_timeout: Duration,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Consume the immediate first tick — the warmup we just ran already
+        // touched every slot, so no need to PING them again right away.
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tick.tick() => {
+                    keepalive_round(&pool, pool_size, health_check_timeout).await;
+                }
+            }
+        }
+    });
+}
+
+/// One pass: attempt a bounded PING on every pool slot in parallel.
+async fn keepalive_round(pool: &Pool, pool_size: usize, timeout: Duration) {
+    let futs = (0..pool_size).map(|_| async {
+        let conn = match pool.get().await {
+            Ok(c) => c,
+            Err(_) => return, // pool gone or contended; try again next tick
+        };
+        // Bound the PING. If the connection is stale (managed-Redis proxy
+        // FIN'd it during idle), the response will never arrive — without
+        // a timeout we'd block here for tens of seconds.
+        let mut conn = conn;
+        let cmd = redis::cmd("PING");
+        let ping = cmd.query_async::<String>(&mut *conn);
+        match tokio::time::timeout(timeout, ping).await {
+            Ok(Ok(_)) => { /* slot is healthy; drop returns it to pool */ }
+            _ => {
+                // Detach the broken connection so the pool mints a fresh
+                // one next time someone asks for this slot.
+                let _ = PooledConn::take(conn);
+                tracing::debug!("oxn keepalive: detached a stale pool slot");
+            }
+        }
+    });
+    futures::future::join_all(futs).await;
 }
 
 fn encode_removal(r: &Removal) -> String {

@@ -164,6 +164,42 @@ async fn main() -> anyhow::Result<()> {
     let _ = q2.remove(&id).await;
     println!();
 
+    // ── long-idle scenario: the bug from the latest report
+    //
+    // Managed Redis proxies (DO/ElastiCache/Upstash) typically FIN idle
+    // TCP connections after 60–300s. With `keepalive_interval` enabled
+    // (the default), oxn's background task should PING every slot every
+    // 25s, so even after a long sleep the next add() lands on a healthy
+    // pool slot.
+    let idle = std::env::var("IDLE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0u64);
+    if idle > 0 {
+        println!("-- long-idle scenario ({idle}s sleep, then 5 sequential adds) --");
+        println!("  sleeping {idle}s …");
+        tokio::time::sleep(Duration::from_secs(idle)).await;
+        for i in 0..5 {
+            let t = Instant::now();
+            let id = q2
+                .add(
+                    Dummy {
+                        payload: format!("post-idle-{i}"),
+                    },
+                    JobOptions::new().delay(Duration::from_secs(86400)),
+                )
+                .await?;
+            println!("  add #{i}: {:?}", t.elapsed());
+            let _ = q2.remove(&id).await;
+        }
+        println!();
+    } else {
+        println!(
+            "(skip long-idle test; set IDLE_SECS=120 to exercise the proxy-FIN scenario)"
+        );
+        println!();
+    }
+
     // ── isolated SCRIPT LOAD timing — establishes a baseline
     println!("-- raw SCRIPT LOAD timing (no oxn) --");
     let mut conn = redis::Client::open(url.as_str())?
