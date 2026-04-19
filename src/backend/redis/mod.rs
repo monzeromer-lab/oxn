@@ -100,19 +100,40 @@ impl fmt::Debug for RedisBackend {
 
 impl RedisBackend {
     /// Connect to Redis with the given config.
+    ///
+    /// Eagerly issues `SCRIPT LOAD` for every embedded Lua script before
+    /// returning, so the first user-facing call (e.g. `Queue::add`) does
+    /// not pay a cold-start `NOSCRIPT` → `SCRIPT LOAD` round-trip. On a
+    /// managed Redis behind a TLS proxy that round-trip can stall for
+    /// seconds; preloading folds the cost into normal startup.
+    ///
+    /// Re-call [`Self::warmup`] after a `SCRIPT FLUSH` or Redis restart
+    /// to refill the cache without dropping the pool.
     pub async fn connect(cfg: RedisConfig) -> Result<Self> {
         let pool_cfg = PoolConfig::from_url(cfg.url.clone());
         let pool = pool_cfg.create_pool(Some(Runtime::Tokio1))?;
         // Dedicated connection for blocking pops.
         let client = Client::open(cfg.url)?;
         let blocking = client.get_connection_manager().await?;
-        Ok(Self {
+        let backend = Self {
             pool,
             blocking,
             prefix: cfg.prefix,
             max_stream_length: cfg.max_stream_length,
             scripts: Arc::new(scripts::Scripts::new()),
-        })
+        };
+        backend.warmup().await?;
+        Ok(backend)
+    }
+
+    /// Re-issue `SCRIPT LOAD` for every embedded Lua script.
+    ///
+    /// Called automatically by [`Self::connect`]. Call manually after a
+    /// `SCRIPT FLUSH`, after a Redis failover that wiped the script cache,
+    /// or as a periodic safety net. The operation is idempotent.
+    pub async fn warmup(&self) -> Result<()> {
+        let mut conn = self.conn().await?;
+        scripts::Scripts::preload(&mut *conn).await
     }
 
     fn keys(&self, queue: &str) -> KeyBuilder {

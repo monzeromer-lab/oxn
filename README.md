@@ -13,7 +13,7 @@ generic typed jobs, `tokio::sync::broadcast` semantics, builder patterns,
 
 ```toml
 [dependencies]
-oxn = "0.2"
+oxn = "0.1.2"
 ```
 
 ## Why another queue crate?
@@ -87,7 +87,7 @@ async fn main() -> oxn::Result<()> {
 
 ```toml
 [dependencies]
-oxn = { version = "0.2", features = ["scheduler", "dashboard-axum"] }
+oxn = { version = "0.1.2", features = ["scheduler", "dashboard-axum"] }
 ```
 
 ## Core concepts
