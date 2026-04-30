@@ -23,7 +23,7 @@ use actix_web::web::{Data, Json, Path, Query};
 use actix_web::{web, HttpResponse, Responder, Scope};
 
 use crate::backend::Backend;
-use crate::dashboard::api::{self, ListQuery};
+use crate::dashboard::api::{self, ListQuery, LogsQuery};
 use crate::dashboard::{DashboardState, DASHBOARD_HTML};
 use crate::error::Error;
 use crate::job::JobId;
@@ -38,6 +38,7 @@ pub fn scope(backend: Arc<dyn Backend>) -> Scope {
         .route("/api/queues/{queue}/counts", web::get().to(get_counts))
         .route("/api/queues/{queue}/jobs", web::get().to(get_jobs))
         .route("/api/queues/{queue}/jobs/{id}", web::get().to(get_job))
+        .route("/api/queues/{queue}/jobs/{id}/logs", web::get().to(get_job_logs))
         .route("/api/queues/{queue}/jobs/{id}/retry", web::post().to(retry_job))
         .route("/api/queues/{queue}/jobs/{id}/promote", web::post().to(promote_job))
         .route("/api/queues/{queue}/jobs/{id}/remove", web::post().to(remove_job))
@@ -74,6 +75,16 @@ async fn get_jobs(
 async fn get_job(s: Data<DashboardState>, path: Path<(String, String)>) -> ApiResult {
     let (queue, id) = path.into_inner();
     let v = api::get_job(s.get_ref(), &queue, &JobId::new(id)).await?;
+    Ok(HttpResponse::Ok().json(v))
+}
+
+async fn get_job_logs(
+    s: Data<DashboardState>,
+    path: Path<(String, String)>,
+    q: Query<LogsQuery>,
+) -> ApiResult {
+    let (queue, id) = path.into_inner();
+    let v = api::get_job_logs(s.get_ref(), &queue, &JobId::new(id), q.into_inner()).await?;
     Ok(HttpResponse::Ok().json(v))
 }
 

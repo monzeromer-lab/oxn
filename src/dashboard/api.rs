@@ -161,6 +161,53 @@ pub async fn get_job(
     state.backend.get(queue, id).await
 }
 
+/// Query string for `GET /api/queues/{name}/jobs/{id}/logs`.
+#[derive(Debug, Deserialize)]
+pub struct LogsQuery {
+    /// Inclusive zero-based start index. Defaults to 0.
+    #[serde(default)]
+    pub start: i64,
+    /// Inclusive end index. Use `-1` for "to the end". Defaults to `-1`.
+    #[serde(default = "default_logs_end")]
+    pub end: i64,
+    /// When true, iterate newest-first. Defaults to false.
+    #[serde(default)]
+    pub desc: bool,
+}
+
+fn default_logs_end() -> i64 {
+    -1
+}
+
+/// Response body of `GET /api/queues/{name}/jobs/{id}/logs`.
+#[derive(Debug, Serialize)]
+pub struct LogsResponse {
+    /// Log lines in the requested order.
+    pub logs: Vec<String>,
+    /// Number of lines returned.
+    pub count: usize,
+}
+
+/// Backs `GET /api/queues/{name}/jobs/{id}/logs` — fetch the log lines
+/// attached to a job.
+pub async fn get_job_logs(
+    state: &DashboardState,
+    queue: &str,
+    id: &JobId,
+    q: LogsQuery,
+) -> Result<LogsResponse> {
+    let range = JobRange {
+        start: q.start,
+        end: q.end,
+        descending: q.desc,
+    };
+    let logs = state.backend.get_logs(queue, id, range).await?;
+    Ok(LogsResponse {
+        count: logs.len(),
+        logs,
+    })
+}
+
 /// Backs `POST /api/queues/{name}/jobs/{id}/retry` — move a failed job back
 /// to `wait`, clearing failure state.
 pub async fn retry_job(state: &DashboardState, queue: &str, id: &JobId) -> Result<()> {

@@ -15,7 +15,7 @@ use crate::backend::{Backend, JobInsert, JobRange, RawJob, StateCounts};
 use crate::error::{Error, Result};
 use crate::events::QueueEvents;
 use crate::job::{Job, JobId, JobState};
-use crate::options::{JobOptions, QueueOptions};
+use crate::options::{JobOptions, QueueOptions, Removal};
 
 /// Typed producer handle.
 ///
@@ -345,6 +345,52 @@ where
     #[must_use]
     pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
         self.opts.prefix = prefix.into();
+        self
+    }
+
+    /// Override the queue-wide default job options.
+    ///
+    /// Each individual `Queue::add` call can still override these per-job;
+    /// any field not explicitly set falls back to this default.
+    #[must_use]
+    pub fn default_job_options(mut self, opts: JobOptions) -> Self {
+        self.opts.default_job_options = opts;
+        self
+    }
+
+    /// Configure the default [`Removal`] policy applied to every job in
+    /// this queue when it completes successfully.
+    ///
+    /// Pass [`Removal::Remove`] to drop completed jobs as soon as they
+    /// finish — useful for keeping Redis tidy when you don't need the
+    /// completion record.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use oxn::{Queue, options::Removal};
+    /// # use serde::{Deserialize, Serialize};
+    /// # #[derive(Clone, Serialize, Deserialize)]
+    /// # struct Email;
+    /// # async fn demo() -> oxn::Result<()> {
+    /// let q: Queue<Email> = Queue::builder("emails")
+    ///     .redis("redis://127.0.0.1:6379")
+    ///     .remove_on_complete(Removal::Remove)
+    ///     .build()
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    #[must_use]
+    pub fn remove_on_complete(mut self, r: Removal) -> Self {
+        self.opts.default_job_options.remove_on_complete = r;
+        self
+    }
+
+    /// Configure the default [`Removal`] policy applied to every job in
+    /// this queue when it fails permanently.
+    #[must_use]
+    pub fn remove_on_fail(mut self, r: Removal) -> Self {
+        self.opts.default_job_options.remove_on_fail = r;
         self
     }
 

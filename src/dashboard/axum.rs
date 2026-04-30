@@ -22,7 +22,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use crate::backend::Backend;
-use crate::dashboard::api::{self, ListQuery};
+use crate::dashboard::api::{self, ListQuery, LogsQuery};
 use crate::dashboard::{DashboardState, DASHBOARD_HTML};
 use crate::error::Error;
 use crate::job::JobId;
@@ -36,6 +36,7 @@ pub fn router(backend: Arc<dyn Backend>) -> Router {
         .route("/api/queues/:queue/counts", get(get_counts))
         .route("/api/queues/:queue/jobs", get(get_jobs))
         .route("/api/queues/:queue/jobs/:id", get(get_job))
+        .route("/api/queues/:queue/jobs/:id/logs", get(get_job_logs))
         .route("/api/queues/:queue/jobs/:id/retry", post(retry_job))
         .route("/api/queues/:queue/jobs/:id/promote", post(promote_job))
         .route("/api/queues/:queue/jobs/:id/remove", post(remove_job))
@@ -76,6 +77,15 @@ async fn get_job(
     Path((queue, id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let v = api::get_job(&s, &queue, &JobId::new(id)).await?;
+    Ok(Json(serde_json::to_value(v)?))
+}
+
+async fn get_job_logs(
+    State(s): State<DashboardState>,
+    Path((queue, id)): Path<(String, String)>,
+    Query(q): Query<LogsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let v = api::get_job_logs(&s, &queue, &JobId::new(id), q).await?;
     Ok(Json(serde_json::to_value(v)?))
 }
 
