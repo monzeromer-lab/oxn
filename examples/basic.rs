@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use oxn::options::Removal;
 use oxn::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +20,10 @@ async fn main() -> anyhow::Result<()> {
 
     let queue: Queue<Email> = Queue::builder("emails")
         .redis("redis://127.0.0.1:6379")
+        // Drop jobs from Redis as soon as they finish, so the queue
+        // stays tidy. Swap for `Removal::KeepLast(100)` to retain a
+        // bounded history.
+        .remove_on_complete(Removal::Remove)
         .build()
         .await?;
 

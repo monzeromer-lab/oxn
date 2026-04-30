@@ -56,6 +56,25 @@ impl QueueOptions {
         self.max_stream_length = n;
         self
     }
+
+    /// Configure the [`Removal`] policy applied to every job in this queue
+    /// when it completes successfully. Equivalent to setting
+    /// [`JobOptions::remove_on_complete`] on the queue's default job
+    /// options.
+    #[must_use]
+    pub fn remove_on_complete(mut self, r: Removal) -> Self {
+        self.default_job_options.remove_on_complete = r;
+        self
+    }
+
+    /// Configure the [`Removal`] policy applied to every job in this queue
+    /// when it fails permanently. Equivalent to setting
+    /// [`JobOptions::remove_on_fail`] on the queue's default job options.
+    #[must_use]
+    pub fn remove_on_fail(mut self, r: Removal) -> Self {
+        self.default_job_options.remove_on_fail = r;
+        self
+    }
 }
 
 /// Per-job submission options.

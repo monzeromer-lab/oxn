@@ -51,6 +51,51 @@
     .pill.waiting { color: var(--muted); }
     .empty { padding: 40px; text-align: center; color: var(--muted); }
     .reason { color: var(--danger); font-size: 12px; }
+    tr.row { cursor: pointer; }
+
+    /* Job detail drawer */
+    .drawer-backdrop {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.45);
+      display: none; z-index: 50;
+    }
+    .drawer-backdrop.open { display: block; }
+    .drawer {
+      position: fixed; top: 0; right: 0; height: 100vh; width: min(640px, 100vw);
+      background: var(--bg); border-left: 1px solid var(--border);
+      z-index: 51; transform: translateX(100%); transition: transform .15s ease-out;
+      display: flex; flex-direction: column;
+    }
+    .drawer.open { transform: translateX(0); }
+    .drawer header {
+      padding: 14px 18px; border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 10px;
+    }
+    .drawer header h2 { margin: 0; font-size: 14px; }
+    .drawer header .spacer { flex: 1; }
+    .drawer .body { padding: 16px 18px; overflow: auto; flex: 1; }
+    .drawer .body h3 {
+      margin: 18px 0 6px; font-size: 11px; text-transform: uppercase;
+      letter-spacing: 0.8px; color: var(--muted); font-weight: 600;
+    }
+    .drawer .body h3:first-child { margin-top: 0; }
+    .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 18px; font-size: 13px; }
+    .stats .k { color: var(--muted); }
+    .stats .v { word-break: break-all; }
+    pre.code {
+      background: var(--card); border: 1px solid var(--border); border-radius: 6px;
+      padding: 10px 12px; font-size: 12px; overflow: auto; margin: 0;
+      font-family: ui-monospace, SFMono-Regular, monospace; max-height: 280px;
+      white-space: pre-wrap; word-break: break-word;
+    }
+    .logs {
+      background: var(--card); border: 1px solid var(--border); border-radius: 6px;
+      padding: 10px 12px; font-size: 12px; overflow: auto;
+      font-family: ui-monospace, SFMono-Regular, monospace; max-height: 320px;
+      white-space: pre-wrap;
+    }
+    .logs .line { padding: 2px 0; border-bottom: 1px dotted var(--border); }
+    .logs .line:last-child { border-bottom: 0; }
+    .drawer .actions { display: flex; gap: 8px; flex-wrap: wrap; }
   </style>
 </head>
 <body>
@@ -64,11 +109,23 @@
     <nav id="queues"></nav>
     <section id="detail"><div class="empty">Select a queue to begin.</div></section>
   </main>
+
+  <div class="drawer-backdrop" id="drawerBackdrop" onclick="closeJob()"></div>
+  <aside class="drawer" id="drawer" aria-hidden="true">
+    <header>
+      <h2 id="drawerTitle">Job</h2>
+      <span class="spacer"></span>
+      <button class="btn ghost" onclick="reloadJob()">Refresh</button>
+      <button class="btn ghost" onclick="closeJob()">Close</button>
+    </header>
+    <div class="body" id="drawerBody"></div>
+  </aside>
   <script>
     const STATES = ['waiting','active','delayed','prioritized','completed','failed','paused','waiting-children'];
     let BASE = '';
     let selectedQueue = null;
     let selectedState = 'waiting';
+    let openJobId = null;
 
     // Auto-detect base path: this file is served at the dashboard root.
     (function detectBase() {
@@ -143,14 +200,14 @@
           </tr></thead>
           <tbody>
             ${res.jobs.map(j => `
-              <tr>
+              <tr class="row" onclick="openJob('${q}','${escapeAttr(j.id)}')">
                 <td><code>${j.id}</code></td>
                 <td>${j.name}</td>
                 <td><span class="pill ${j.state}">${j.state ?? '-'}</span></td>
                 <td>${j.attempts_made} / ${j.attempts_total}</td>
                 <td>${new Date(j.timestamp_ms).toISOString().slice(0,19).replace('T',' ')}</td>
                 <td>${j.finished_on_ms ? new Date(j.finished_on_ms).toISOString().slice(0,19).replace('T',' ') : '-'}</td>
-                <td>
+                <td onclick="event.stopPropagation()">
                   ${j.state === 'failed' ? `<button class="btn ghost" onclick="retryJob('${q}','${j.id}')">Retry</button>` : ''}
                   ${j.state === 'delayed' ? `<button class="btn ghost" onclick="promoteJob('${q}','${j.id}')">Promote</button>` : ''}
                   <button class="btn danger" onclick="removeJob('${q}','${j.id}')">Remove</button>
@@ -160,6 +217,103 @@
             `).join('')}
           </tbody>
         </table>
+      `;
+    }
+
+    function escapeHtml(s) {
+      if (s == null) return '';
+      return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+    function escapeAttr(s) { return escapeHtml(s).replace(/`/g, '&#96;'); }
+    function fmtTs(ms) { return ms ? new Date(ms).toISOString().slice(0,19).replace('T',' ') : '-'; }
+    function fmtJson(s) {
+      if (s == null || s === '') return '<em style="color:var(--muted)">none</em>';
+      try { return `<pre class="code">${escapeHtml(JSON.stringify(JSON.parse(s), null, 2))}</pre>`; }
+      catch { return `<pre class="code">${escapeHtml(s)}</pre>`; }
+    }
+
+    async function openJob(q, id) {
+      openJobId = id;
+      const drawer = document.getElementById('drawer');
+      const backdrop = document.getElementById('drawerBackdrop');
+      drawer.classList.add('open');
+      backdrop.classList.add('open');
+      drawer.setAttribute('aria-hidden', 'false');
+      document.getElementById('drawerTitle').textContent = `Job ${id}`;
+      document.getElementById('drawerBody').innerHTML = `<div class="empty">Loading…</div>`;
+      await renderJob(q, id);
+    }
+
+    function closeJob() {
+      openJobId = null;
+      const drawer = document.getElementById('drawer');
+      const backdrop = document.getElementById('drawerBackdrop');
+      drawer.classList.remove('open');
+      backdrop.classList.remove('open');
+      drawer.setAttribute('aria-hidden', 'true');
+    }
+
+    async function reloadJob() {
+      if (selectedQueue && openJobId) await renderJob(selectedQueue, openJobId);
+    }
+
+    async function renderJob(q, id) {
+      const body = document.getElementById('drawerBody');
+      let job, logs;
+      try {
+        [job, logs] = await Promise.all([
+          api(`/api/queues/${encodeURIComponent(q)}/jobs/${encodeURIComponent(id)}`),
+          api(`/api/queues/${encodeURIComponent(q)}/jobs/${encodeURIComponent(id)}/logs?desc=false`).catch(() => ({logs: [], count: 0})),
+        ]);
+      } catch (e) {
+        body.innerHTML = `<div class="empty">Failed to load: ${escapeHtml(e.message)}</div>`;
+        return;
+      }
+      if (!job) {
+        body.innerHTML = `<div class="empty">Job not found.</div>`;
+        return;
+      }
+      const stateClass = job.state || 'waiting';
+      const durMs = (job.processed_on_ms && job.finished_on_ms) ? (job.finished_on_ms - job.processed_on_ms) : null;
+      body.innerHTML = `
+        <div class="actions">
+          ${job.state === 'failed' ? `<button class="btn ghost" onclick="retryJob('${q}','${escapeAttr(job.id)}'); reloadJob();">Retry</button>` : ''}
+          ${job.state === 'delayed' ? `<button class="btn ghost" onclick="promoteJob('${q}','${escapeAttr(job.id)}'); reloadJob();">Promote</button>` : ''}
+          <button class="btn danger" onclick="removeJob('${q}','${escapeAttr(job.id)}'); closeJob();">Remove</button>
+        </div>
+
+        <h3>Stats</h3>
+        <div class="stats">
+          <div class="k">ID</div><div class="v"><code>${escapeHtml(job.id)}</code></div>
+          <div class="k">Name</div><div class="v">${escapeHtml(job.name)}</div>
+          <div class="k">State</div><div class="v"><span class="pill ${stateClass}">${escapeHtml(job.state ?? '-')}</span></div>
+          <div class="k">Attempts</div><div class="v">${job.attempts_made} / ${job.opts?.attempts ?? '?'}</div>
+          <div class="k">Priority</div><div class="v">${job.opts?.priority ?? 0}</div>
+          <div class="k">Created</div><div class="v">${fmtTs(job.timestamp_ms)}</div>
+          <div class="k">Started</div><div class="v">${fmtTs(job.processed_on_ms)}</div>
+          <div class="k">Finished</div><div class="v">${fmtTs(job.finished_on_ms)}</div>
+          <div class="k">Duration</div><div class="v">${durMs != null ? durMs + ' ms' : '-'}</div>
+          <div class="k">Lock token</div><div class="v">${job.lock_token ? `<code>${escapeHtml(job.lock_token)}</code>` : '-'}</div>
+          <div class="k">Remove on complete</div><div class="v">${escapeHtml(JSON.stringify(job.opts?.remove_on_complete ?? 'Keep'))}</div>
+          <div class="k">Remove on fail</div><div class="v">${escapeHtml(JSON.stringify(job.opts?.remove_on_fail ?? 'Keep'))}</div>
+        </div>
+
+        <h3>Data</h3>
+        ${fmtJson(job.data)}
+
+        <h3>Progress</h3>
+        ${fmtJson(job.progress_json)}
+
+        <h3>Return value</h3>
+        ${fmtJson(job.return_value_json)}
+
+        ${job.failed_reason ? `<h3>Failed reason</h3><pre class="code reason">${escapeHtml(job.failed_reason)}</pre>` : ''}
+        ${job.stacktrace && job.stacktrace.length ? `<h3>Stack trace</h3><pre class="code">${escapeHtml(job.stacktrace.join('\n\n'))}</pre>` : ''}
+
+        <h3>Logs <small style="color:var(--muted);font-weight:400">(${logs.count})</small></h3>
+        ${logs.count
+          ? `<div class="logs">${logs.logs.map(l => `<div class="line">${escapeHtml(l)}</div>`).join('')}</div>`
+          : `<div style="color:var(--muted);font-size:12px">No log lines.</div>`}
       `;
     }
 
@@ -180,8 +334,13 @@
       renderJobs();
     }
 
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') closeJob(); });
+
     refresh();
-    setInterval(refresh, 5000);
+    setInterval(async () => {
+      await refresh();
+      if (openJobId && selectedQueue) await renderJob(selectedQueue, openJobId);
+    }, 5000);
   </script>
 </body>
 </html>
