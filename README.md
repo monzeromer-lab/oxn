@@ -13,7 +13,7 @@ generic typed jobs, `tokio::sync::broadcast` semantics, builder patterns,
 
 ```toml
 [dependencies]
-oxn = "0.1.3"
+oxn = "0.2.1"
 ```
 
 ## Why another queue crate?
@@ -87,7 +87,7 @@ async fn main() -> oxn::Result<()> {
 
 ```toml
 [dependencies]
-oxn = { version = "0.1.3", features = ["scheduler", "dashboard-axum", "tls"] }
+oxn = { version = "0.2.1", features = ["scheduler", "dashboard-axum", "tls"] }
 ```
 
 ## Core concepts
@@ -154,6 +154,27 @@ queue.add(payload, JobOptions::new().lifo(true)).await?;                     // 
 Priority jobs live in a sorted set and are drained ahead of `wait`; delayed
 jobs are promoted by the worker's `move_to_active` Lua script as their
 scheduled time arrives.
+
+### Retention (delete on completion)
+
+Completed and failed jobs are kept indefinitely by default. To drop them as
+soon as they finish — or keep a bounded window — configure a [`Removal`]
+policy at queue setup time:
+
+```rust
+use oxn::options::Removal;
+
+let queue: Queue<Email> = Queue::builder("emails")
+    .redis("redis://127.0.0.1:6379")
+    .remove_on_complete(Removal::Remove)        // delete on success
+    .remove_on_fail(Removal::KeepLast(100))     // keep last 100 failures
+    .build()
+    .await?;
+```
+
+The same policy can be set per-job via `JobOptions::remove_on_complete` /
+`JobOptions::remove_on_fail`; per-job values override the queue default.
+`Removal` variants: `Keep`, `Remove`, `KeepLast(n)`, `KeepFor(Duration)`.
 
 ### Deduplication
 
@@ -233,10 +254,26 @@ FlowProducer::new(queue.backend()).add(tree).await?;
 ## Dashboard
 
 Enable `dashboard-axum` or `dashboard-actix`. Both export a framework-native
-factory that mounts the same set of endpoints (`/api/queues`,
-`/api/queues/{name}/counts`, `/api/queues/{name}/jobs?state=failed`, plus
-POST `pause`/`resume`/`drain` and per-job `retry`/`promote`/`remove`) and a
-zero-dependency HTML UI served at `/`.
+factory that mounts the same set of endpoints and serves a zero-dependency
+HTML UI at `/`.
+
+| Method | Path                                        | Purpose                                  |
+| ------ | ------------------------------------------- | ---------------------------------------- |
+| GET    | `/api/queues`                               | List queues with pause flag + counts     |
+| GET    | `/api/queues/{name}/counts`                 | Per-state job counts                     |
+| GET    | `/api/queues/{name}/jobs?state=failed`      | Page through jobs in a state             |
+| GET    | `/api/queues/{name}/jobs/{id}`              | Full job record (data, opts, stats, …)   |
+| GET    | `/api/queues/{name}/jobs/{id}/logs`         | Log lines attached via `Backend::log`    |
+| POST   | `/api/queues/{name}/jobs/{id}/retry`        | Move a failed job back to `wait`         |
+| POST   | `/api/queues/{name}/jobs/{id}/promote`      | Skip a delayed job's wait time           |
+| POST   | `/api/queues/{name}/jobs/{id}/remove`       | Delete a job and its auxiliary keys      |
+| POST   | `/api/queues/{name}/pause`/`resume`/`drain` | Queue-wide controls                      |
+
+Clicking a row in the bundled UI opens a side drawer with the job's
+**data**, **stats** (state, attempts, priority, timestamps, duration, lock
+token, retention policies), **progress**, **return value**, **failed reason
++ stack trace** when present, and the captured **log lines** — all backed
+by the endpoints above.
 
 ```rust
 // axum

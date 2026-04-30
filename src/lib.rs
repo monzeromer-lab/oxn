@@ -99,7 +99,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! oxn = { version = "0.1", features = ["tls"] }
+//! oxn = { version = "0.2", features = ["tls"] }
 //! ```
 //!
 //! Then build the queue exactly the same way:
@@ -121,7 +121,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! oxn = { version = "0.1", features = ["scheduler", "flow", "dashboard-axum"] }
+//! oxn = { version = "0.2", features = ["scheduler", "flow", "dashboard-axum"] }
 //! ```
 //!
 //! ## Minimum supported Rust version
