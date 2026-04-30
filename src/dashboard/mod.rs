@@ -7,8 +7,12 @@
 //! into `axum::Router` or `actix_web::Scope`.
 //!
 //! The bundled UI is a single static HTML page (no build step) served at
-//! `/`. Production deployments will typically override the UI path or wire
-//! up their own frontend.
+//! `/`. Clicking a job row opens a side drawer with the full record —
+//! data, options, computed stats, progress, return value, failure stack
+//! trace, and captured log lines — pulled from
+//! `GET /api/queues/{name}/jobs/{id}` and
+//! `GET /api/queues/{name}/jobs/{id}/logs`. Production deployments will
+//! typically override the UI path or wire up their own frontend.
 
 pub mod api;
 
