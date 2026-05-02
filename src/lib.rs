@@ -124,6 +124,22 @@
 //! oxn = { version = "0.2", features = ["scheduler", "flow", "dashboard-axum"] }
 //! ```
 //!
+//! ## Recent releases
+//!
+//! - **0.2.2** — bulk dashboard ops: `Backend::clean(state, limit)` and
+//!   `Backend::promote_all` plus matching `POST /clean/{state}` and
+//!   `POST /promote-all` routes. State-aware buttons in the bundled UI.
+//!   Subscriber decodes `Event::Cleaned` (was silently ignored).
+//! - **0.2.1** — documentation refresh of the dashboard work. No code
+//!   changes.
+//! - **0.2.0** — job-detail drawer + per-job logs endpoint;
+//!   `QueueBuilder::remove_on_complete` / `remove_on_fail` shortcuts;
+//!   pool keepalive task to survive managed-Redis idle FINs;
+//!   `BZPOPMIN` moved to a regular pool slot to stop blocking-call
+//!   head-of-line starvation; honored `cfg.pool_size`.
+//!
+//! See `CHANGELOG.md` in the repo for the full per-version history.
+//!
 //! ## Minimum supported Rust version
 //!
 //! Rust 1.85 (edition 2024).

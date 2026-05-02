@@ -239,6 +239,30 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
     /// Move a delayed job into `wait` ahead of schedule.
     async fn promote(&self, queue: &str, id: &JobId) -> Result<()>;
 
+    /// Move **every** delayed job into `wait` (or `paused`, if the queue
+    /// is paused) immediately. Returns the number of jobs promoted.
+    ///
+    /// Useful for operators clearing a backlog of retry-delayed jobs after
+    /// fixing a downstream issue.
+    async fn promote_all(&self, queue: &str) -> Result<u64>;
+
+    /// Bulk-delete jobs sitting in a finished/scheduled state.
+    ///
+    /// Supported states: `Completed`, `Failed`, `Delayed`, `Prioritized`,
+    /// `WaitingChildren`. Calling with `Waiting`, `Paused`, or `Active`
+    /// returns [`crate::Error::Config`] — those are list-backed and you
+    /// should use [`Self::drain`] / [`Self::obliterate`] instead.
+    ///
+    /// `limit = 0` means "every job in that state". Returns the number of
+    /// jobs removed. Job hash + auxiliary keys (logs, dependencies, etc.)
+    /// are deleted along with the zset entries.
+    async fn clean(
+        &self,
+        queue: &str,
+        state: JobState,
+        limit: u64,
+    ) -> Result<u64>;
+
     /// Retry a failed job by moving it back to `wait`.
     async fn retry(&self, queue: &str, id: &JobId) -> Result<()>;
 

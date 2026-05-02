@@ -23,7 +23,7 @@ use actix_web::web::{Data, Json, Path, Query};
 use actix_web::{web, HttpResponse, Responder, Scope};
 
 use crate::backend::Backend;
-use crate::dashboard::api::{self, ListQuery, LogsQuery};
+use crate::dashboard::api::{self, CleanBody, ListQuery, LogsQuery};
 use crate::dashboard::{DashboardState, DASHBOARD_HTML};
 use crate::error::Error;
 use crate::job::JobId;
@@ -45,6 +45,8 @@ pub fn scope(backend: Arc<dyn Backend>) -> Scope {
         .route("/api/queues/{queue}/pause", web::post().to(pause_queue))
         .route("/api/queues/{queue}/resume", web::post().to(resume_queue))
         .route("/api/queues/{queue}/drain", web::post().to(drain_queue))
+        .route("/api/queues/{queue}/clean/{state}", web::post().to(clean_state))
+        .route("/api/queues/{queue}/promote-all", web::post().to(promote_all_delayed))
 }
 
 async fn index() -> impl Responder {
@@ -130,6 +132,25 @@ async fn drain_queue(
     let include_delayed = body.map(|b| b.include_delayed).unwrap_or(false);
     api::drain_queue(s.get_ref(), &path, include_delayed).await?;
     Ok(HttpResponse::NoContent().finish())
+}
+
+async fn clean_state(
+    s: Data<DashboardState>,
+    path: Path<(String, String)>,
+    body: Option<Json<CleanBody>>,
+) -> ApiResult {
+    let (queue, job_state) = path.into_inner();
+    let body = body.map(|b| b.into_inner()).unwrap_or_default();
+    let r = api::clean_state(s.get_ref(), &queue, &job_state, body).await?;
+    Ok(HttpResponse::Ok().json(r))
+}
+
+async fn promote_all_delayed(
+    s: Data<DashboardState>,
+    path: Path<String>,
+) -> ApiResult {
+    let r = api::promote_all(s.get_ref(), &path).await?;
+    Ok(HttpResponse::Ok().json(r))
 }
 
 type ApiResult = std::result::Result<HttpResponse, ApiError>;

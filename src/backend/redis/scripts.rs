@@ -36,6 +36,8 @@ const ALL_SCRIPTS: &[&str] = &[
     include_str!("lua/promote.lua"),
     include_str!("lua/retry.lua"),
     include_str!("lua/remove.lua"),
+    include_str!("lua/clean.lua"),
+    include_str!("lua/promote_all.lua"),
 ];
 
 pub(super) struct Scripts {
@@ -49,6 +51,8 @@ pub(super) struct Scripts {
     pub promote: Script,
     pub retry: Script,
     pub remove: Script,
+    pub clean: Script,
+    pub promote_all: Script,
 }
 
 impl Scripts {
@@ -64,6 +68,8 @@ impl Scripts {
             promote: Script::new(ALL_SCRIPTS[7]),
             retry: Script::new(ALL_SCRIPTS[8]),
             remove: Script::new(ALL_SCRIPTS[9]),
+            clean: Script::new(ALL_SCRIPTS[10]),
+            promote_all: Script::new(ALL_SCRIPTS[11]),
         }
     }
 

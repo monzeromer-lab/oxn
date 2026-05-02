@@ -147,3 +147,199 @@ async fn dashboard_serves_index_html() {
     let _ = srv.handle.await;
     common::teardown(&q).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboard_clean_endpoint_removes_completed_jobs() {
+    use oxn::{Job, Worker};
+    let (q, backend) = common::fresh_queue::<T>("dash-clean").await;
+
+    // Seed completed jobs.
+    for _ in 0..3u32 {
+        q.add(T(0), JobOptions::new()).await.unwrap();
+    }
+    let worker = Worker::builder(q.clone(), |_: Job<T>| async {
+        Ok::<_, oxn::Error>(())
+    })
+    .concurrency(1)
+    .drain_delay(Duration::from_millis(50))
+    .build();
+    let cancel = worker.cancellation_token();
+    let h = tokio::spawn(worker.run());
+    common::wait_for(Duration::from_secs(5), || {
+        let q = q.clone();
+        async move { q.counts().await.map(|c| c.completed == 3).unwrap_or(false) }
+    })
+    .await;
+    cancel.cancel();
+    h.await.unwrap().unwrap();
+
+    let srv = spawn_dashboard(backend.clone() as Arc<dyn Backend>).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let resp: serde_json::Value = reqwest::Client::new()
+        .post(format!(
+            "{}/api/queues/{}/clean/completed",
+            srv.base,
+            q.name()
+        ))
+        .header("content-type", "application/json")
+        .body(r#"{"limit":0}"#)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["count"], 3);
+    assert_eq!(q.counts().await.unwrap().completed, 0);
+
+    srv.cancel.cancel();
+    let _ = srv.handle.await;
+    common::teardown(&q).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboard_clean_endpoint_works_without_a_body() {
+    use oxn::Job;
+    let (q, backend) = common::fresh_queue::<T>("dash-clean-no-body").await;
+
+    for _ in 0..2u32 {
+        q.add(T(0), JobOptions::new()).await.unwrap();
+    }
+    let worker = oxn::Worker::builder(q.clone(), |_: Job<T>| async {
+        Ok::<_, oxn::Error>(())
+    })
+    .concurrency(1)
+    .drain_delay(Duration::from_millis(50))
+    .build();
+    let cancel = worker.cancellation_token();
+    let h = tokio::spawn(worker.run());
+    common::wait_for(Duration::from_secs(5), || {
+        let q = q.clone();
+        async move { q.counts().await.map(|c| c.completed == 2).unwrap_or(false) }
+    })
+    .await;
+    cancel.cancel();
+    h.await.unwrap().unwrap();
+
+    let srv = spawn_dashboard(backend.clone() as Arc<dyn Backend>).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // No body — the handler should treat it as `limit: 0` (everything).
+    let resp: serde_json::Value = reqwest::Client::new()
+        .post(format!(
+            "{}/api/queues/{}/clean/completed",
+            srv.base,
+            q.name()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["count"], 2);
+
+    srv.cancel.cancel();
+    let _ = srv.handle.await;
+    common::teardown(&q).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboard_clean_endpoint_rejects_unknown_state() {
+    let (q, backend) = common::fresh_queue::<T>("dash-clean-bad").await;
+    let srv = spawn_dashboard(backend.clone() as Arc<dyn Backend>).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/api/queues/{}/clean/not-a-real-state",
+            srv.base,
+            q.name()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "unknown state should be 400");
+
+    srv.cancel.cancel();
+    let _ = srv.handle.await;
+    common::teardown(&q).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboard_clean_endpoint_rejects_list_backed_state() {
+    // Trying to clean `waiting` should hit `Error::Config` → 400.
+    let (q, backend) = common::fresh_queue::<T>("dash-clean-waiting").await;
+    let srv = spawn_dashboard(backend.clone() as Arc<dyn Backend>).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/api/queues/{}/clean/waiting",
+            srv.base,
+            q.name()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    srv.cancel.cancel();
+    let _ = srv.handle.await;
+    common::teardown(&q).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboard_promote_all_endpoint_moves_delayed_to_waiting() {
+    let (q, backend) = common::fresh_queue::<T>("dash-promote-all").await;
+
+    for _ in 0..4u32 {
+        q.add(T(0), JobOptions::new().delay(Duration::from_secs(60)))
+            .await
+            .unwrap();
+    }
+    assert_eq!(q.counts().await.unwrap().delayed, 4);
+
+    let srv = spawn_dashboard(backend.clone() as Arc<dyn Backend>).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let resp: serde_json::Value = reqwest::Client::new()
+        .post(format!("{}/api/queues/{}/promote-all", srv.base, q.name()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["count"], 4);
+
+    let c = q.counts().await.unwrap();
+    assert_eq!(c.delayed, 0);
+    assert_eq!(c.waiting, 4);
+
+    srv.cancel.cancel();
+    let _ = srv.handle.await;
+    common::teardown(&q).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboard_promote_all_endpoint_returns_zero_when_empty() {
+    let (q, backend) = common::fresh_queue::<T>("dash-promote-all-empty").await;
+    let srv = spawn_dashboard(backend.clone() as Arc<dyn Backend>).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let resp: serde_json::Value = reqwest::Client::new()
+        .post(format!("{}/api/queues/{}/promote-all", srv.base, q.name()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["count"], 0);
+
+    srv.cancel.cancel();
+    let _ = srv.handle.await;
+    common::teardown(&q).await;
+}

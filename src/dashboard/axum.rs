@@ -22,7 +22,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use crate::backend::Backend;
-use crate::dashboard::api::{self, ListQuery, LogsQuery};
+use crate::dashboard::api::{self, CleanBody, ListQuery, LogsQuery};
 use crate::dashboard::{DashboardState, DASHBOARD_HTML};
 use crate::error::Error;
 use crate::job::JobId;
@@ -43,6 +43,8 @@ pub fn router(backend: Arc<dyn Backend>) -> Router {
         .route("/api/queues/:queue/pause", post(pause_queue))
         .route("/api/queues/:queue/resume", post(resume_queue))
         .route("/api/queues/:queue/drain", post(drain_queue))
+        .route("/api/queues/:queue/clean/:state", post(clean_state))
+        .route("/api/queues/:queue/promote-all", post(promote_all_delayed))
         .with_state(state)
 }
 
@@ -143,6 +145,24 @@ async fn drain_queue(
     let include_delayed = body.map(|b| b.include_delayed).unwrap_or(false);
     api::drain_queue(&s, &queue, include_delayed).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn clean_state(
+    State(s): State<DashboardState>,
+    Path((queue, job_state)): Path<(String, String)>,
+    body: Option<Json<CleanBody>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let body = body.map(|b| b.0).unwrap_or_default();
+    let r = api::clean_state(&s, &queue, &job_state, body).await?;
+    Ok(Json(serde_json::to_value(r)?))
+}
+
+async fn promote_all_delayed(
+    State(s): State<DashboardState>,
+    Path(queue): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let r = api::promote_all(&s, &queue).await?;
+    Ok(Json(serde_json::to_value(r)?))
 }
 
 struct AppError(Error);

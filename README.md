@@ -13,8 +13,18 @@ generic typed jobs, `tokio::sync::broadcast` semantics, builder patterns,
 
 ```toml
 [dependencies]
-oxn = "0.2.1"
+oxn = "0.2.2"
 ```
+
+See [CHANGELOG.md](CHANGELOG.md) for the per-version notes. The most
+recent two:
+
+- **0.2.2** — Bulk dashboard ops (`Backend::clean`, `Backend::promote_all`,
+  matching `POST /clean/{state}` and `POST /promote-all` routes, state-aware
+  buttons in the bundled UI). Subscriber now decodes `Event::Cleaned`. 18 new
+  tests; suite at 116.
+- **0.2.1** — Documentation refresh of the dashboard work that landed in
+  0.2.0 (drawer, retention shortcuts, route table). No code changes.
 
 ## Why another queue crate?
 
@@ -87,7 +97,7 @@ async fn main() -> oxn::Result<()> {
 
 ```toml
 [dependencies]
-oxn = { version = "0.2.1", features = ["scheduler", "dashboard-axum", "tls"] }
+oxn = { version = "0.2.2", features = ["scheduler", "dashboard-axum", "tls"] }
 ```
 
 ## Core concepts
@@ -268,6 +278,8 @@ HTML UI at `/`.
 | POST   | `/api/queues/{name}/jobs/{id}/promote`      | Skip a delayed job's wait time           |
 | POST   | `/api/queues/{name}/jobs/{id}/remove`       | Delete a job and its auxiliary keys      |
 | POST   | `/api/queues/{name}/pause`/`resume`/`drain` | Queue-wide controls                      |
+| POST   | `/api/queues/{name}/clean/{state}`          | Bulk-delete jobs in `completed` / `failed` / `delayed` / `prioritized` / `waiting-children`. Body: `{"limit": N}` (`0` = all). Returns `{"count": N}`. |
+| POST   | `/api/queues/{name}/promote-all`            | Move every delayed job to `wait` immediately. Returns `{"count": N}`. |
 
 Clicking a row in the bundled UI opens a side drawer with the job's
 **data**, **stats** (state, attempts, priority, timestamps, duration, lock
@@ -332,23 +344,33 @@ Every state transition is a single `EVAL` — scripts live under
 
 ## Testing
 
-The crate ships with 77 tests:
+The crate ships with **116 tests** (5-run stress passes 580/580):
 
-- 38 unit tests for types, serde round-trips, key layout, option builders,
-  error code mapping, progress clamping, flow tree building
-- 39 integration tests hitting a live Redis (`redis://127.0.0.1:6379` by
-  default; override with `TEST_REDIS_URL`), each isolated by a unique queue
-  name and cleaned up via `obliterate(true)`
+- **42 unit tests** — types, serde round-trips, key layout, option
+  builders, error-code mapping, progress clamping, flow-tree building,
+  dashboard API serde.
+- **62 integration tests** hitting a live Redis (`redis://127.0.0.1:6379`
+  by default; override with `TEST_REDIS_URL`), each isolated by a unique
+  queue name and cleaned up via `obliterate(true)`. Coverage spans
+  add/process/complete, delayed/priority ordering, retry+backoff, stalled
+  recovery, pause/resume, drain/obliterate, dedup, flow trees, scheduler
+  ticks, dashboard HTTP round-trips, script-cache preload regression,
+  and the new bulk `clean`/`promote_all` ops (including event emission and
+  worker-wakeup behaviour).
+- **12 doctests** keep the inline examples honest.
 
 ```bash
-# run everything
+# run everything (default: per-test backend, stable + ~4s locally)
 cargo test --features "scheduler,flow,dashboard-axum"
 
 # unit tests only (no Redis required)
 cargo test --lib --no-default-features
 
-# point at a different Redis
-TEST_REDIS_URL=redis://redis.local:6379 cargo test
+# point at a different Redis (managed Redis CI: shared per-binary backend
+# avoids connect storms and the deadpool conn-recycle race)
+TEST_REDIS_URL=rediss://... \
+OXN_TEST_SHARED_BACKEND=1 \
+  cargo test --features "tls,scheduler,flow,dashboard-axum" -- --test-threads=1
 ```
 
 ## Minimum Rust version

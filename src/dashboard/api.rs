@@ -245,3 +245,75 @@ pub async fn drain_queue(
 ) -> Result<()> {
     state.backend.drain(queue, include_delayed).await
 }
+
+/// Body of `POST /api/queues/{name}/clean/{state}`.
+#[derive(Debug, Deserialize, Default)]
+pub struct CleanBody {
+    /// Maximum number of jobs to remove. `0` (the default) means "all".
+    #[serde(default)]
+    pub limit: u64,
+}
+
+/// Response body of `POST /api/queues/{name}/clean/{state}` — how many
+/// jobs were actually removed.
+#[derive(Debug, Serialize)]
+pub struct CountResponse {
+    /// Number of jobs affected.
+    pub count: u64,
+}
+
+/// Backs `POST /api/queues/{name}/clean/{state}` — bulk-remove jobs in a
+/// finished/scheduled state (`completed`, `failed`, `delayed`,
+/// `prioritized`, `waiting-children`).
+pub async fn clean_state(
+    state: &DashboardState,
+    queue: &str,
+    job_state: &str,
+    body: CleanBody,
+) -> Result<CountResponse> {
+    let js = JobState::parse(job_state).ok_or_else(|| {
+        crate::error::Error::Config(format!("clean: unknown state '{job_state}'"))
+    })?;
+    let count = state.backend.clean(queue, js, body.limit).await?;
+    Ok(CountResponse { count })
+}
+
+/// Backs `POST /api/queues/{name}/promote-all` — move every delayed job
+/// into `wait` immediately. Returns the number of jobs promoted.
+pub async fn promote_all(
+    state: &DashboardState,
+    queue: &str,
+) -> Result<CountResponse> {
+    let count = state.backend.promote_all(queue).await?;
+    Ok(CountResponse { count })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_body_default_limit_is_zero() {
+        let b = CleanBody::default();
+        assert_eq!(b.limit, 0);
+    }
+
+    #[test]
+    fn clean_body_parses_explicit_limit() {
+        let b: CleanBody = serde_json::from_str(r#"{"limit": 25}"#).unwrap();
+        assert_eq!(b.limit, 25);
+    }
+
+    #[test]
+    fn clean_body_accepts_empty_object_as_default() {
+        let b: CleanBody = serde_json::from_str("{}").unwrap();
+        assert_eq!(b.limit, 0);
+    }
+
+    #[test]
+    fn count_response_serializes_to_json() {
+        let r = CountResponse { count: 7 };
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(s, r#"{"count":7}"#);
+    }
+}

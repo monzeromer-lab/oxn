@@ -726,6 +726,58 @@ impl Backend for RedisBackend {
         Ok(())
     }
 
+    async fn promote_all(&self, queue: &str) -> Result<u64> {
+        let keys = self.keys(queue);
+        let mut conn = self.conn().await?;
+        let moved: i64 = self
+            .scripts
+            .promote_all
+            .key(keys.delayed())
+            .key(keys.wait())
+            .key(keys.events())
+            .key(keys.marker())
+            .key(keys.meta())
+            .key(keys.paused())
+            .arg(self.max_stream_length as i64)
+            .invoke_async(&mut *conn)
+            .await?;
+        Ok(moved.max(0) as u64)
+    }
+
+    async fn clean(
+        &self,
+        queue: &str,
+        state: JobState,
+        limit: u64,
+    ) -> Result<u64> {
+        let keys = self.keys(queue);
+        let zset = match state {
+            JobState::Completed => keys.completed(),
+            JobState::Failed => keys.failed(),
+            JobState::Delayed => keys.delayed(),
+            JobState::Prioritized => keys.prioritized(),
+            JobState::WaitingChildren => keys.waiting_children(),
+            JobState::Waiting | JobState::Paused | JobState::Active => {
+                return Err(Error::Config(format!(
+                    "clean({state}): list-backed states cannot be cleaned via this API; \
+                     use drain() or obliterate() instead"
+                )))
+            }
+        };
+        let mut conn = self.conn().await?;
+        let removed: i64 = self
+            .scripts
+            .clean
+            .key(zset)
+            .key(keys.events())
+            .key(keys.job_hash_prefix())
+            .arg(limit as i64)
+            .arg(self.max_stream_length as i64)
+            .invoke_async(&mut *conn)
+            .await?;
+        Ok(removed.max(0) as u64)
+    }
+
     async fn retry(&self, queue: &str, id: &JobId) -> Result<()> {
         let keys = self.keys(queue);
         let mut conn = self.conn().await?;
@@ -1146,6 +1198,9 @@ fn parse_stream_entry(map: &std::collections::HashMap<String, redis::Value>) -> 
         "deduplicated" => Event::Deduplicated {
             id,
             dedup_id: s(map, "dedupId").unwrap_or_default(),
+        },
+        "cleaned" => Event::Cleaned {
+            count: s(map, "count").and_then(|c| c.parse().ok()).unwrap_or(0),
         },
         _ => Event::Unknown,
     }

@@ -185,15 +185,34 @@
       await renderJobs();
     }
 
+    function stateActions(q, state, total) {
+      // Bulk actions that depend on the currently-selected state. Empty
+      // string for states where bulk operations don't make sense.
+      if (state === 'completed' || state === 'failed') {
+        if (!total) return '';
+        return `<button class="btn danger" onclick="cleanState('${q}','${state}',${total})">Clean ${total} ${state}</button>`;
+      }
+      if (state === 'delayed') {
+        const help = `<span style="color:var(--muted);font-size:11px;margin-left:8px">Jobs sit in <em>delayed</em> when the producer asked for a delay, when a handler returned <code>Error::Delayed</code>/<code>RateLimited</code>, when a retry is waiting for backoff, or when the scheduler queued them for a future fire time.</span>`;
+        if (!total) return help;
+        return `<button class="btn ghost" onclick="promoteAllDelayed('${q}',${total})">Promote all ${total}</button>` + help;
+      }
+      return '';
+    }
+
     async function renderJobs() {
       const q = selectedQueue;
       const res = await api(`/api/queues/${encodeURIComponent(q)}/jobs?state=${selectedState}&start=0&end=49&desc=true`);
       const out = document.getElementById('jobs');
+      const actions = stateActions(q, selectedState, res.total);
+      const actionsBar = actions
+        ? `<div class="toolbar" style="margin-bottom:10px">${actions}</div>`
+        : '';
       if (!res.jobs.length) {
-        out.innerHTML = `<div class="empty">No ${selectedState} jobs.</div>`;
+        out.innerHTML = `${actionsBar}<div class="empty">No ${selectedState} jobs.</div>`;
         return;
       }
-      out.innerHTML = `
+      out.innerHTML = `${actionsBar}
         <table>
           <thead><tr>
             <th>ID</th><th>Name</th><th>State</th><th>Attempts</th><th>Created</th><th>Finished</th><th></th>
@@ -332,6 +351,26 @@
       if (!confirm('Remove job ' + id + '?')) return;
       await api(`/api/queues/${encodeURIComponent(q)}/jobs/${id}/remove`, {method:'POST'});
       renderJobs();
+    }
+
+    async function cleanState(q, state, total) {
+      if (!confirm(`Clean ${total} ${state} job${total === 1 ? '' : 's'} from "${q}"? Their hashes, logs, and dependency keys are deleted.`)) return;
+      const res = await api(
+        `/api/queues/${encodeURIComponent(q)}/clean/${encodeURIComponent(state)}`,
+        { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ limit: 0 }) },
+      );
+      refresh();
+      console.info('cleaned', res?.count, state, 'jobs');
+    }
+
+    async function promoteAllDelayed(q, total) {
+      if (!confirm(`Promote all ${total} delayed job${total === 1 ? '' : 's'} on "${q}" to wait?`)) return;
+      const res = await api(
+        `/api/queues/${encodeURIComponent(q)}/promote-all`,
+        { method:'POST' },
+      );
+      refresh();
+      console.info('promoted', res?.count, 'delayed jobs');
     }
 
     document.addEventListener('keydown', e => { if (e.key === 'Escape') closeJob(); });
