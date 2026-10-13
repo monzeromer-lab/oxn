@@ -58,6 +58,7 @@ pub(super) const ALL_SCRIPTS: &[(&str, &str)] = &[
     script!("drain"),
     script!("obliterate_begin"),
     script!("add_bulk"),
+    script!("job_update"),
 ];
 
 pub(super) struct Scripts {
@@ -77,6 +78,7 @@ pub(super) struct Scripts {
     pub drain: Script,
     pub obliterate_begin: Script,
     pub add_bulk: Script,
+    pub job_update: Script,
 }
 
 impl Scripts {
@@ -99,6 +101,7 @@ impl Scripts {
             drain: s(13),
             obliterate_begin: s(14),
             add_bulk: s(15),
+            job_update: s(16),
         }
     }
 

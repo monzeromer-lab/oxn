@@ -150,6 +150,9 @@ pub struct RunArgs {
     /// exactly what the raw observer saw.
     #[arg(long)]
     pub oxn_subscriber: bool,
+    /// Handlers report progress and a log line via `JobContext` each run.
+    #[arg(long)]
+    pub ctx_ops: bool,
     /// Worker `max_stalled` (stalls a job may survive before it fails).
     #[arg(long)]
     pub max_stalled: Option<u32>,
@@ -212,6 +215,8 @@ pub struct Config {
     pub max_stalled: u32,
     /// Cross-check oxn's subscriber against the raw observer.
     pub oxn_subscriber: bool,
+    /// JobContext progress + log on every run.
+    pub ctx_ops: bool,
 }
 
 fn ser_dur<S: serde::Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
@@ -267,6 +272,7 @@ impl Config {
             max_stream_len: 200_000,
             max_stalled: 1,
             oxn_subscriber: a.oxn_subscriber,
+            ctx_ops: a.ctx_ops,
         };
         match a.scenario {
             Smoke => {}

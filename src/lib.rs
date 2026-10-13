@@ -190,7 +190,7 @@ pub use crate::events::{Event, EventRecord, QueueEvents, StreamStart};
 pub use crate::job::{Backoff, Job, JobId, JobState, Progress};
 pub use crate::options::{JobOptions, QueueOptions, ResolvedJobOptions, WorkerOptions};
 pub use crate::queue::Queue;
-pub use crate::worker::Worker;
+pub use crate::worker::{JobContext, Worker};
 
 #[cfg(feature = "flow")]
 pub use crate::flow::{FlowNode, FlowProducer};

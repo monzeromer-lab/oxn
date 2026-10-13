@@ -28,6 +28,7 @@ mod events;
 mod explicit_ids;
 mod flow;
 mod handler_panics;
+mod job_context;
 mod job_defaults;
 mod obliterate_scope;
 mod pause_resume;

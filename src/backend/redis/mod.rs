@@ -1205,10 +1205,7 @@ impl Backend for RedisBackend {
     }
 
     async fn log(&self, queue: &str, id: &JobId, line: &str) -> Result<()> {
-        let keys = self.keys(queue);
-        let mut conn = self.conn().await?;
-        let _: () = conn.rpush(keys.job_logs(id.as_str()), line).await?;
-        Ok(())
+        self.job_update(queue, id, "log", line).await
     }
 
     async fn get_logs(&self, queue: &str, id: &JobId, range: JobRange) -> Result<Vec<String>> {
@@ -1225,27 +1222,7 @@ impl Backend for RedisBackend {
     }
 
     async fn update_progress(&self, queue: &str, id: &JobId, progress_json: &str) -> Result<()> {
-        let keys = self.keys(queue);
-        let mut conn = self.conn().await?;
-        let _: () = conn
-            .hset(keys.job_hash(id.as_str()), "progress", progress_json)
-            .await?;
-        // also emit a progress event
-        let _: () = redis::cmd("XADD")
-            .arg(keys.events())
-            .arg("MAXLEN")
-            .arg("~")
-            .arg(self.max_stream_length)
-            .arg("*")
-            .arg("event")
-            .arg("progress")
-            .arg("jobId")
-            .arg(id.as_str())
-            .arg("data")
-            .arg(progress_json)
-            .query_async(&mut *conn)
-            .await?;
-        Ok(())
+        self.job_update(queue, id, "progress", progress_json).await
     }
 
     async fn subscribe(&self, queue: &str, from: StreamStart) -> Result<RecordStream> {
@@ -1303,6 +1280,24 @@ impl RedisBackend {
         }
         let mut conn = self.conn().await?;
         let _: String = cmd.query_async(&mut *conn).await?;
+        Ok(())
+    }
+
+    /// Progress or log write that refuses (`NotFound`) for a missing job
+    /// instead of re-creating its keys.
+    async fn job_update(&self, queue: &str, id: &JobId, kind: &str, value: &str) -> Result<()> {
+        let keys = self.keys(queue);
+        let mut inv = self.scripts.job_update.prepare_invoke();
+        inv.key(keys.job_hash(id.as_str()))
+            .key(keys.job_logs(id.as_str()))
+            .key(keys.events())
+            .arg(kind)
+            .arg(value)
+            .arg(id.as_str())
+            .arg(self.max_stream_length as i64);
+        let mut conn = self.conn().await?;
+        self.eval(&mut conn, "job_update", queue, Some(id.as_str()), &inv)
+            .await?;
         Ok(())
     }
 

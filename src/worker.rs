@@ -29,7 +29,107 @@ use crate::queue::{Queue, decode_job};
 /// Boxed future returned by a handler.
 pub type HandlerFuture<R> = Pin<Box<dyn Future<Output = Result<R>> + Send + 'static>>;
 
-type HandlerFn<D, R> = Arc<dyn Fn(Job<D>) -> HandlerFuture<R> + Send + Sync + 'static>;
+type HandlerFn<D, R> = Arc<dyn Fn(Job<D>, JobContext) -> HandlerFuture<R> + Send + Sync + 'static>;
+
+/// Per-job handle given to handlers built with [`Worker::builder_with_ctx`].
+///
+/// Cheap to clone. Lets a handler report progress, write log lines, learn
+/// that its lock was lost (another worker or the stalled scanner now owns
+/// the job, so its result will be discarded), and wind down cooperatively
+/// when the worker is shutting down.
+#[derive(Clone)]
+pub struct JobContext {
+    inner: Arc<CtxInner>,
+}
+
+struct CtxInner {
+    backend: Arc<dyn Backend>,
+    queue: String,
+    id: crate::job::JobId,
+    attempt: u32,
+    lock_lost: CancellationToken,
+    shutdown: CancellationToken,
+}
+
+impl std::fmt::Debug for JobContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobContext")
+            .field("queue", &self.inner.queue)
+            .field("job_id", &self.inner.id)
+            .field("attempt", &self.inner.attempt)
+            .field("lock_lost", &self.lock_lost())
+            .field("shutdown_requested", &self.shutdown_requested())
+            .finish()
+    }
+}
+
+impl JobContext {
+    /// The job's id.
+    pub fn job_id(&self) -> &crate::job::JobId {
+        &self.inner.id
+    }
+
+    /// The queue the job belongs to.
+    pub fn queue(&self) -> &str {
+        &self.inner.queue
+    }
+
+    /// Which attempt this is (1-based; postponements and stalls don't
+    /// count).
+    pub fn attempt(&self) -> u32 {
+        self.inner.attempt
+    }
+
+    /// Record progress (a percentage via `u8`/`f64`, or any
+    /// [`crate::Progress`]); emits a `progress` event.
+    pub async fn progress(&self, progress: impl Into<crate::Progress>) -> Result<()> {
+        let json = serde_json::to_string(&progress.into())?;
+        self.inner
+            .backend
+            .update_progress(&self.inner.queue, &self.inner.id, &json)
+            .await
+    }
+
+    /// Append a line to the job's log (shown in the dashboard).
+    pub async fn log(&self, line: impl AsRef<str>) -> Result<()> {
+        self.inner
+            .backend
+            .log(&self.inner.queue, &self.inner.id, line.as_ref())
+            .await
+    }
+
+    /// `true` once a lock renewal found the lock gone or held by another
+    /// token: this worker no longer owns the job and its outcome will be
+    /// discarded. Stop expensive work.
+    pub fn lock_lost(&self) -> bool {
+        self.inner.lock_lost.is_cancelled()
+    }
+
+    /// Resolves when [`Self::lock_lost`] becomes true.
+    pub async fn lock_lost_signal(&self) {
+        self.inner.lock_lost.cancelled().await;
+    }
+
+    /// `true` once the worker was asked to shut down. The handler may keep
+    /// going until `shutdown_timeout`, but should checkpoint and return.
+    pub fn shutdown_requested(&self) -> bool {
+        self.inner.shutdown.is_cancelled()
+    }
+
+    /// Resolves when [`Self::shutdown_requested`] becomes true.
+    pub async fn cancelled(&self) {
+        self.inner.shutdown.cancelled().await;
+    }
+}
+
+/// The two shutdown signals a running job observes.
+#[derive(Clone)]
+struct Signals {
+    /// Worker cancellation: stop fetching, tell handlers to wind down.
+    shutdown: CancellationToken,
+    /// `shutdown_timeout` elapsed: drop handlers and release their jobs.
+    abort: CancellationToken,
+}
 
 /// A worker polling a queue and dispatching jobs to a handler.
 pub struct Worker<D, R = ()>
@@ -94,7 +194,36 @@ where
         F: Fn(Job<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<R>> + Send + 'static,
     {
-        WorkerBuilder::new(queue, handler)
+        WorkerBuilder::from_handler(Arc::new(move |job, _ctx| handler(job).boxed()), queue)
+    }
+
+    /// Like [`Self::builder`], but the handler also receives a
+    /// [`JobContext`] for progress, logs, lost-lock and shutdown signals.
+    ///
+    /// ```no_run
+    /// # use oxn::{Queue, Worker, Job, Error};
+    /// # use oxn::worker::JobContext;
+    /// # async fn demo(queue: Queue<String>) -> oxn::Result<()> {
+    /// let worker = Worker::builder_with_ctx(queue, |job: Job<String>, ctx: JobContext| async move {
+    ///     ctx.log(format!("processing {}", job.data)).await?;
+    ///     for pct in [25u8, 50, 75, 100] {
+    ///         if ctx.shutdown_requested() || ctx.lock_lost() {
+    ///             break; // checkpoint and return early
+    ///         }
+    ///         ctx.progress(pct).await?;
+    ///     }
+    ///     Ok::<_, Error>(())
+    /// })
+    /// .build();
+    /// worker.run().await
+    /// # }
+    /// ```
+    pub fn builder_with_ctx<F, Fut>(queue: Queue<D>, handler: F) -> WorkerBuilder<D, R>
+    where
+        F: Fn(Job<D>, JobContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R>> + Send + 'static,
+    {
+        WorkerBuilder::from_handler(Arc::new(move |job, ctx| handler(job, ctx).boxed()), queue)
     }
 
     /// Worker id, used as the prefix for lock tokens.
@@ -234,9 +363,13 @@ where
                     let queue = queue.clone();
                     let handler = handler.clone();
                     let opts = opts.clone();
-                    let abort = abort.clone();
+                    let signals = Signals {
+                        shutdown: cancel.clone(),
+                        abort: abort.clone(),
+                    };
                     tokio::spawn(async move {
-                        process_one::<D, R>(backend, queue, raw, token, handler, opts, abort).await;
+                        process_one::<D, R>(backend, queue, raw, token, handler, opts, signals)
+                            .await;
                         drop(permit);
                     });
                 }
@@ -313,7 +446,7 @@ async fn process_one<D, R>(
     token: String,
     handler: HandlerFn<D, R>,
     opts: WorkerOptions,
-    abort: CancellationToken,
+    signals: Signals,
 ) where
     D: DeserializeOwned + Send + Sync + 'static,
     R: Serialize + Send + 'static,
@@ -337,7 +470,7 @@ async fn process_one<D, R>(
         token,
         handler,
         opts,
-        abort,
+        signals,
         span.clone(),
     )
     .instrument(span.clone())
@@ -353,7 +486,7 @@ async fn process_one_inner<D, R>(
     token: String,
     handler: HandlerFn<D, R>,
     opts: WorkerOptions,
-    abort: CancellationToken,
+    signals: Signals,
     span: tracing::Span,
 ) where
     D: DeserializeOwned + Send + Sync + 'static,
@@ -393,21 +526,34 @@ async fn process_one_inner<D, R>(
     renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     renew.tick().await; // consume the zero-tick
 
+    let lock_lost = CancellationToken::new();
+    let ctx = JobContext {
+        inner: Arc::new(CtxInner {
+            backend: backend.clone(),
+            queue: queue.clone(),
+            id: id.clone(),
+            attempt: attempts_made,
+            lock_lost: lock_lost.clone(),
+            shutdown: signals.shutdown.clone(),
+        }),
+    };
+    let abort = signals.abort;
     tracing::trace!("handler started");
     // A panic — while building the future or while polling it — becomes
     // `Error::Panicked`, handled like any returned error. Uncaught, it would
     // unwind this task and leave the job locked until its lock expired.
-    let mut handler_fut: BoxFuture<'static, Result<R>> =
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (handler)(job))) {
-            Ok(fut) => std::panic::AssertUnwindSafe(fut)
-                .catch_unwind()
-                .map(|r| r.unwrap_or_else(|p| Err(Error::Panicked(panic_message(p.as_ref())))))
-                .boxed(),
-            Err(p) => {
-                let msg = panic_message(p.as_ref());
-                futures::future::ready(Err(Error::Panicked(msg))).boxed()
-            }
-        };
+    let mut handler_fut: BoxFuture<'static, Result<R>> = match std::panic::catch_unwind(
+        std::panic::AssertUnwindSafe(|| (handler)(job, ctx.clone())),
+    ) {
+        Ok(fut) => std::panic::AssertUnwindSafe(fut)
+            .catch_unwind()
+            .map(|r| r.unwrap_or_else(|p| Err(Error::Panicked(panic_message(p.as_ref())))))
+            .boxed(),
+        Err(p) => {
+            let msg = panic_message(p.as_ref());
+            futures::future::ready(Err(Error::Panicked(msg))).boxed()
+        }
+    };
     let outcome: Result<R> = loop {
         tokio::select! {
             biased;
@@ -422,9 +568,15 @@ async fn process_one_inner<D, R>(
                 log_transition("released", &r);
                 return;
             }
-            _ = renew.tick() => {
+            _ = renew.tick(), if !lock_lost.is_cancelled() => {
                 match backend.extend_lock(&queue, &id, &token, opts.lock_duration).await {
                     Ok(()) => tracing::trace!("lock extended"),
+                    Err(e) if e.is_lock_lost() => {
+                        // Someone else owns the job now; renewing is pointless
+                        // and the handler should know its result won't count.
+                        tracing::warn!(job = %id, error = %e, "lock lost; signalling handler");
+                        lock_lost.cancel();
+                    }
                     Err(e) => tracing::warn!(job = %id, error = %e, "lock renew failed"),
                 }
             }
@@ -623,12 +775,7 @@ where
     D: Serialize + DeserializeOwned + Send + Sync + 'static,
     R: Serialize + Send + 'static,
 {
-    fn new<F, Fut>(queue: Queue<D>, handler: F) -> Self
-    where
-        F: Fn(Job<D>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<R>> + Send + 'static,
-    {
-        let handler: HandlerFn<D, R> = Arc::new(move |job| handler(job).boxed());
+    fn from_handler(handler: HandlerFn<D, R>, queue: Queue<D>) -> Self {
         Self {
             queue,
             opts: WorkerOptions::default(),

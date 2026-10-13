@@ -221,6 +221,8 @@ pub struct WorkerSpec {
     pub drain_delay_ms: Option<u64>,
     pub shutdown_timeout_ms: u64,
     pub max_stalled: u32,
+    /// Report progress and a log line through `JobContext` on every run.
+    pub ctx_ops: bool,
 }
 
 pub fn build_worker(
@@ -236,12 +238,17 @@ pub fn build_worker(
         drain_delay_ms,
         shutdown_timeout_ms,
         max_stalled,
+        ctx_ops,
     } = spec;
-    let mut b = Worker::builder(queue, move |job: Job<LoadJob>| {
+    let mut b = Worker::builder_with_ctx(queue, move |job: Job<LoadJob>, ctx: oxn::JobContext| {
         let sink = sink.clone();
         async move {
             let d = job.data;
             let attempt = job.attempts_made;
+            if ctx_ops {
+                ctx.progress(50u8).await?;
+                ctx.log(format!("attempt {attempt}")).await?;
+            }
             let due_us = d.enq_us + d.delay_ms * 1000;
             let start = now_us();
             sink.emit(WEvent::Start {
@@ -573,6 +580,7 @@ impl InProcPool {
                 drain_delay_ms: self.cfg.drain_delay_ms,
                 shutdown_timeout_ms: self.cfg.shutdown_timeout_ms,
                 max_stalled: self.cfg.max_stalled,
+                ctx_ops: self.cfg.ctx_ops,
             };
             let w = build_worker(
                 q,
@@ -660,6 +668,9 @@ impl ProcPool {
             .arg(self.cfg.max_stream_len.to_string())
             .arg("--max-stalled")
             .arg(self.cfg.max_stalled.to_string());
+        if self.cfg.ctx_ops {
+            cmd.arg("--ctx-ops");
+        }
         if let Some(d) = self.cfg.drain_delay_ms {
             cmd.arg("--drain-delay-ms").arg(d.to_string());
         }
@@ -721,26 +732,10 @@ impl ProcPool {
 }
 
 /// Entry point of `oxn-load worker` (child process mode).
-pub async fn child_worker_main(
-    url: String,
-    queue: String,
-    index: u32,
-    concurrency: usize,
-    lock_ms: u64,
-    drain_delay_ms: Option<u64>,
-    max_stalled: u32,
-) -> anyhow::Result<()> {
-    let backend = connect(&url, concurrency + 4).await?;
+pub async fn child_worker_main(url: String, queue: String, spec: WorkerSpec) -> anyhow::Result<()> {
+    let backend = connect(&url, spec.concurrency + 4).await?;
     let q = queue_on(backend, &queue, JobOptions::new());
     let sink = Sink::Stdout(Arc::new(Mutex::new(std::io::stdout())));
-    let spec = WorkerSpec {
-        index,
-        concurrency,
-        lock_ms,
-        drain_delay_ms,
-        shutdown_timeout_ms: 10_000,
-        max_stalled,
-    };
     let w = build_worker(q, spec, sink, CancellationToken::new());
     w.run().await?;
     Ok(())

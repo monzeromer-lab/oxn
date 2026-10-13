@@ -107,6 +107,18 @@ It contains breaking changes; see the migration notes below.
   immediately and its pool slot is detached instead of being returned with
   a block still pending; the stalled scanner is joined before `run()`
   returns.
+- **Handlers get a `JobContext` (B12c).** New
+  `Worker::builder_with_ctx(queue, |job, ctx| …)` (`builder` is
+  unchanged): `ctx.progress(p)` / `ctx.log(line)` report progress (with a
+  `progress` event) and log lines shown in the dashboard;
+  `ctx.lock_lost()` / `lock_lost_signal()` fire when lock renewal finds
+  another owner (renewal then stops; the result would be discarded);
+  `ctx.shutdown_requested()` / `cancelled()` fire as soon as the worker is
+  cancelled so long jobs can checkpoint before `shutdown_timeout`; plus
+  `job_id()`, `queue()`, `attempt()`.
+- `Backend::update_progress` / `log` refuse (`NotFound`) for a job that no
+  longer exists; a plain `HSET` / `RPUSH` used to re-create an orphan hash
+  or `:logs` key.
 - **Failed attempts leave a stack trace (B12b).** `Job::stacktrace` (and
   the dashboard's "Stack trace" section) was never written. Each real
   failure — returned error, panic, unrecoverable, decode error, stall

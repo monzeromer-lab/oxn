@@ -54,6 +54,8 @@ enum Cmd {
         max_stream_len: u64,
         #[arg(long, default_value_t = 1)]
         max_stalled: u32,
+        #[arg(long)]
+        ctx_ops: bool,
     },
 }
 
@@ -83,18 +85,19 @@ async fn main() -> anyhow::Result<()> {
             drain_delay_ms,
             max_stream_len,
             max_stalled,
+            ctx_ops,
         } => {
             workload::MAX_STREAM_LEN.store(max_stream_len, std::sync::atomic::Ordering::Relaxed);
-            workload::child_worker_main(
-                redis,
-                queue,
+            let spec = workload::WorkerSpec {
                 index,
                 concurrency,
                 lock_ms,
                 drain_delay_ms,
+                shutdown_timeout_ms: 10_000,
                 max_stalled,
-            )
-            .await
+                ctx_ops,
+            };
+            workload::child_worker_main(redis, queue, spec).await
         }
         Cmd::Run(args) => {
             let cfg = config::Config::resolve(&args)?;
