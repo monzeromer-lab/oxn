@@ -80,7 +80,13 @@ async fn finishing_with_a_foreign_or_expired_lock_is_rejected() {
     let f = rec
         .step(
             "fetch with token A",
-            b.fetch_next(q.name(), "A", secs(30), ms(10)),
+            b.fetch_next(
+                q.name(),
+                "A",
+                secs(30),
+                ms(10),
+                &tokio_util::sync::CancellationToken::new(),
+            ),
         )
         .await
         .unwrap()
@@ -154,7 +160,13 @@ async fn complete_reports_job_deleted_while_active() {
         .await
         .unwrap();
     let f = b
-        .fetch_next(q.name(), "A", secs(30), ms(10))
+        .fetch_next(
+            q.name(),
+            "A",
+            secs(30),
+            ms(10),
+            &tokio_util::sync::CancellationToken::new(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -193,7 +205,16 @@ async fn remove_refuses_locked_jobs_and_reports_missing_ones() {
         .await
         .unwrap();
     let f = rec
-        .step("fetch one", b.fetch_next(q.name(), "A", secs(30), ms(10)))
+        .step(
+            "fetch one",
+            b.fetch_next(
+                q.name(),
+                "A",
+                secs(30),
+                ms(10),
+                &tokio_util::sync::CancellationToken::new(),
+            ),
+        )
         .await
         .unwrap()
         .unwrap();

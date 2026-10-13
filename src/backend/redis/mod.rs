@@ -548,7 +548,11 @@ impl Backend for RedisBackend {
         worker_token: &str,
         lock_duration: Duration,
         block_for: Duration,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Option<Fetched>> {
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
         // First: try non-blocking move-to-active via Lua.
         let next_due = match self
             .move_to_active(queue, worker_token, lock_duration)
@@ -577,20 +581,33 @@ impl Backend for RedisBackend {
         );
         let start = std::time::Instant::now();
         let mut blocking = self.conn().await?;
-        let secs = block_for.as_secs_f64();
-        let popped: Option<(String, String, f64)> = redis::cmd("BZPOPMIN")
-            .arg(keys.marker())
-            .arg(secs)
-            .query_async(&mut *blocking)
-            .instrument(span.clone())
-            .await
-            .ok()
-            .flatten();
-        drop(blocking);
-        span.record("woke", popped.is_some());
+        let mut bzpopmin = redis::cmd("BZPOPMIN");
+        bzpopmin.arg(keys.marker()).arg(block_for.as_secs_f64());
+        // Cancellation is honored here, while only *waiting*: no job has
+        // been taken yet, so giving up loses nothing.
+        let popped = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            r = bzpopmin
+                .query_async::<Option<(String, String, f64)>>(&mut *blocking)
+                .instrument(span.clone()) => Some(r),
+        };
         span.record("elapsed_us", start.elapsed().as_micros() as u64);
+        let Some(popped) = popped else {
+            // The connection still has a BZPOPMIN in flight; returning it
+            // to the pool would make its next user wait behind the block.
+            // Detach it instead (dropping it closes the socket, which also
+            // unblocks the client server-side).
+            span.record("woke", "cancelled");
+            let _ = PooledConn::take(blocking);
+            return Ok(None);
+        };
+        drop(blocking);
+        span.record("woke", popped.ok().flatten().is_some());
         drop(span);
 
+        // Not cancellable: if this takes a job we must hand it to the
+        // caller, who releases it if shutdown began meanwhile.
         match self
             .move_to_active(queue, worker_token, lock_duration)
             .await?
@@ -598,6 +615,28 @@ impl Backend for RedisBackend {
             Moved::Job(f) => Ok(Some(*f)),
             Moved::Empty { .. } => Ok(None),
         }
+    }
+
+    async fn release(&self, queue: &str, id: &JobId, token: &str) -> Result<()> {
+        let keys = self.keys(queue);
+        let mut inv = self.scripts.release.prepare_invoke();
+        inv.key(keys.active())
+            .key(keys.wait())
+            .key(keys.paused())
+            .key(keys.prioritized())
+            .key(keys.priority_counter())
+            .key(keys.meta())
+            .key(keys.marker())
+            .key(keys.events())
+            .key(keys.job_hash(id.as_str()))
+            .key(keys.job_lock(id.as_str()))
+            .arg(id.as_str())
+            .arg(token)
+            .arg(self.max_stream_length as i64);
+        let mut conn = self.conn().await?;
+        self.eval(&mut conn, "release", queue, Some(id.as_str()), &inv)
+            .await?;
+        Ok(())
     }
 
     async fn complete(

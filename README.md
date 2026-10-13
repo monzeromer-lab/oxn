@@ -233,6 +233,11 @@ tokio::spawn(async move {
 worker.run().await?;   // returns once in-flight jobs drain or timeout fires
 ```
 
+Cancelling stops the worker from taking new jobs; running handlers keep
+going (their locks are renewed) until they finish or `shutdown_timeout`
+elapses. Anything still running then is released back to the queue with
+its attempt refunded — a deploy never burns a job's retries or fails it.
+
 ### Scheduler (feature `scheduler`)
 
 ```rust

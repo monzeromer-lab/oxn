@@ -80,6 +80,8 @@ pub enum Mark {
     ServerDelayed,
     /// Server emitted `active`.
     ServerActive,
+    /// A shutting-down worker released the job back to the queue.
+    Released,
 }
 
 /// Ledger row for one job.
@@ -99,6 +101,8 @@ pub struct Entry {
     pub fatals: u32,
     /// Server `stalled` events.
     pub stalls: u32,
+    /// Releases by shutting-down workers.
+    pub releases: u32,
     /// Server `failed` events.
     pub server_failed: u32,
     /// Server `completed` events.
@@ -216,11 +220,13 @@ impl Ledger {
             "completed" => Mark::ServerCompleted,
             "delayed" => Mark::ServerDelayed,
             "active" => Mark::ServerActive,
+            "released" => Mark::Released,
             _ => return,
         };
         self.with(seq, |e| {
             match mark {
                 Mark::Stalled => e.stalls += 1,
+                Mark::Released => e.releases += 1,
                 Mark::ServerFailed => e.server_failed += 1,
                 Mark::ServerCompleted => e.server_completed += 1,
                 _ => {}
@@ -352,12 +358,12 @@ impl Ledger {
                 } else {
                     v.interrupted_attempts += interrupted as u64;
                     v.explained_extra_starts += interrupted as u64;
-                    if interrupted > e.stalls + allow_extra_starts {
+                    if interrupted > e.stalls + e.releases + allow_extra_starts {
                         push(
                             Anomaly::ExtraStarts,
                             format!(
-                                "{interrupted} interrupted attempt(s) but only {} stall(s) recorded",
-                                e.stalls
+                                "{interrupted} interrupted attempt(s) but only {} stall(s) and {} release(s) recorded",
+                                e.stalls, e.releases
                             ),
                         );
                     }
@@ -647,6 +653,28 @@ mod tests {
             5,
         );
         l.server_event("1", "failed", 6);
+        let v = l.verify(3, 0);
+        assert!(v.ok(), "{:?}", v.counts);
+        assert_eq!(v.interrupted_attempts, 1);
+    }
+
+    #[test]
+    fn releases_explain_interrupted_attempts() {
+        // Shutdown aborted attempt 1 and released it (attempt refunded), so
+        // the re-run is attempt 1 again.
+        let l = Ledger::new(24);
+        l.added(job(1, 0, false), "1".into(), 0);
+        l.start(1, 1, 0, 1);
+        l.server_event("1", "released", 2);
+        l.start(1, 1, 1, 3);
+        l.finish(
+            1,
+            Mark::Ok {
+                worker: 1,
+                attempt: 1,
+            },
+            4,
+        );
         let v = l.verify(3, 0);
         assert!(v.ok(), "{:?}", v.counts);
         assert_eq!(v.interrupted_attempts, 1);

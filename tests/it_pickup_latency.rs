@@ -203,7 +203,13 @@ async fn resume_promote_and_retry_wake_blocked_workers() {
         .await
         .unwrap();
     let f = b
-        .fetch_next(q.name(), "setup", secs(30), ms(10))
+        .fetch_next(
+            q.name(),
+            "setup",
+            secs(30),
+            ms(10),
+            &tokio_util::sync::CancellationToken::new(),
+        )
         .await
         .unwrap()
         .unwrap();

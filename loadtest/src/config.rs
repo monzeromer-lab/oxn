@@ -131,6 +131,9 @@ pub struct RunArgs {
     /// Label appended to the report file name.
     #[arg(long)]
     pub label: Option<String>,
+    /// Worker `shutdown_timeout` in ms (in-process workers).
+    #[arg(long)]
+    pub shutdown_timeout_ms: Option<u64>,
     /// Set attempts, backoff and retention as **queue defaults** and add
     /// jobs with only per-job delay/priority (exercises default merging).
     #[arg(long)]
@@ -176,6 +179,8 @@ pub struct Config {
     pub slo_pickup_p99_ms: Option<f64>,
     /// Attempts/backoff/retention set on the queue, not per job.
     pub options_at_queue: bool,
+    /// Worker shutdown_timeout, ms.
+    pub shutdown_timeout_ms: u64,
 }
 
 fn ser_dur<S: serde::Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
@@ -224,6 +229,7 @@ impl Config {
             bursty: false,
             slo_pickup_p99_ms: None,
             options_at_queue: a.options_at_queue,
+            shutdown_timeout_ms: 10_000,
         };
         match a.scenario {
             Smoke => {}
@@ -316,6 +322,7 @@ impl Config {
             ($($f:ident),*) => { $( if let Some(v) = a.$f.clone() { c.$f = v; } )* };
         }
         ovr!(
+            shutdown_timeout_ms,
             jobs,
             rate,
             producers,

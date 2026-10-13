@@ -389,7 +389,10 @@ pub struct WorkerOptions {
     pub run_stalled_scanner: bool,
     /// Optional rate limit: at most `max` jobs per `duration`.
     pub rate_limit: Option<RateLimit>,
-    /// How long to wait for in-flight jobs to finish on shutdown.
+    /// How long [`Worker::run`](crate::Worker::run) lets in-flight handlers
+    /// finish after cancellation. Jobs whose handlers are still running
+    /// when it elapses are released back to the queue (attempt refunded),
+    /// not failed. Default 30s.
     pub shutdown_timeout: Duration,
 }
 

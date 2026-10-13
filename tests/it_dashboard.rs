@@ -357,6 +357,7 @@ async fn dashboard_maps_rejected_operations_to_http_status() {
             "A",
             Duration::from_secs(30),
             Duration::from_millis(10),
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap()

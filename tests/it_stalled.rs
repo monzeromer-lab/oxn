@@ -28,6 +28,7 @@ async fn scan_stalled_requeues_jobs_with_expired_locks() {
             &token,
             Duration::from_millis(300),
             Duration::from_millis(100),
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -57,6 +58,7 @@ async fn stalled_scanner_is_rate_limited() {
             &token,
             Duration::from_millis(200),
             Duration::from_millis(100),
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -91,6 +93,7 @@ async fn worker_recovers_stalled_job_automatically() {
             &token,
             Duration::from_millis(200),
             Duration::from_millis(100),
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap();

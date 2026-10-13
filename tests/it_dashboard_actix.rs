@@ -28,6 +28,7 @@ async fn actix_lists_queues_and_maps_errors() {
             "A",
             Duration::from_secs(30),
             Duration::from_millis(10),
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap()

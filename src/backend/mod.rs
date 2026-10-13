@@ -174,14 +174,20 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
         Ok(ids)
     }
 
-    /// Block up to `block_for` waiting for the next job. Returns `None` on
-    /// timeout.
+    /// Take the next ready job, blocking up to `block_for` when nothing is
+    /// ready. Returns `None` on timeout, or as soon as `cancel` fires.
+    ///
+    /// Cancellation must only be honored while **waiting**, never while a
+    /// job is being moved to `active`: a fetch that already took a job
+    /// returns it even if `cancel` fired meanwhile, so the caller can
+    /// [`Self::release`] it instead of leaving it locked until it stalls.
     async fn fetch_next(
         &self,
         queue: &str,
         worker_token: &str,
         lock_duration: Duration,
         block_for: Duration,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Option<Fetched>>;
 
     /// Mark a job completed and record `return_value_json`.
@@ -217,6 +223,15 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
         retry_at_ms: Option<i64>,
         removal: crate::options::Removal,
     ) -> Result<()>;
+
+    /// Hand an active job back without recording an outcome: drop the lock,
+    /// refund the attempt the fetch counted, and put the job back at the
+    /// head of its ready container (respecting priority and pause).
+    ///
+    /// Used by a worker shutting down when a handler outlives
+    /// `shutdown_timeout`, and for jobs fetched after shutdown began. Same
+    /// lock errors as [`Self::complete`].
+    async fn release(&self, queue: &str, id: &JobId, token: &str) -> Result<()>;
 
     /// Renew the lock TTL.
     async fn extend_lock(

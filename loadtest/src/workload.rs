@@ -205,15 +205,29 @@ impl std::fmt::Display for Transient {
 impl std::error::Error for Transient {}
 
 /// Build the worker for one pool slot.
+/// Tuning for one pool slot's worker.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkerSpec {
+    pub index: u32,
+    pub concurrency: usize,
+    pub lock_ms: u64,
+    pub drain_delay_ms: Option<u64>,
+    pub shutdown_timeout_ms: u64,
+}
+
 pub fn build_worker(
     queue: Queue<LoadJob>,
-    index: u32,
-    concurrency: usize,
-    lock_ms: u64,
-    drain_delay_ms: Option<u64>,
+    spec: WorkerSpec,
     sink: Sink,
     cancel: CancellationToken,
 ) -> Worker<LoadJob, u64> {
+    let WorkerSpec {
+        index,
+        concurrency,
+        lock_ms,
+        drain_delay_ms,
+        shutdown_timeout_ms,
+    } = spec;
     let mut b = Worker::builder(queue, move |job: Job<LoadJob>| {
         let sink = sink.clone();
         async move {
@@ -259,7 +273,7 @@ pub fn build_worker(
     .lock_duration(Duration::from_millis(lock_ms))
     .lock_renew_interval(Duration::from_millis((lock_ms / 2).max(1)))
     .stalled_interval(Duration::from_millis((lock_ms / 2).clamp(250, 30_000)))
-    .shutdown_timeout(Duration::from_secs(10))
+    .shutdown_timeout(Duration::from_millis(shutdown_timeout_ms))
     .id(format!("w{index}"))
     .cancellation_token(cancel);
     if let Some(d) = drain_delay_ms {
@@ -498,12 +512,16 @@ impl InProcPool {
             let q = queue_on(backend, &self.queue_name, JobOptions::new());
             let cancel = CancellationToken::new();
             let index = self.generation * 1000 + i as u32;
+            let spec = WorkerSpec {
+                index,
+                concurrency: self.cfg.concurrency,
+                lock_ms: self.cfg.lock_ms,
+                drain_delay_ms: self.cfg.drain_delay_ms,
+                shutdown_timeout_ms: self.cfg.shutdown_timeout_ms,
+            };
             let w = build_worker(
                 q,
-                index,
-                self.cfg.concurrency,
-                self.cfg.lock_ms,
-                self.cfg.drain_delay_ms,
+                spec,
                 Sink::Local(self.ledger.clone(), self.stats.clone()),
                 cancel.clone(),
             );
@@ -655,15 +673,14 @@ pub async fn child_worker_main(
     let backend = connect(&url, concurrency + 4).await?;
     let q = queue_on(backend, &queue, JobOptions::new());
     let sink = Sink::Stdout(Arc::new(Mutex::new(std::io::stdout())));
-    let w = build_worker(
-        q,
+    let spec = WorkerSpec {
         index,
         concurrency,
         lock_ms,
         drain_delay_ms,
-        sink,
-        CancellationToken::new(),
-    );
+        shutdown_timeout_ms: 10_000,
+    };
+    let w = build_worker(q, spec, sink, CancellationToken::new());
     w.run().await?;
     Ok(())
 }
@@ -726,7 +743,12 @@ pub async fn observe_stream(
                             .get(f)
                             .and_then(|v| redis::from_redis_value::<String>(v).ok())
                     };
-                    let event = get("event").unwrap_or_default();
+                    let mut event = get("event").unwrap_or_default();
+                    // A worker shutting down hands unfinished jobs back:
+                    // `waiting` with prev=active is a release, not an add.
+                    if event == "waiting" && get("prev").as_deref() == Some("active") {
+                        event = "released".to_string();
+                    }
                     *counts.lock().entry(event.clone()).or_default() += 1;
                     if let Some(job) = get("jobId") {
                         let at_us =

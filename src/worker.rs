@@ -108,11 +108,16 @@ where
         self.cancel.clone()
     }
 
-    /// Drive the worker until its [`CancellationToken`] fires.
+    /// Drive the worker until its [`CancellationToken`] fires, then shut
+    /// down gracefully.
     ///
-    /// This future completes once the cancel token has been triggered **and**
-    /// in-flight jobs have either finished or exceeded
-    /// [`WorkerOptions::shutdown_timeout`].
+    /// When the token fires the worker stops taking new jobs (an idle
+    /// worker stops waiting immediately) and lets running handlers finish,
+    /// renewing their locks, for up to [`WorkerOptions::shutdown_timeout`].
+    /// Handlers still running after that are dropped and their jobs are
+    /// **released** back to the queue — attempt refunded, priority and
+    /// pause state respected — rather than failed. The stalled-job scanner
+    /// is stopped and joined before this future resolves.
     ///
     /// # Examples
     ///
@@ -148,9 +153,13 @@ where
 
         let semaphore = Arc::new(Semaphore::new(opts.concurrency));
         let token_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // `cancel` (the caller's token) means "stop taking new jobs".
+        // `abort` means "stop running handlers"; it only fires once
+        // `shutdown_timeout` has elapsed with handlers still running.
+        let abort = CancellationToken::new();
 
         // Stalled-job scanner.
-        if opts.run_stalled_scanner {
+        let scanner = opts.run_stalled_scanner.then(|| {
             let backend = backend.clone();
             let queue = queue.clone();
             let interval = opts.stalled_interval;
@@ -169,112 +178,133 @@ where
                         }
                     }
                 }
-            });
-        }
+            })
+        });
 
         // Main fetch loop.
         'main: loop {
-            tokio::select! {
+            let permit = tokio::select! {
                 _ = cancel.cancelled() => break 'main,
-                permit = semaphore.clone().acquire_owned() => {
-                    let permit = match permit {
-                        Ok(p) => p,
-                        Err(_) => break 'main,
-                    };
-                    let token = format!(
-                        "{}:{}",
-                        id,
-                        token_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                permit = semaphore.clone().acquire_owned() => match permit {
+                    Ok(p) => p,
+                    Err(_) => break 'main,
+                },
+            };
+            let token = format!(
+                "{}:{}",
+                id,
+                token_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            let fetch_span = tracing::debug_span!(
+                "oxn.fetch",
+                queue = %queue,
+                worker = %id,
+                token = %token,
+                job_id = tracing::field::Empty,
+                outcome = tracing::field::Empty,
+            );
+            // Not raced against `cancel`: the backend honors it only while
+            // waiting, so a job it already took is never dropped on the
+            // floor (it would stay locked until the stalled scanner).
+            let fetched = backend
+                .fetch_next(
+                    &queue,
+                    &token,
+                    opts.lock_duration,
+                    opts.drain_delay,
+                    &cancel,
+                )
+                .instrument(fetch_span.clone())
+                .await;
+            match fetched {
+                Ok(Some(Fetched { job: raw, token })) if cancel.is_cancelled() => {
+                    // Shutdown began while this fetch was taking the job:
+                    // give it back untouched rather than start new work.
+                    fetch_span.record("job_id", raw.id.as_str());
+                    fetch_span.record("outcome", "released-on-shutdown");
+                    let r = backend.release(&queue, &raw.id, &token).await;
+                    log_transition("released", &r);
+                    drop(permit);
+                    break 'main;
+                }
+                Ok(Some(Fetched { job: raw, token })) => {
+                    fetch_span.record("job_id", raw.id.as_str());
+                    fetch_span.record("outcome", "job");
+                    let backend = backend.clone();
+                    let queue = queue.clone();
+                    let handler = handler.clone();
+                    let opts = opts.clone();
+                    let abort = abort.clone();
+                    tokio::spawn(async move {
+                        process_one::<D, R>(backend, queue, raw, token, handler, opts, abort).await;
+                        drop(permit);
+                    });
+                }
+                Ok(None) => {
+                    fetch_span.record(
+                        "outcome",
+                        if cancel.is_cancelled() {
+                            "cancelled"
+                        } else {
+                            "idle"
+                        },
                     );
-                    let fetch_span = tracing::debug_span!(
-                        "oxn.fetch",
-                        queue = %queue,
-                        worker = %id,
-                        token = %token,
-                        job_id = tracing::field::Empty,
-                        outcome = tracing::field::Empty,
-                    );
-                    let fetched = tokio::select! {
-                        _ = cancel.cancelled() => {
-                            fetch_span.record("outcome", "cancelled");
-                            drop(permit);
-                            break 'main;
-                        }
-                        r = backend
-                            .fetch_next(&queue, &token, opts.lock_duration, opts.drain_delay)
-                            .instrument(fetch_span.clone()) => r,
-                    };
-                    match &fetched {
-                        Ok(Some(f)) => {
-                            fetch_span.record("job_id", f.job.id.as_str());
-                            fetch_span.record("outcome", "job");
-                        }
-                        Ok(None) => {
-                            fetch_span.record("outcome", "idle");
-                        }
-                        Err(_) => {
-                            fetch_span.record("outcome", "error");
-                        }
-                    }
-                    drop(fetch_span);
-                    match fetched {
-                        Ok(Some(Fetched { job: raw, token })) => {
-                            let backend = backend.clone();
-                            let queue = queue.clone();
-                            let handler = handler.clone();
-                            let opts = opts.clone();
-                            let cancel = cancel.clone();
-                            tokio::spawn(async move {
-                                process_one::<D, R>(
-                                    backend,
-                                    queue,
-                                    raw,
-                                    token,
-                                    handler,
-                                    opts,
-                                    cancel,
-                                )
-                                .await;
-                                drop(permit);
-                            });
-                        }
-                        Ok(None) => {
-                            // Idle: drop permit, spin. BZPOPMIN already blocked inside fetch_next.
-                            drop(permit);
-                        }
-                        Err(e) => {
-                            tracing::warn!(queue = %queue, worker = %id, error = %e, "fetch_next failed");
-                            drop(permit);
-                            tokio::time::sleep(Duration::from_millis(250)).await;
-                        }
+                    drop(permit);
+                }
+                Err(e) => {
+                    fetch_span.record("outcome", "error");
+                    tracing::warn!(queue = %queue, worker = %id, error = %e, "fetch_next failed");
+                    drop(permit);
+                    tokio::select! {
+                        _ = cancel.cancelled() => break 'main,
+                        _ = tokio::time::sleep(Duration::from_millis(250)) => {}
                     }
                 }
             }
         }
 
-        // Graceful shutdown: wait for in-flight jobs up to the timeout by
-        // blocking on the semaphore reaching full capacity again.
-        let total = opts.concurrency;
-        let in_flight = total - semaphore.available_permits();
+        // Graceful shutdown. Stop fetching (done), let in-flight handlers
+        // finish — their locks keep being renewed — for up to
+        // `shutdown_timeout`, then abort the rest. Aborted jobs are released
+        // back to the queue (attempt refunded), never failed.
+        let total = opts.concurrency as u32;
+        let in_flight = total as usize - semaphore.available_permits();
         tracing::debug!(queue = %queue, worker = %id, in_flight, "oxn.shutdown: waiting for in-flight jobs");
         let started = std::time::Instant::now();
-        let drain = async {
-            let _ = semaphore.acquire_many(total as u32).await;
-        };
-        let drained = tokio::time::timeout(opts.shutdown_timeout, drain)
+        let drained = tokio::time::timeout(opts.shutdown_timeout, semaphore.acquire_many(total))
             .await
             .is_ok();
+        let aborted = total as usize - semaphore.available_permits();
+        if !drained {
+            tracing::warn!(
+                queue = %queue,
+                worker = %id,
+                aborted,
+                "oxn.shutdown: shutdown_timeout elapsed; aborting and releasing remaining jobs"
+            );
+            abort.cancel();
+            // Releasing is a single short script per job; bound it anyway.
+            let _ = tokio::time::timeout(RELEASE_GRACE, semaphore.acquire_many(total)).await;
+        }
+        if let Some(scanner) = scanner {
+            let _ = scanner.await;
+        }
         tracing::debug!(
             queue = %queue,
             worker = %id,
             drained,
-            still_running = total - semaphore.available_permits(),
+            aborted = if drained { 0 } else { aborted },
+            still_running = total as usize - semaphore.available_permits(),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "oxn.shutdown: done"
         );
         Ok(())
     }
 }
+
+/// After aborting handlers at shutdown, how long to wait for their jobs to
+/// be released before `run()` returns anyway.
+const RELEASE_GRACE: Duration = Duration::from_secs(5);
 
 async fn process_one<D, R>(
     backend: Arc<dyn Backend>,
@@ -283,7 +313,7 @@ async fn process_one<D, R>(
     token: String,
     handler: HandlerFn<D, R>,
     opts: WorkerOptions,
-    cancel: CancellationToken,
+    abort: CancellationToken,
 ) where
     D: DeserializeOwned + Send + Sync + 'static,
     R: Serialize + Send + 'static,
@@ -307,7 +337,7 @@ async fn process_one<D, R>(
         token,
         handler,
         opts,
-        cancel,
+        abort,
         span.clone(),
     )
     .instrument(span.clone())
@@ -323,7 +353,7 @@ async fn process_one_inner<D, R>(
     token: String,
     handler: HandlerFn<D, R>,
     opts: WorkerOptions,
-    cancel: CancellationToken,
+    abort: CancellationToken,
     span: tracing::Span,
 ) where
     D: DeserializeOwned + Send + Sync + 'static,
@@ -368,9 +398,16 @@ async fn process_one_inner<D, R>(
     let outcome: Result<R> = loop {
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => {
-                tracing::debug!("cancellation observed while handler running");
-                break Err(Error::Closed);
+            _ = abort.cancelled() => {
+                // shutdown_timeout elapsed: drop the handler and hand the
+                // job back. It did not fail; it was interrupted.
+                drop(handler_fut);
+                span.record("outcome", "aborted");
+                span.record("transition", "released");
+                tracing::debug!("handler aborted by shutdown_timeout; releasing job");
+                let r = backend.release(&queue, &id, &token).await;
+                log_transition("released", &r);
+                return;
             }
             _ = renew.tick() => {
                 match backend.extend_lock(&queue, &id, &token, opts.lock_duration).await {
@@ -614,8 +651,9 @@ where
         self
     }
 
-    /// How long [`Worker::run`] waits for in-flight jobs to drain after
-    /// cancellation before returning.
+    /// How long [`Worker::run`] lets in-flight handlers finish after
+    /// cancellation; jobs still running then are released back to the
+    /// queue, not failed.
     #[must_use]
     pub fn shutdown_timeout(mut self, d: Duration) -> Self {
         self.opts.shutdown_timeout = d;

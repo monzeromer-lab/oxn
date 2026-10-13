@@ -26,3 +26,44 @@ end
 local function oxnEmit(eventsKey, maxStream, ...)
   redis.call('XADD', eventsKey, 'MAXLEN', '~', maxStream, '*', ...)
 end
+
+-- The job's stored options (ResolvedJobOptions JSON), or {} if absent or
+-- unreadable.
+local function oxnJobOpts(hashKey)
+  local raw = redis.call('HGET', hashKey, 'opts')
+  if not raw then return {} end
+  local ok, o = pcall(cjson.decode, raw)
+  if ok and type(o) == 'table' then return o end
+  return {}
+end
+
+-- Make an existing job ready again, honoring its priority and the queue's
+-- pause state, and wake a worker. `front` puts it at the head of the line
+-- (next to be popped) — used for jobs that were already in progress.
+--
+-- k = { wait=, paused=, prio=, pc=, meta=, marker= }
+-- Returns the container it landed in: 'prioritized' | 'wait' | 'paused'.
+local function oxnPushReady(k, id, hashKey, front)
+  local o = oxnJobOpts(hashKey)
+  local prio = tonumber(o['priority']) or 0
+  if prio > 0 then
+    local counter = redis.call('INCR', k.pc)
+    redis.call('ZADD', k.prio, prio * 0x100000000 + counter, id)
+    oxnWake(k.marker)
+    return 'prioritized'
+  end
+  local target = k.wait
+  if redis.call('HGET', k.meta, 'paused') == '1' then
+    target = k.paused
+  end
+  if front then
+    redis.call('RPUSH', target, id)
+  else
+    redis.call('LPUSH', target, id)
+  end
+  if target == k.wait then
+    oxnWake(k.marker)
+    return 'wait'
+  end
+  return 'paused'
+end

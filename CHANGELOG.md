@@ -46,6 +46,10 @@ It contains breaking changes; see the migration notes below.
     code that read fields off a `JobOptions` value it built must handle
     `Option`s; code constructing `JobInsert` for a custom backend call
     must resolve first (`opts.resolve()`).
+- **`Backend` trait (custom backends):** `fetch_next` takes a
+  `&CancellationToken` and must honor it only while *waiting* (B4); new
+  required method `release(queue, id, token)` hands an active job back
+  without an outcome (B4).
 - Dashboard (axum and actix) maps `NotFound` → **404** and state/lock
   conflicts → **409**, with `{"error": "..."}` bodies, instead of `204`.
 - New `Error::is_conflict()` and `Error::is_lock_lost()` helpers.
@@ -69,6 +73,19 @@ It contains breaking changes; see the migration notes below.
   - `drain_delay(0)` is clamped to 1ms instead of sending `BZPOPMIN 0`
     (block forever).
   After: pickup p50 1.7ms / p99 2.0ms on the same scenario.
+- **Graceful shutdown actually drains (B4).** Cancelling a worker used to
+  abort every running handler at once with `Error::Closed`, which went down
+  the normal failure path: the attempt was consumed and a job on its last
+  attempt was failed for good ("backend closed"); `run()` returned within
+  milliseconds whatever `shutdown_timeout` said. Now cancellation stops
+  fetching, handlers keep running (locks renewed) until `shutdown_timeout`,
+  and any still running are aborted and **released** back to the head of
+  their ready container with the attempt refunded (new `release.lua`,
+  emits `waiting` with `prev=active`). A job fetched while shutdown began
+  is released without running. An idle worker blocked in `BZPOPMIN` stops
+  immediately and its pool slot is detached instead of being returned with
+  a block still pending; the stalled scanner is joined before `run()`
+  returns.
 - The worker no longer logs "transition applied" when the backend
   rejected the transition. A lost lock is logged as a warning ("lock
   lost, outcome discarded"); any other rejection as an error.
