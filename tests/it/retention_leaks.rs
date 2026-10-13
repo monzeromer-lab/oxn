@@ -7,7 +7,7 @@
 //! pointed at. The recorder's `orphan-hash` / `orphan-aux` /
 //! `dedup-dangling` / `stalled-set-leak` rules catch each of these.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

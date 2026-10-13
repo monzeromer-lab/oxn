@@ -6,7 +6,7 @@
 //! and queue names were not validated, so an id like `wait` or `a:lock`
 //! collided with queue-level or per-job keys.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

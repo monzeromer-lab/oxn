@@ -17,11 +17,24 @@ use std::path::{Path, PathBuf};
 use crate::invariants::Severity;
 use crate::recorder::Recorder;
 
-/// Root directory reports are written under: `OXN_REPORT_DIR`, else
-/// `<workspace>/target/oxn-reports`.
+/// Root directory reports are written under, in order of preference:
+/// 1. `OXN_REPORT_DIR`;
+/// 2. `<cargo target dir>/oxn-reports`, where the target dir is found by
+///    walking up from the running test/harness binary to the directory
+///    holding cargo's `.rustc_info.json` (present in every target dir;
+///    `CACHEDIR.TAG` is only written for the default `./target`) — so
+///    reports follow `CARGO_TARGET_DIR` or a `build.target-dir` config;
+/// 3. `<workspace>/target/oxn-reports`.
 pub fn report_root() -> PathBuf {
     if let Ok(d) = std::env::var("OXN_REPORT_DIR") {
         return PathBuf::from(d);
+    }
+    if let Some(target) = std::env::current_exe().ok().and_then(|exe| {
+        exe.ancestors()
+            .find(|d| d.join(".rustc_info.json").is_file() || d.join("CACHEDIR.TAG").is_file())
+            .map(Path::to_path_buf)
+    }) {
+        return target.join("oxn-reports");
     }
     let start = std::env::var("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)

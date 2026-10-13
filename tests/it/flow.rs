@@ -2,7 +2,7 @@
 
 #![cfg(feature = "flow")]
 
-mod common;
+use crate::common;
 
 use oxn::backend::Backend;
 use oxn::flow::{FlowNode, FlowProducer};

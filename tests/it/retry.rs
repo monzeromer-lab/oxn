@@ -1,6 +1,6 @@
 //! Retry with backoff; unrecoverable terminal error; attempts exhausted.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

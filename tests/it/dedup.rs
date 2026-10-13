@@ -1,7 +1,7 @@
 //! Deduplication: adding a second job with the same dedup id within the TTL
 //! should return the existing id and not produce a second job.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

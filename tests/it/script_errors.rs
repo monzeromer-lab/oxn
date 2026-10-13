@@ -6,7 +6,7 @@
 //! script must reject, asserts the error, and uses the recorder to prove
 //! the rejected call left Redis exactly as it was.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

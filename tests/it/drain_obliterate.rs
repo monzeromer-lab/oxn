@@ -1,6 +1,6 @@
 //! drain(), obliterate(), remove() cleanups.
 
-mod common;
+use crate::common;
 
 use oxn::backend::Backend;
 use oxn::prelude::*;

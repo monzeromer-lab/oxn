@@ -1,7 +1,7 @@
 //! Stalled recovery: if a worker dies while holding a lock, the stalled
 //! scanner should requeue the job.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

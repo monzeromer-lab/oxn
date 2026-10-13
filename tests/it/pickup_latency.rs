@@ -9,7 +9,7 @@
 //! Every test runs workers at the **default** `drain_delay`, which is
 //! exactly what the old test-suite avoided by setting it to 20–100ms.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -1,6 +1,6 @@
 //! Priority ordering: lower `priority` number ⇒ processed first.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -26,7 +26,8 @@ pool drains, so "pickup" includes time spent behind the backlog.
 ## Reports
 
 Full per-run reports (per-second timeline, per-job anomaly histories,
-Redis state after drain) are written to `target/oxn-reports/load/`:
+Redis state after drain) are written to `<cargo target dir>/oxn-reports/load/`
+(`./target` unless `CARGO_TARGET_DIR` / `build.target-dir` say otherwise):
 
 - `smoke-baseline-last1000-1791919793.md`, `mixed-baseline-1791920023.md`
 - `latency-baseline-1791919811.md`

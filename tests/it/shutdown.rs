@@ -8,7 +8,7 @@
 //! finish until `shutdown_timeout`, and only then aborts what is left and
 //! **releases** it back to the queue without consuming an attempt.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

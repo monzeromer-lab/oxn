@@ -13,6 +13,12 @@ categories = ["asynchronous", "database"]
 [workspace]
 members = [".", "testkit", "loadtest"]
 
+# Building this repo only — profiles in a library's manifest never apply to
+# crates that depend on it. Full debug info made every integration-test
+# binary ~140 MB; line tables keep file:line in backtraces at ~38 MB.
+[profile.dev]
+debug = "line-tables-only"
+
 [features]
 default = ["redis-backend"]
 

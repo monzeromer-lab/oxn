@@ -10,7 +10,7 @@
 //! ```
 //!
 //! Every run prints a live per-second table, then verifies each job against
-//! its plan and writes `target/oxn-reports/load/<scenario>-<ts>.{md,json}`.
+//! its plan and writes `<target dir>/oxn-reports/load/<scenario>-<ts>.{md,json}`.
 //! The exit code is non-zero when anything is wrong, so a run doubles as a
 //! CI gate.
 

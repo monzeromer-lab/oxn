@@ -6,7 +6,7 @@
 //! `Queue::builder(..).remove_on_complete(Removal::Remove)` did nothing for
 //! a job added with `JobOptions::new()`.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

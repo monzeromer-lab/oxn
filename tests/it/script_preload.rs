@@ -5,7 +5,7 @@
 //! `SCRIPT LOAD` round-trip. Without this preload, the first add against a
 //! managed Redis behind a TLS proxy can hang for seconds.
 
-mod common;
+use crate::common;
 
 use std::time::{Duration, Instant};
 
@@ -116,7 +116,7 @@ async fn warmup_preloads_scripts_on_every_pool_connection() {
         .unwrap();
 
     const POOL_SIZE: usize = 4;
-    const SCRIPT_COUNT: u64 = 10; // matches ALL_SCRIPTS in scripts.rs
+    let script_count = oxn::backend::redis::script_hashes().len() as u64;
 
     let cfg = RedisConfig::new(common::redis_url())
         .prefix(common::TEST_PREFIX)
@@ -144,10 +144,10 @@ async fn warmup_preloads_scripts_on_every_pool_connection() {
         })
         .sum();
 
-    let expected = SCRIPT_COUNT * POOL_SIZE as u64;
+    let expected = script_count * POOL_SIZE as u64;
     assert!(
         calls >= expected,
-        "expected ≥ {expected} SCRIPT calls (10 scripts × {POOL_SIZE} pool slots), \
+        "expected ≥ {expected} SCRIPT calls ({script_count} scripts × {POOL_SIZE} pool slots), \
          got {calls} — looks like preload only ran on a single connection"
     );
 }

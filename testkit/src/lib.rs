@@ -22,7 +22,7 @@
 //! | `OXN_TRACE=1` | Always write timeline reports, not just on failure |
 //! | `OXN_MONITOR=1` | Attach a `MONITOR` tap to every recorder |
 //! | `OXN_LOG=<filter>` | Also print oxn traces to stderr (`EnvFilter` syntax) |
-//! | `OXN_REPORT_DIR` | Where reports go (default `<workspace>/target/oxn-reports`) |
+//! | `OXN_REPORT_DIR` | Where reports go (default `<cargo target dir>/oxn-reports`) |
 
 #![warn(missing_docs)]
 

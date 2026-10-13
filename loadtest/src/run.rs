@@ -9,7 +9,7 @@
 //! 4. **Drain** — wait until the ledger says every job is terminal.
 //! 5. **Verify** — ledger anomalies, queue sizes, retention expectations,
 //!    leak estimate, a final full invariant snapshot.
-//! 6. **Report** — `target/oxn-reports/load/<scenario>-<ts>.{md,json}`.
+//! 6. **Report** — `<target dir>/oxn-reports/load/<scenario>-<ts>.{md,json}`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

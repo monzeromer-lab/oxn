@@ -1,6 +1,6 @@
 //! Bulk dashboard ops: `clean(state)` and `promote_all`.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

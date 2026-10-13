@@ -2,7 +2,7 @@
 
 #![cfg(feature = "dashboard-axum")]
 
-mod common;
+use crate::common;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

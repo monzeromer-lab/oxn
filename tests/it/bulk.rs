@@ -1,6 +1,6 @@
 //! Bulk submission and draining.
 
-mod common;
+use crate::common;
 
 use serde::{Deserialize, Serialize};
 

@@ -2,7 +2,7 @@
 
 #![cfg(feature = "scheduler")]
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

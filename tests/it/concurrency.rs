@@ -1,6 +1,6 @@
 //! Concurrency invariants under load.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
