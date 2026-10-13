@@ -149,7 +149,7 @@
         const total = Object.values(q.counts).reduce((a,b)=>a+b,0);
         const el = document.createElement('div');
         el.className = 'q' + (q.paused ? ' paused' : '') + (selectedQueue === q.name ? ' active' : '');
-        el.innerHTML = `<span>${q.name}</span><small>${total}</small>`;
+        el.innerHTML = `<span>${esc(q.name)}</span><small>${total}</small>`;
         el.onclick = () => { selectedQueue = q.name; render(); };
         nav.appendChild(el);
       }
@@ -162,11 +162,11 @@
       const counts = await api('/api/queues/' + encodeURIComponent(q) + '/counts');
       const detail = document.getElementById('detail');
       detail.innerHTML = `
-        <h2 style="margin-top:0">${q}</h2>
+        <h2 style="margin-top:0">${esc(q)}</h2>
         <div class="toolbar">
-          <button class="btn ghost" onclick="pause('${q}')">Pause</button>
-          <button class="btn ghost" onclick="resume('${q}')">Resume</button>
-          <button class="btn danger" onclick="drain('${q}')">Drain</button>
+          <button class="btn ghost" onclick="pause(${js(q)})">Pause</button>
+          <button class="btn ghost" onclick="resume(${js(q)})">Resume</button>
+          <button class="btn danger" onclick="drain(${js(q)})">Drain</button>
         </div>
         <div class="counts">
           ${STATES.map(s => {
@@ -190,12 +190,12 @@
       // string for states where bulk operations don't make sense.
       if (state === 'completed' || state === 'failed') {
         if (!total) return '';
-        return `<button class="btn danger" onclick="cleanState('${q}','${state}',${total})">Clean ${total} ${state}</button>`;
+        return `<button class="btn danger" onclick="cleanState(${js(q)},${js(state)},${total})">Clean ${total} ${state}</button>`;
       }
       if (state === 'delayed') {
         const help = `<span style="color:var(--muted);font-size:11px;margin-left:8px">Jobs sit in <em>delayed</em> when the producer asked for a delay, when a handler returned <code>Error::Delayed</code>/<code>RateLimited</code>, when a retry is waiting for backoff, or when the scheduler queued them for a future fire time.</span>`;
         if (!total) return help;
-        return `<button class="btn ghost" onclick="promoteAllDelayed('${q}',${total})">Promote all ${total}</button>` + help;
+        return `<button class="btn ghost" onclick="promoteAllDelayed(${js(q)},${total})">Promote all ${total}</button>` + help;
       }
       return '';
     }
@@ -219,20 +219,20 @@
           </tr></thead>
           <tbody>
             ${res.jobs.map(j => `
-              <tr class="row" onclick="openJob('${q}','${escapeAttr(j.id)}')">
-                <td><code>${j.id}</code></td>
-                <td>${j.name}</td>
-                <td><span class="pill ${j.state}">${j.state ?? '-'}</span></td>
+              <tr class="row" onclick="openJob(${js(q)},${js(j.id)})">
+                <td><code>${esc(j.id)}</code></td>
+                <td>${esc(j.name)}</td>
+                <td><span class="pill ${esc(j.state)}">${esc(j.state ?? '-')}</span></td>
                 <td>${j.attempts_made} / ${j.attempts_total}</td>
                 <td>${new Date(j.timestamp_ms).toISOString().slice(0,19).replace('T',' ')}</td>
                 <td>${j.finished_on_ms ? new Date(j.finished_on_ms).toISOString().slice(0,19).replace('T',' ') : '-'}</td>
                 <td onclick="event.stopPropagation()">
-                  ${j.state === 'failed' ? `<button class="btn ghost" onclick="retryJob('${q}','${j.id}')">Retry</button>` : ''}
-                  ${j.state === 'delayed' ? `<button class="btn ghost" onclick="promoteJob('${q}','${j.id}')">Promote</button>` : ''}
-                  <button class="btn danger" onclick="removeJob('${q}','${j.id}')">Remove</button>
+                  ${j.state === 'failed' ? `<button class="btn ghost" onclick="retryJob(${js(q)},${js(j.id)})">Retry</button>` : ''}
+                  ${j.state === 'delayed' ? `<button class="btn ghost" onclick="promoteJob(${js(q)},${js(j.id)})">Promote</button>` : ''}
+                  <button class="btn danger" onclick="removeJob(${js(q)},${js(j.id)})">Remove</button>
                 </td>
               </tr>
-              ${j.failed_reason ? `<tr><td colspan="7" class="reason">${j.failed_reason}</td></tr>` : ''}
+              ${j.failed_reason ? `<tr><td colspan="7" class="reason">${esc(j.failed_reason)}</td></tr>` : ''}
             `).join('')}
           </tbody>
         </table>
@@ -244,6 +244,13 @@
       return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     }
     function escapeAttr(s) { return escapeHtml(s).replace(/`/g, '&#96;'); }
+    // HTML text and attribute values.
+    function esc(s) { return escapeAttr(s == null ? '' : String(s)); }
+    // A value passed to an inline handler: onclick="f(${js(x)})". JSON makes
+    // it a valid JS string literal; attribute-escaping keeps the HTML parser
+    // from ending the attribute. (escapeAttr alone is NOT enough here: the
+    // browser decodes &#39; back to ' before the JS runs.)
+    function js(s) { return escapeAttr(JSON.stringify(s == null ? '' : String(s))); }
     function fmtTs(ms) { return ms ? new Date(ms).toISOString().slice(0,19).replace('T',' ') : '-'; }
     function fmtJson(s) {
       if (s == null || s === '') return '<em style="color:var(--muted)">none</em>';
@@ -258,7 +265,7 @@
       drawer.classList.add('open');
       backdrop.classList.add('open');
       drawer.setAttribute('aria-hidden', 'false');
-      document.getElementById('drawerTitle').textContent = `Job ${id}`;
+      document.getElementById('drawerTitle').textContent = 'Job ' + id;
       document.getElementById('drawerBody').innerHTML = `<div class="empty">Loading…</div>`;
       await renderJob(q, id);
     }
@@ -296,16 +303,16 @@
       const durMs = (job.processed_on_ms && job.finished_on_ms) ? (job.finished_on_ms - job.processed_on_ms) : null;
       body.innerHTML = `
         <div class="actions">
-          ${job.state === 'failed' ? `<button class="btn ghost" onclick="retryJob('${q}','${escapeAttr(job.id)}'); reloadJob();">Retry</button>` : ''}
-          ${job.state === 'delayed' ? `<button class="btn ghost" onclick="promoteJob('${q}','${escapeAttr(job.id)}'); reloadJob();">Promote</button>` : ''}
-          <button class="btn danger" onclick="removeJob('${q}','${escapeAttr(job.id)}'); closeJob();">Remove</button>
+          ${job.state === 'failed' ? `<button class="btn ghost" onclick="retryJob(${js(q)},${js(job.id)}); reloadJob();">Retry</button>` : ''}
+          ${job.state === 'delayed' ? `<button class="btn ghost" onclick="promoteJob(${js(q)},${js(job.id)}); reloadJob();">Promote</button>` : ''}
+          <button class="btn danger" onclick="removeJob(${js(q)},${js(job.id)}); closeJob();">Remove</button>
         </div>
 
         <h3>Stats</h3>
         <div class="stats">
           <div class="k">ID</div><div class="v"><code>${escapeHtml(job.id)}</code></div>
           <div class="k">Name</div><div class="v">${escapeHtml(job.name)}</div>
-          <div class="k">State</div><div class="v"><span class="pill ${stateClass}">${escapeHtml(job.state ?? '-')}</span></div>
+          <div class="k">State</div><div class="v"><span class="pill ${esc(stateClass)}">${escapeHtml(job.state ?? '-')}</span></div>
           <div class="k">Attempts</div><div class="v">${job.attempts_made} / ${job.opts?.attempts ?? '?'}</div>
           <div class="k">Priority</div><div class="v">${job.opts?.priority ?? 0}</div>
           <div class="k">Created</div><div class="v">${fmtTs(job.timestamp_ms)}</div>
@@ -345,16 +352,16 @@
       await api(`/api/queues/${encodeURIComponent(q)}/drain`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({include_delayed:false})});
       refresh();
     }
-    async function retryJob(q, id) { await api(`/api/queues/${encodeURIComponent(q)}/jobs/${id}/retry`, {method:'POST'}); renderJobs(); }
-    async function promoteJob(q, id) { await api(`/api/queues/${encodeURIComponent(q)}/jobs/${id}/promote`, {method:'POST'}); renderJobs(); }
+    async function retryJob(q, id) { await api(`/api/queues/${encodeURIComponent(q)}/jobs/${encodeURIComponent(id)}/retry`, {method:'POST'}); renderJobs(); }
+    async function promoteJob(q, id) { await api(`/api/queues/${encodeURIComponent(q)}/jobs/${encodeURIComponent(id)}/promote`, {method:'POST'}); renderJobs(); }
     async function removeJob(q, id) {
       if (!confirm('Remove job ' + id + '?')) return;
-      await api(`/api/queues/${encodeURIComponent(q)}/jobs/${id}/remove`, {method:'POST'});
+      await api(`/api/queues/${encodeURIComponent(q)}/jobs/${encodeURIComponent(id)}/remove`, {method:'POST'});
       renderJobs();
     }
 
     async function cleanState(q, state, total) {
-      if (!confirm(`Clean ${total} ${state} job${total === 1 ? '' : 's'} from "${q}"? Their hashes, logs, and dependency keys are deleted.`)) return;
+      if (!confirm('Clean ' + total + ' ' + state + ' job' + (total === 1 ? '' : 's') + ' from "' + q + '"? Their hashes, logs, and dependency keys are deleted.')) return;
       const res = await api(
         `/api/queues/${encodeURIComponent(q)}/clean/${encodeURIComponent(state)}`,
         { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ limit: 0 }) },
@@ -364,7 +371,7 @@
     }
 
     async function promoteAllDelayed(q, total) {
-      if (!confirm(`Promote all ${total} delayed job${total === 1 ? '' : 's'} on "${q}" to wait?`)) return;
+      if (!confirm('Promote all ' + total + ' delayed job' + (total === 1 ? '' : 's') + ' on "' + q + '" to wait?')) return;
       const res = await api(
         `/api/queues/${encodeURIComponent(q)}/promote-all`,
         { method:'POST' },

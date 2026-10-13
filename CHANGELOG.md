@@ -105,6 +105,21 @@ It contains breaking changes; see the migration notes below.
   immediately and its pool slot is detached instead of being returned with
   a block still pending; the stalled scanner is joined before `run()`
   returns.
+- **Dashboard stored XSS closed (B10).** Queue names, job ids, job names,
+  failure reasons and state names were interpolated into `innerHTML` and
+  inline `onclick` handlers unescaped (and `escapeAttr` was used inside JS
+  string literals, where the browser decodes `&#39;` back to `'` before
+  the script runs). A failure reason such as `<img src=x onerror=…>` ran
+  script in an operator's browser, with access to every destructive POST
+  route. Every value is now escaped for its context: `esc()` for HTML,
+  `js()` (JSON + attribute escaping) for inline handlers,
+  `encodeURIComponent` for ids in URLs. Verified in a real browser with
+  hostile queue names, ids, names and failure reasons. A test fails on
+  any new raw `${…}` interpolation. (Queue-name validation alone is not
+  enough: `xss<img/src=x/onerror=…>` contains no whitespace or `:`.)
+- The `dashboard_axum` example binds to `127.0.0.1` (it bound `0.0.0.0`,
+  exposing an unauthenticated admin UI) and reads `REDIS_URL` / `PORT` /
+  `BIND`.
 - **A panicking handler is a failure, not a stuck job (B16).** A panic
   unwound the task processing the job: no outcome was recorded and the
   job stayed locked in `active` until its lock expired (30s by default)
