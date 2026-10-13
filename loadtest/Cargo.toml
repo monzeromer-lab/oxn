@@ -3,8 +3,26 @@ name = "oxn-load"
 version = "0.0.0"
 edition = "2024"
 publish = false
-description = "Load, soak and chaos harness for oxn."
+description = "Load, soak and chaos harness for oxn with per-job ledger verification."
+
+[[bin]]
+name = "oxn-load"
+path = "src/main.rs"
 
 [dependencies]
 oxn = { path = "..", features = ["redis-backend"] }
 oxn-testkit = { path = "../testkit" }
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "aio", "connection-manager"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4.5", features = ["derive"] }
+hdrhistogram = "7.5"
+rand = "0.8"
+anyhow = "1"
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+libc = "0.2"

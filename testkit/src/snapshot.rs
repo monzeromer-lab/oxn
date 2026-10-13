@@ -8,7 +8,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use redis::aio::MultiplexedConnection;
 use serde::Serialize;
 
 /// List-backed containers, in display order.
@@ -137,11 +136,10 @@ return out
 
 impl Snapshot {
     /// Read the full state of `queue` in one atomic server-side step.
-    pub async fn take(
-        conn: &mut MultiplexedConnection,
-        prefix: &str,
-        queue: &str,
-    ) -> redis::RedisResult<Self> {
+    pub async fn take<C>(conn: &mut C, prefix: &str, queue: &str) -> redis::RedisResult<Self>
+    where
+        C: redis::aio::ConnectionLike + Send,
+    {
         let base = format!("{prefix}:{queue}:");
         let raw: Vec<(String, String, Vec<String>)> = redis::Script::new(SNAPSHOT_LUA)
             .arg(format!("{}*", glob_escape(&base)))
