@@ -453,6 +453,19 @@ enum Moved {
     Empty { next_due: Option<Duration> },
 }
 
+/// Escape Redis glob metacharacters so a `SCAN MATCH` pattern built from a
+/// queue name matches that name literally.
+fn glob_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Job deletions per script call for batched operations; must match
 /// `OXN_BATCH` in `lua/includes/common.lua`.
 const SCRIPT_BATCH: u64 = 1000;
@@ -864,16 +877,28 @@ impl Backend for RedisBackend {
             deleted = tracing::field::Empty
         );
         let keys = self.keys(queue);
+        // 1. Atomically: refuse if jobs are active (unless forced), else
+        //    pause so no worker can take a job while we delete.
+        let mut inv = self.scripts.obliterate_begin.prepare_invoke();
+        inv.key(keys.active())
+            .key(keys.meta())
+            .arg(if force { 1 } else { 0 });
         let mut conn = self.conn().await?;
-        if !force {
-            let active: usize = conn.llen(keys.active()).await?;
-            if active > 0 {
-                return Err(Error::Config(format!(
-                    "obliterate: {active} active jobs — pass force=true to proceed"
-                )));
-            }
+        let reply = self
+            .eval(&mut conn, "obliterate_begin", queue, None, &inv)
+            .await?;
+        let active: u64 = redis::from_redis_value(&reply)?;
+        if active > 0 {
+            return Err(Error::Config(format!(
+                "obliterate: {active} active jobs — pass force=true to proceed"
+            )));
         }
-        let pattern = keys.scan_pattern();
+        // 2. Delete every key under the queue in pages. The SCAN pattern is
+        //    glob-escaped: queue names may contain `*`, `?` and `[`, and an
+        //    unescaped `oxn:*:*` would match every queue under the prefix.
+        //    `meta` holds the pause flag, so it goes last.
+        let pattern = format!("{}*", glob_escape(&keys.job_hash_prefix()));
+        let meta = keys.meta();
         let mut cursor: u64 = 0;
         let mut deleted = 0usize;
         loop {
@@ -885,6 +910,7 @@ impl Backend for RedisBackend {
                 .arg(500)
                 .query_async(&mut *conn)
                 .await?;
+            let page: Vec<String> = page.into_iter().filter(|k| *k != meta).collect();
             if !page.is_empty() {
                 deleted += page.len();
                 let _: () = conn.del(page).await?;
@@ -894,12 +920,13 @@ impl Backend for RedisBackend {
             }
             cursor = next;
         }
+        let _: () = conn.del(&meta).await?;
         let _: () = conn.srem(format!("{}:queues", self.prefix), queue).await?;
         // Drop the in-process cache entry so a future `add()` re-SADDs the
         // queue back into the registry. Without this, the cache lies and the
         // dashboard's queue listing won't show a re-created queue.
         self.registered_queues.remove(queue);
-        span.record("deleted", deleted);
+        span.record("deleted", deleted + 1);
         Ok(())
     }
 
@@ -1606,6 +1633,13 @@ mod tests {
             j(Removal::KeepFor(Duration::from_millis(1500))),
             serde_json::json!({"KeepFor": {"secs": 1, "nanos": 500_000_000}})
         );
+    }
+
+    #[test]
+    fn glob_escape_neutralizes_metacharacters() {
+        assert_eq!(glob_escape("oxn:emails:"), "oxn:emails:");
+        assert_eq!(glob_escape("oxn:*:"), "oxn:\\*:");
+        assert_eq!(glob_escape("a?b[c]d\\e"), "a\\?b\\[c\\]d\\\\e");
     }
 
     #[test]

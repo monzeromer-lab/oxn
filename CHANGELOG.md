@@ -105,6 +105,16 @@ It contains breaking changes; see the migration notes below.
   immediately and its pool slot is detached instead of being returned with
   a block still pending; the stalled scanner is joined before `run()`
   returns.
+- **`obliterate` deletes exactly one queue, safely (B11).** It deleted
+  every key matching the unescaped glob `{prefix}:{queue}:*`; queue names
+  may contain `*`, `?` and `[`, so obliterating a queue named `x*`
+  deleted every queue starting with `x` (and `*` every queue under the
+  prefix). The pattern is now glob-escaped. The non-force "no active jobs"
+  check was a separate command from the deletion, so a worker could take
+  a job mid-delete and re-create part of it (keys survived in 3 of 3 stress
+  runs). New `obliterate_begin.lua` checks and pauses the queue in one
+  step; `meta` (holding the pause flag) is deleted last. A refused
+  obliterate changes nothing.
 - **Dashboard stored XSS closed (B10).** Queue names, job ids, job names,
   failure reasons and state names were interpolated into `innerHTML` and
   inline `onclick` handlers unescaped (and `escapeAttr` was used inside JS

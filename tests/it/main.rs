@@ -28,6 +28,7 @@ mod explicit_ids;
 mod flow;
 mod handler_panics;
 mod job_defaults;
+mod obliterate_scope;
 mod pause_resume;
 mod pickup_latency;
 mod priority;
