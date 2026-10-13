@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::common;
 use oxn::backend::Backend;
+use oxn::backend::Failure;
 use oxn::backend::redis::RedisBackend;
 use oxn::options::Removal;
 use oxn::prelude::*;
@@ -216,7 +217,7 @@ async fn a_stall_does_not_consume_an_attempt() {
     assert_eq!(f.job.attempts_made, 1);
     rec.step(
         "fail attempt 1 (retry)",
-        b.fail(q.name(), &id, "w", "boom", Some(0), Removal::Keep, None),
+        b.fail(q.name(), &id, "w", Failure::new("boom").retry_at(0)),
     )
     .await
     .unwrap();

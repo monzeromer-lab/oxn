@@ -8,6 +8,7 @@
 //! `dedup-dangling` / `stalled-set-leak` rules catch each of these.
 
 use crate::common;
+use oxn::backend::Failure;
 
 use std::sync::Arc;
 
@@ -39,7 +40,7 @@ async fn finish(
             .await
             .unwrap();
     } else {
-        b.fail(q, &f.job.id, "tok", "boom", None, removal, None)
+        b.fail(q, &f.job.id, "tok", Failure::new("boom").removal(removal))
             .await
             .unwrap();
     }

@@ -24,7 +24,7 @@ use redis::AsyncCommands;
 use tracing::Instrument;
 
 use crate::backend::{
-    Backend, EventRecord, Fetched, JobInsert, JobRange, RawJob, RecordStream, StateCounts,
+    Backend, EventRecord, Failure, Fetched, JobInsert, JobRange, RawJob, RecordStream, StateCounts,
     StreamStart,
 };
 use crate::error::{Error, Result};
@@ -774,16 +774,13 @@ impl Backend for RedisBackend {
         Ok(())
     }
 
-    async fn fail(
-        &self,
-        queue: &str,
-        id: &JobId,
-        token: &str,
-        reason: &str,
-        retry_at_ms: Option<i64>,
-        removal: crate::options::Removal,
-        trace: Option<&str>,
-    ) -> Result<()> {
+    async fn fail(&self, queue: &str, id: &JobId, token: &str, failure: Failure<'_>) -> Result<()> {
+        let Failure {
+            reason,
+            retry_at_ms,
+            removal,
+            trace,
+        } = failure;
         let keys = self.keys(queue);
         let mut conn = self.conn().await?;
 

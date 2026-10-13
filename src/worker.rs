@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use uuid::Uuid;
 
-use crate::backend::{Backend, Fetched};
+use crate::backend::{Backend, Failure, Fetched};
 use crate::error::{Error, Result};
 use crate::job::Job;
 use crate::options::WorkerOptions;
@@ -381,10 +381,7 @@ async fn process_one_inner<D, R>(
                     &queue,
                     &id,
                     &token,
-                    &reason,
-                    None,
-                    remove_on_fail,
-                    Some(&trace),
+                    Failure::new(&reason).removal(remove_on_fail).trace(&trace),
                 )
                 .await;
             log_transition("failed", &r);
@@ -462,7 +459,12 @@ async fn process_one_inner<D, R>(
         Err(Error::Unrecoverable(msg)) => {
             span.record("transition", "failed");
             let r = backend
-                .fail(&queue, &id, &token, &msg, None, remove_on_fail, trace)
+                .fail(
+                    &queue,
+                    &id,
+                    &token,
+                    failure(&msg, None, remove_on_fail, trace),
+                )
                 .await;
             log_transition("failed", &r);
         }
@@ -482,10 +484,7 @@ async fn process_one_inner<D, R>(
                         &queue,
                         &id,
                         &token,
-                        &err.to_string(),
-                        Some(retry_at),
-                        remove_on_fail,
-                        trace,
+                        failure(&err.to_string(), Some(retry_at), remove_on_fail, trace),
                     )
                     .await;
                 log_transition("retry-delayed", &r);
@@ -496,16 +495,26 @@ async fn process_one_inner<D, R>(
                         &queue,
                         &id,
                         &token,
-                        &err.to_string(),
-                        None,
-                        remove_on_fail,
-                        trace,
+                        failure(&err.to_string(), None, remove_on_fail, trace),
                     )
                     .await;
                 log_transition("failed", &r);
             }
         }
     }
+}
+
+/// The [`Failure`] for one attempt: retry at `retry_at` or fail for good.
+fn failure<'a>(
+    reason: &'a str,
+    retry_at: Option<i64>,
+    removal: crate::options::Removal,
+    trace: Option<&'a str>,
+) -> Failure<'a> {
+    let mut f = Failure::new(reason).removal(removal);
+    f.retry_at_ms = retry_at;
+    f.trace = trace;
+    f
 }
 
 /// Longest stack-trace entry stored for one attempt.

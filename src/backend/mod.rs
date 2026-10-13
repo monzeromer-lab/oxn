@@ -78,6 +78,58 @@ pub struct JobInsert {
     pub timestamp_ms: i64,
 }
 
+/// What went wrong with an attempt, for [`Backend::fail`].
+///
+/// ```
+/// use oxn::backend::Failure;
+/// use oxn::options::Removal;
+///
+/// let retry = Failure::new("timeout").retry_at(1_700_000_000_000);
+/// let fatal = Failure::new("bad input").removal(Removal::KeepLast(100));
+/// # let _ = (retry, fatal);
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct Failure<'a> {
+    /// Human-readable reason, stored as `failedReason`.
+    pub reason: &'a str,
+    /// Retry at this epoch-ms (backoff); `None` fails the job for good.
+    pub retry_at_ms: Option<i64>,
+    /// Retention applied when the job fails for good.
+    pub removal: crate::options::Removal,
+    /// Stack-trace entry for this attempt.
+    pub trace: Option<&'a str>,
+}
+
+impl<'a> Failure<'a> {
+    /// A permanent failure with `reason`, kept ([`Removal::Keep`](crate::options::Removal)), no trace.
+    pub fn new(reason: &'a str) -> Self {
+        Self {
+            reason,
+            retry_at_ms: None,
+            removal: crate::options::Removal::Keep,
+            trace: None,
+        }
+    }
+    /// Retry at `ms` (epoch-ms) instead of failing for good.
+    #[must_use]
+    pub fn retry_at(mut self, ms: i64) -> Self {
+        self.retry_at_ms = Some(ms);
+        self
+    }
+    /// Retention applied if the job fails for good.
+    #[must_use]
+    pub fn removal(mut self, removal: crate::options::Removal) -> Self {
+        self.removal = removal;
+        self
+    }
+    /// Stack-trace entry for this attempt.
+    #[must_use]
+    pub fn trace(mut self, trace: &'a str) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+}
+
 /// A fetched job plus the lock token that authorizes operations on it.
 ///
 /// The worker must pass `token` to subsequent `complete`/`fail`/`extend_lock`
@@ -210,24 +262,13 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
         removal: crate::options::Removal,
     ) -> Result<()>;
 
-    /// Mark a job failed. If `retry_at_ms` is `Some`, the job goes to
-    /// `delayed` for re-execution at that timestamp; otherwise it's moved
-    /// to `failed` with `removal` applied.
-    ///
-    /// `trace`, when given, is appended to the job's `stacktrace` (the 10
-    /// most recent entries are kept).
+    /// Record a failed attempt. With [`Failure::retry_at`] the job goes to
+    /// `delayed` for re-execution at that time; otherwise it fails for good
+    /// into `failed` with [`Failure::removal`] applied. [`Failure::trace`]
+    /// is appended to the job's `stacktrace` (10 most recent kept).
     ///
     /// Same lock errors as [`Self::complete`].
-    async fn fail(
-        &self,
-        queue: &str,
-        id: &JobId,
-        token: &str,
-        reason: &str,
-        retry_at_ms: Option<i64>,
-        removal: crate::options::Removal,
-        trace: Option<&str>,
-    ) -> Result<()>;
+    async fn fail(&self, queue: &str, id: &JobId, token: &str, failure: Failure<'_>) -> Result<()>;
 
     /// Postpone an active job until `until_ms` without counting it as a
     /// failure: the attempt is refunded and no `failedReason` is recorded.

@@ -68,8 +68,9 @@ It contains breaking changes; see the migration notes below.
   required method `release(queue, id, token)` hands an active job back
   without an outcome (B4); `subscribe` takes a `StreamStart` and returns
   `EventRecord`s (B8); new required `delay(queue, id, token, until_ms)`
-  for postponements (B9); `fail` takes a trailing `trace: Option<&str>`
-  (B12b).
+  for postponements (B9); `fail(queue, id, token, Failure)` takes a
+  `Failure { reason, retry_at_ms, removal, trace }` (builder:
+  `Failure::new(reason).retry_at(ms).removal(r).trace(t)`) (B12b).
 - Dashboard (axum and actix) maps `NotFound` → **404** and state/lock
   conflicts → **409**, with `{"error": "..."}` bodies, instead of `204`.
 - New `Error::is_conflict()` and `Error::is_lock_lost()` helpers.

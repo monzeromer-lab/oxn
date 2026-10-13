@@ -12,9 +12,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::common;
+use oxn::backend::Failure;
 use oxn::backend::redis::RedisBackend;
 use oxn::backend::{Backend, JobRange};
-use oxn::options::Removal;
 use oxn::prelude::*;
 use oxn_testkit::{Recorder, ms, secs};
 use serde::{Deserialize, Serialize};
@@ -71,16 +71,8 @@ async fn a_retry_backoff_keeps_priority() {
     assert_eq!(fetch(&b, q.name()).await, prio);
     rec.step("fail with a 100ms backoff", async {
         let at = now_ms() + 100;
-        b.fail(
-            q.name(),
-            &prio,
-            "w",
-            "transient",
-            Some(at),
-            Removal::Keep,
-            None,
-        )
-        .await
+        b.fail(q.name(), &prio, "w", Failure::new("transient").retry_at(at))
+            .await
     })
     .await
     .unwrap();
@@ -163,7 +155,7 @@ async fn retry_of_a_failed_job_keeps_priority_and_respects_pause() {
         .unwrap();
     for _ in 0..2 {
         let id = fetch(&b, q.name()).await;
-        b.fail(q.name(), &id, "w", "boom", None, Removal::Keep, None)
+        b.fail(q.name(), &id, "w", Failure::new("boom"))
             .await
             .unwrap();
     }

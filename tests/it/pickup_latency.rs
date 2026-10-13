@@ -10,6 +10,7 @@
 //! exactly what the old test-suite avoided by setting it to 20–100ms.
 
 use crate::common;
+use oxn::backend::Failure;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -216,15 +217,7 @@ async fn resume_promote_and_retry_wake_blocked_workers() {
         .unwrap();
     rec.step(
         "fail it permanently",
-        b.fail(
-            q.name(),
-            &f.job.id,
-            "setup",
-            "boom",
-            None,
-            oxn::options::Removal::Keep,
-            None,
-        ),
+        b.fail(q.name(), &f.job.id, "setup", Failure::new("boom")),
     )
     .await
     .unwrap();
