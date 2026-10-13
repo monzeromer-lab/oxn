@@ -56,6 +56,10 @@ pub struct Outcome {
     pub health_after_cleanup: Option<RedisHealth>,
     pub rows: Vec<Row>,
     pub kills: u32,
+    /// Host `/proc/loadavg` (1/5/15 min) at start and end — throughput and
+    /// latency numbers are only comparable between quiet runs.
+    pub loadavg_start: Option<String>,
+    pub loadavg_end: Option<String>,
     pub passed: bool,
     pub failures: Vec<String>,
 }
@@ -128,6 +132,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
         .unwrap_or_else(|| cfg.redis.clone());
 
     let health_before = stats::redis_health(&mut direct).await;
+    let loadavg_start = loadavg();
     let history_cap = if cfg.jobs > 200_000 || cfg.duration.is_some() {
         6
     } else {
@@ -201,7 +206,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
 
     // Producers.
     let backend = workload::connect(&oxn_url, cfg.producers * 2 + 2).await?;
-    let pq = workload::queue_on(backend.clone(), &queue);
+    let pq = workload::queue_on(backend.clone(), &queue, workload::queue_defaults(&cfg));
     let next = Arc::new(AtomicU64::new(0));
     let stop_producers = CancellationToken::new();
     let mut producers = Vec::new();
@@ -419,6 +424,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
         health_after_cleanup,
         rows: rows.lock().clone(),
         kills,
+        loadavg_start,
+        loadavg_end: loadavg(),
         passed: failures.is_empty(),
         failures,
         config: (*cfg).clone(),
@@ -652,6 +659,12 @@ fn check_retention(
         }
     }
     out
+}
+
+fn loadavg() -> Option<String> {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
 }
 
 fn uuid_like() -> String {

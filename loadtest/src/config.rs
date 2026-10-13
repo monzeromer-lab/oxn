@@ -131,6 +131,10 @@ pub struct RunArgs {
     /// Label appended to the report file name.
     #[arg(long)]
     pub label: Option<String>,
+    /// Set attempts, backoff and retention as **queue defaults** and add
+    /// jobs with only per-job delay/priority (exercises default merging).
+    #[arg(long)]
+    pub options_at_queue: bool,
     /// Fail the run if first-attempt pickup p99 exceeds this (ms).
     #[arg(long)]
     pub slo_pickup_p99_ms: Option<f64>,
@@ -170,6 +174,8 @@ pub struct Config {
     pub bursty: bool,
     /// Pickup p99 service level, ms.
     pub slo_pickup_p99_ms: Option<f64>,
+    /// Attempts/backoff/retention set on the queue, not per job.
+    pub options_at_queue: bool,
 }
 
 fn ser_dur<S: serde::Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
@@ -217,6 +223,7 @@ impl Config {
             label: a.label.clone(),
             bursty: false,
             slo_pickup_p99_ms: None,
+            options_at_queue: a.options_at_queue,
         };
         match a.scenario {
             Smoke => {}
@@ -336,6 +343,9 @@ impl Config {
         }
         if let Some(ch) = &a.chaos {
             c.chaos = parse_chaos(ch)?;
+        }
+        if c.options_at_queue && c.retention == Retention::Mixed {
+            anyhow::bail!("--options-at-queue can't express per-job mixed retention");
         }
         if c.chaos
             .iter()

@@ -27,7 +27,7 @@ use crate::backend::{Backend, EventStream, Fetched, JobInsert, JobRange, RawJob,
 use crate::error::{Error, Result};
 use crate::events::Event;
 use crate::job::{JobId, JobState};
-use crate::options::{JobOptions, Removal};
+use crate::options::{Removal, ResolvedJobOptions};
 
 /// Construction config for [`RedisBackend`].
 #[derive(Debug, Clone)]
@@ -346,11 +346,11 @@ fn encode_removal(r: &Removal) -> String {
     }
 }
 
-fn opts_to_json(opts: &JobOptions) -> Result<String> {
+fn opts_to_json(opts: &ResolvedJobOptions) -> Result<String> {
     Ok(serde_json::to_string(opts)?)
 }
 
-fn opts_from_json(s: &str) -> Result<JobOptions> {
+fn opts_from_json(s: &str) -> Result<ResolvedJobOptions> {
     Ok(serde_json::from_str(s)?)
 }
 
@@ -1110,7 +1110,7 @@ fn hash_to_raw(
     let take = |m: &mut std::collections::HashMap<String, String>, k: &str| m.remove(k);
     let opts = match take(&mut map, "opts") {
         Some(s) => opts_from_json(&s)?,
-        None => JobOptions::default(),
+        None => ResolvedJobOptions::default(),
     };
     let stacktrace = take(&mut map, "stacktrace")
         .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())

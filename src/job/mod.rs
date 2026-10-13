@@ -10,7 +10,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::options::JobOptions;
+use crate::options::ResolvedJobOptions;
 
 /// A job id. Wraps `String` so the rest of the crate doesn't pass untyped
 /// strings around.
@@ -132,8 +132,9 @@ pub struct Job<D, R = ()> {
     pub name: String,
     /// The user payload.
     pub data: D,
-    /// Options originally used to submit the job.
-    pub opts: JobOptions,
+    /// The options the job runs with: per-job options merged with the
+    /// queue's defaults at submission time.
+    pub opts: ResolvedJobOptions,
     /// Epoch-ms the job was accepted by the queue.
     pub timestamp_ms: i64,
     /// Epoch-ms the worker started processing, if started.

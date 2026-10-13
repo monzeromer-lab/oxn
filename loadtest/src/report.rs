@@ -36,6 +36,12 @@ pub fn render(o: &Outcome) -> String {
         "queue `{}` · {} jobs added ({} add errors) · load {:.1}s + drain {:.1}s · **{:.0} completions/s**\n",
         o.queue, o.added, o.add_errors, o.load_secs, o.drain_secs, o.throughput_ok_per_s
     );
+    if let (Some(a), Some(b)) = (&o.loadavg_start, &o.loadavg_end) {
+        let _ = writeln!(
+            s,
+            "host load average (1/5/15m): start `{a}` → end `{b}` — compare throughput only between quiet runs\n"
+        );
+    }
     if !o.failures.is_empty() {
         let _ = writeln!(s, "## Failures\n");
         for f in &o.failures {

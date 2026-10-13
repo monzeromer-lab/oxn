@@ -276,8 +276,49 @@ pub async fn connect(url: &str, pool: usize) -> anyhow::Result<Arc<dyn Backend>>
     Ok(Arc::new(RedisBackend::connect(cfg).await?))
 }
 
-pub fn queue_on(backend: Arc<dyn Backend>, name: &str) -> Queue<LoadJob> {
-    Queue::from_backend(name, backend, QueueOptions::default().prefix(PREFIX))
+pub fn queue_on(backend: Arc<dyn Backend>, name: &str, defaults: JobOptions) -> Queue<LoadJob> {
+    Queue::from_backend(
+        name,
+        backend,
+        QueueOptions::default()
+            .prefix(PREFIX)
+            .default_job_options(defaults),
+    )
+}
+
+fn removal_for(r: Retention) -> Removal {
+    match r {
+        Retention::Keep | Retention::Mixed => Removal::Keep,
+        Retention::Remove => Removal::Remove,
+        Retention::Last1000 => Removal::KeepLast(1000),
+        Retention::For30s => Removal::KeepFor(Duration::from_secs(30)),
+    }
+}
+
+fn backoff_for(cfg: &Config) -> Backoff {
+    if cfg.fail_rate > 0.0 {
+        Backoff::Exponential {
+            initial: Duration::from_millis(50),
+            max: Some(Duration::from_secs(1)),
+        }
+    } else {
+        Backoff::Fixed {
+            delay: Duration::from_millis(100),
+        }
+    }
+}
+
+/// Queue-level defaults for `--options-at-queue` (empty otherwise).
+pub fn queue_defaults(cfg: &Config) -> JobOptions {
+    if !cfg.options_at_queue {
+        return JobOptions::new();
+    }
+    let removal = removal_for(cfg.retention);
+    JobOptions::new()
+        .attempts(cfg.attempts)
+        .backoff(backoff_for(cfg))
+        .remove_on_complete(removal)
+        .remove_on_fail(removal)
 }
 
 /// Deterministic per-job plan.
@@ -304,7 +345,7 @@ pub fn plan(cfg: &Config, seq: u64, seed: u64) -> (LoadJob, JobOptions) {
     } else {
         0
     };
-    let retention = match cfg.retention {
+    let removal = removal_for(match cfg.retention {
         Retention::Mixed => [
             Retention::Keep,
             Retention::Remove,
@@ -312,13 +353,7 @@ pub fn plan(cfg: &Config, seq: u64, seed: u64) -> (LoadJob, JobOptions) {
             Retention::For30s,
         ][rng.gen_range(0..4)],
         r => r,
-    };
-    let removal = match retention {
-        Retention::Keep | Retention::Mixed => Removal::Keep,
-        Retention::Remove => Removal::Remove,
-        Retention::Last1000 => Removal::KeepLast(1000),
-        Retention::For30s => Removal::KeepFor(Duration::from_secs(30)),
-    };
+    });
     let job = LoadJob {
         seq,
         enq_us: 0, // stamped at submit time
@@ -327,22 +362,18 @@ pub fn plan(cfg: &Config, seq: u64, seed: u64) -> (LoadJob, JobOptions) {
         fatal,
         work_us,
     };
-    let backoff = if cfg.fail_rate > 0.0 {
-        Backoff::Exponential {
-            initial: Duration::from_millis(50),
-            max: Some(Duration::from_secs(1)),
-        }
+    let mut opts = if cfg.options_at_queue {
+        JobOptions::new()
     } else {
-        Backoff::Fixed {
-            delay: Duration::from_millis(100),
-        }
+        JobOptions::new()
+            .attempts(cfg.attempts)
+            .backoff(backoff_for(cfg))
+            .remove_on_complete(removal)
+            .remove_on_fail(removal)
     };
-    let mut opts = JobOptions::new()
-        .attempts(cfg.attempts)
-        .backoff(backoff)
-        .priority(priority)
-        .remove_on_complete(removal)
-        .remove_on_fail(removal);
+    if priority > 0 || !cfg.options_at_queue {
+        opts = opts.priority(priority);
+    }
     if delay_ms > 0 {
         opts = opts.delay(Duration::from_millis(delay_ms));
     }
@@ -464,7 +495,7 @@ impl InProcPool {
     pub async fn start(&mut self) -> anyhow::Result<()> {
         for i in 0..self.cfg.workers {
             let backend = connect(&self.url, self.cfg.concurrency + 4).await?;
-            let q = queue_on(backend, &self.queue_name);
+            let q = queue_on(backend, &self.queue_name, JobOptions::new());
             let cancel = CancellationToken::new();
             let index = self.generation * 1000 + i as u32;
             let w = build_worker(
@@ -622,7 +653,7 @@ pub async fn child_worker_main(
     drain_delay_ms: Option<u64>,
 ) -> anyhow::Result<()> {
     let backend = connect(&url, concurrency + 4).await?;
-    let q = queue_on(backend, &queue);
+    let q = queue_on(backend, &queue, JobOptions::new());
     let sink = Sink::Stdout(Arc::new(Mutex::new(std::io::stdout())));
     let w = build_worker(
         q,

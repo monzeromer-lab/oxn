@@ -127,7 +127,7 @@ where
     /// # Ok(()) }
     /// ```
     pub async fn add(&self, data: D, opts: JobOptions) -> Result<JobId> {
-        let opts = merge_opts(&self.opts.default_job_options, opts);
+        let opts = opts.resolve_with(&self.opts.default_job_options);
         let insert = JobInsert {
             name: opts.name.clone().unwrap_or_else(|| self.name.clone()),
             data: serde_json::to_string(&data)?,
@@ -167,7 +167,7 @@ where
         let inserts = jobs
             .into_iter()
             .map(|(d, opts)| {
-                let opts = merge_opts(&self.opts.default_job_options, opts);
+                let opts = opts.resolve_with(&self.opts.default_job_options);
                 let name = opts.name.clone().unwrap_or_else(|| self.name.clone());
                 Ok(JobInsert {
                     name,
@@ -252,27 +252,6 @@ where
     /// Attach a local event subscriber.
     pub fn events(&self) -> QueueEvents {
         QueueEvents::new(self.name.clone(), self.backend.clone())
-    }
-}
-
-pub(crate) fn merge_opts(default: &JobOptions, override_: JobOptions) -> JobOptions {
-    JobOptions {
-        id: override_.id.or_else(|| default.id.clone()),
-        name: override_.name.or_else(|| default.name.clone()),
-        delay: override_.delay.or(default.delay),
-        priority: if override_.priority != 0 {
-            override_.priority
-        } else {
-            default.priority
-        },
-        attempts: override_.attempts.max(1),
-        backoff: override_.backoff.or(default.backoff),
-        deduplication: override_
-            .deduplication
-            .or_else(|| default.deduplication.clone()),
-        remove_on_complete: override_.remove_on_complete,
-        remove_on_fail: override_.remove_on_fail,
-        lifo: override_.lifo,
     }
 }
 
@@ -396,7 +375,7 @@ where
     /// ```
     #[must_use]
     pub fn remove_on_complete(mut self, r: Removal) -> Self {
-        self.opts.default_job_options.remove_on_complete = r;
+        self.opts.default_job_options.remove_on_complete = Some(r);
         self
     }
 
@@ -404,7 +383,7 @@ where
     /// this queue when it fails permanently.
     #[must_use]
     pub fn remove_on_fail(mut self, r: Removal) -> Self {
-        self.opts.default_job_options.remove_on_fail = r;
+        self.opts.default_job_options.remove_on_fail = Some(r);
         self
     }
 
@@ -450,49 +429,5 @@ where
             }
         };
         Ok(Queue::from_backend(self.name, backend, self.opts))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::job::Backoff;
-    use std::time::Duration;
-
-    #[test]
-    fn merge_prefers_override_but_falls_back() {
-        let default = JobOptions::new()
-            .attempts(2)
-            .priority(1)
-            .backoff(Backoff::ONE_SECOND);
-        let merged = merge_opts(
-            &default,
-            JobOptions::new()
-                .id("abc")
-                .delay(Duration::from_millis(300))
-                .attempts(5),
-        );
-        assert_eq!(merged.id.as_deref(), Some("abc"));
-        assert_eq!(merged.attempts, 5);
-        assert_eq!(merged.delay, Some(Duration::from_millis(300)));
-        // override_ priority 0 should fall back to default's 1
-        assert_eq!(merged.priority, 1);
-        // backoff should inherit
-        assert!(merged.backoff.is_some());
-    }
-
-    #[test]
-    fn merge_respects_override_priority_when_nonzero() {
-        let default = JobOptions::new().priority(1);
-        let merged = merge_opts(&default, JobOptions::new().priority(9));
-        assert_eq!(merged.priority, 9);
-    }
-
-    #[test]
-    fn merge_inherits_dedup_when_override_is_none() {
-        let default = JobOptions::new().deduplicate("abc", std::time::Duration::from_secs(10));
-        let merged = merge_opts(&default, JobOptions::new());
-        let d = merged.deduplication.unwrap();
-        assert_eq!(d.id, "abc");
     }
 }

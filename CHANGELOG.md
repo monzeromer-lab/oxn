@@ -28,6 +28,24 @@ It contains breaking changes; see the migration notes below.
   - `Error::Script(JobLocked)` (new, code `-7`) — `remove` on an active
     job whose lock is held. It used to delete the job out from under the
     worker processing it.
+- **Queue defaults are honored (B2).** `JobOptions` fields are now all
+  `Option`s: `None` means "use the queue's `default_job_options`, then the
+  built-in default". In 0.2, `attempts`, `remove_on_complete`,
+  `remove_on_fail` and `lifo` were always taken from the per-job options,
+  so `QueueBuilder::remove_on_complete(Removal::Remove)` and a default
+  `attempts(n)` had no effect on jobs added with `JobOptions::new()`. An
+  explicit value now always wins, even one equal to the built-in default
+  (`.priority(0)` overrides a queue default priority). `id` is never
+  inherited.
+  - New `ResolvedJobOptions` (the merged result) is what is stored and what
+    `Job::opts`, `RawJob::opts` and `JobInsert::opts` expose; its fields are
+    plain values (`attempts: u32`, …). Its JSON matches 0.2's `JobOptions`,
+    so existing job records keep loading.
+  - New `JobOptions::resolve_with(&defaults)` / `resolve()`.
+  - *Migration:* reading `opts.attempts` etc. off a `Job` is unchanged;
+    code that read fields off a `JobOptions` value it built must handle
+    `Option`s; code constructing `JobInsert` for a custom backend call
+    must resolve first (`opts.resolve()`).
 - Dashboard (axum and actix) maps `NotFound` → **404** and state/lock
   conflicts → **409**, with `{"error": "..."}` bodies, instead of `204`.
 - New `Error::is_conflict()` and `Error::is_lock_lost()` helpers.

@@ -19,7 +19,8 @@ use crate::job::Backoff;
 pub struct QueueOptions {
     /// Redis key prefix. BullMQ defaults to `"bull"`; we default to `"oxn"`.
     pub prefix: String,
-    /// Default job options, applied when [`JobOptions::default()`] is used.
+    /// Queue-wide defaults: every field a job leaves unset is taken from
+    /// here (see [`JobOptions::resolve_with`]).
     pub default_job_options: JobOptions,
     /// Max length of the `events` Redis Stream (trimmed on every XADD).
     pub max_stream_length: usize,
@@ -63,7 +64,7 @@ impl QueueOptions {
     /// options.
     #[must_use]
     pub fn remove_on_complete(mut self, r: Removal) -> Self {
-        self.default_job_options.remove_on_complete = r;
+        self.default_job_options.remove_on_complete = Some(r);
         self
     }
 
@@ -72,61 +73,69 @@ impl QueueOptions {
     /// [`JobOptions::remove_on_fail`] on the queue's default job options.
     #[must_use]
     pub fn remove_on_fail(mut self, r: Removal) -> Self {
-        self.default_job_options.remove_on_fail = r;
+        self.default_job_options.remove_on_fail = Some(r);
         self
     }
 }
 
 /// Per-job submission options.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Every field is optional: `None` means "not set here", so the queue's
+/// [`QueueOptions::default_job_options`] — and after that the built-in
+/// default — applies. An explicit value always wins, even one that equals
+/// the built-in default (`.priority(0)` overrides a queue default of `4`).
+/// [`Self::resolve_with`] performs that merge and yields the
+/// [`ResolvedJobOptions`] stored with the job.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct JobOptions {
     /// Optional explicit job id. When omitted, the backend assigns one.
+    /// Never inherited from queue defaults.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    /// Optional human-readable name for the job (used for routing handlers
-    /// when the worker is configured with named handlers).
+    /// Logical job name. Defaults to the queue name.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Delay before the job becomes eligible for execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub delay: Option<Duration>,
     /// Priority — lower number = higher priority. `0` means unprioritized
-    /// (FIFO via `wait`).
-    pub priority: u32,
+    /// (FIFO via `wait`). Built-in default: `0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u32>,
     /// Total number of attempts before the job is marked failed.
-    pub attempts: u32,
-    /// Backoff strategy applied between attempts.
+    /// Built-in default: `1`; values below 1 are raised to 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<u32>,
+    /// Backoff strategy applied between attempts. Built-in default: none
+    /// (retry immediately).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub backoff: Option<Backoff>,
-    /// If `Some`, the job is deduplicated against this id for the given TTL.
+    /// If set, the job is deduplicated against this id for the given TTL.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub deduplication: Option<Dedup>,
-    /// Remove the job from Redis after it completes.
-    pub remove_on_complete: Removal,
-    /// Remove the job from Redis after it fails permanently.
-    pub remove_on_fail: Removal,
-    /// Use LIFO ordering when pushed to `wait` (default: false = FIFO).
-    pub lifo: bool,
-}
-
-impl Default for JobOptions {
-    fn default() -> Self {
-        Self {
-            id: None,
-            name: None,
-            delay: None,
-            priority: 0,
-            attempts: 1,
-            backoff: None,
-            deduplication: None,
-            remove_on_complete: Removal::Keep,
-            remove_on_fail: Removal::Keep,
-            lifo: false,
-        }
-    }
+    /// Retention once the job completes. Built-in default: [`Removal::Keep`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remove_on_complete: Option<Removal>,
+    /// Retention once the job fails permanently. Built-in default:
+    /// [`Removal::Keep`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remove_on_fail: Option<Removal>,
+    /// Push to the front of `wait` instead of the back. Built-in default:
+    /// `false` (FIFO).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifo: Option<bool>,
 }
 
 impl JobOptions {
-    /// Equivalent to [`Self::default`]. Useful for chainable construction:
+    /// Equivalent to [`Self::default`]: nothing set. Useful for chainable
+    /// construction:
     ///
     /// ```
     /// use oxn::JobOptions;
     /// let opts = JobOptions::new().attempts(5);
+    /// assert_eq!(opts.attempts, Some(5));
+    /// assert_eq!(opts.priority, None); // left to the queue default
     /// ```
     #[must_use]
     pub fn new() -> Self {
@@ -134,17 +143,13 @@ impl JobOptions {
     }
 
     /// Assign an explicit id. If omitted, the backend auto-increments one.
-    ///
-    /// Explicit ids are useful for idempotent producers — adding the same
-    /// id twice without [`Self::deduplicate`] still overwrites the job
-    /// hash, so prefer deduplication when collisions are possible.
     #[must_use]
     pub fn id(mut self, id: impl Into<String>) -> Self {
         self.id = Some(id.into());
         self
     }
 
-    /// Job name used for named-handler routing.
+    /// Logical job name.
     #[must_use]
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
@@ -158,17 +163,17 @@ impl JobOptions {
         self
     }
 
-    /// Set priority (lower = higher priority).
+    /// Set priority (lower = higher priority; `0` = unprioritized).
     #[must_use]
     pub fn priority(mut self, priority: u32) -> Self {
-        self.priority = priority;
+        self.priority = Some(priority);
         self
     }
 
-    /// Number of attempts before giving up.
+    /// Number of attempts before giving up (floored at 1).
     #[must_use]
     pub fn attempts(mut self, attempts: u32) -> Self {
-        self.attempts = attempts.max(1);
+        self.attempts = Some(attempts.max(1));
         self
     }
 
@@ -186,32 +191,152 @@ impl JobOptions {
         self
     }
 
-    /// Clean up the job hash when it completes.
+    /// Retention once the job completes.
     #[must_use]
     pub fn remove_on_complete(mut self, r: Removal) -> Self {
-        self.remove_on_complete = r;
+        self.remove_on_complete = Some(r);
         self
     }
 
-    /// Clean up the job hash when it fails permanently.
+    /// Retention once the job fails permanently.
     #[must_use]
     pub fn remove_on_fail(mut self, r: Removal) -> Self {
-        self.remove_on_fail = r;
+        self.remove_on_fail = Some(r);
         self
     }
 
     /// Use LIFO ordering.
     #[must_use]
     pub fn lifo(mut self, yes: bool) -> Self {
-        self.lifo = yes;
+        self.lifo = Some(yes);
         self
+    }
+
+    /// Merge with `defaults` field by field: a value set here wins,
+    /// otherwise the default's value, otherwise the built-in default.
+    /// `id` is never taken from `defaults` (it would collapse every job
+    /// into one).
+    ///
+    /// ```
+    /// use oxn::JobOptions;
+    /// use oxn::options::Removal;
+    ///
+    /// let queue_defaults = JobOptions::new().attempts(5).remove_on_complete(Removal::Remove);
+    /// let r = JobOptions::new().attempts(2).resolve_with(&queue_defaults);
+    /// assert_eq!(r.attempts, 2);                         // explicit wins
+    /// assert_eq!(r.remove_on_complete, Removal::Remove); // inherited
+    /// assert_eq!(r.priority, 0);                         // built-in
+    /// ```
+    pub fn resolve_with(&self, defaults: &JobOptions) -> ResolvedJobOptions {
+        let builtin = ResolvedJobOptions::default();
+        ResolvedJobOptions {
+            id: self.id.clone(),
+            name: self.name.clone().or_else(|| defaults.name.clone()),
+            delay: self.delay.or(defaults.delay),
+            priority: self
+                .priority
+                .or(defaults.priority)
+                .unwrap_or(builtin.priority),
+            attempts: self
+                .attempts
+                .or(defaults.attempts)
+                .unwrap_or(builtin.attempts)
+                .max(1),
+            backoff: self.backoff.or(defaults.backoff),
+            deduplication: self
+                .deduplication
+                .clone()
+                .or_else(|| defaults.deduplication.clone()),
+            remove_on_complete: self
+                .remove_on_complete
+                .or(defaults.remove_on_complete)
+                .unwrap_or(builtin.remove_on_complete),
+            remove_on_fail: self
+                .remove_on_fail
+                .or(defaults.remove_on_fail)
+                .unwrap_or(builtin.remove_on_fail),
+            lifo: self.lifo.or(defaults.lifo).unwrap_or(builtin.lifo),
+        }
+    }
+
+    /// Resolve against built-in defaults only.
+    pub fn resolve(&self) -> ResolvedJobOptions {
+        self.resolve_with(&JobOptions::default())
+    }
+}
+
+/// The options a job actually runs with, after merging per-job options,
+/// queue defaults and built-in defaults (see [`JobOptions::resolve_with`]).
+///
+/// This is what is stored with the job and what [`Job::opts`](crate::Job)
+/// exposes. Its serialized shape matches 0.2's `JobOptions`, so job
+/// records written by 0.2 still deserialize.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResolvedJobOptions {
+    /// Explicit job id, if one was given.
+    pub id: Option<String>,
+    /// Logical job name, if one was given (the job's `name` falls back to
+    /// the queue name).
+    pub name: Option<String>,
+    /// Delay requested at submission.
+    pub delay: Option<Duration>,
+    /// Priority — lower = higher; `0` = unprioritized.
+    pub priority: u32,
+    /// Total attempts allowed (≥ 1).
+    pub attempts: u32,
+    /// Backoff between attempts.
+    pub backoff: Option<Backoff>,
+    /// Deduplication, if requested.
+    pub deduplication: Option<Dedup>,
+    /// Retention on completion.
+    pub remove_on_complete: Removal,
+    /// Retention on permanent failure.
+    pub remove_on_fail: Removal,
+    /// LIFO push.
+    pub lifo: bool,
+}
+
+impl Default for ResolvedJobOptions {
+    fn default() -> Self {
+        Self {
+            id: None,
+            name: None,
+            delay: None,
+            priority: 0,
+            attempts: 1,
+            backoff: None,
+            deduplication: None,
+            remove_on_complete: Removal::Keep,
+            remove_on_fail: Removal::Keep,
+            lifo: false,
+        }
+    }
+}
+
+impl From<ResolvedJobOptions> for JobOptions {
+    /// Every field set explicitly — re-submitting with these options
+    /// reproduces the job exactly, regardless of queue defaults.
+    fn from(r: ResolvedJobOptions) -> Self {
+        Self {
+            id: r.id,
+            name: r.name,
+            delay: r.delay,
+            priority: Some(r.priority),
+            attempts: Some(r.attempts),
+            backoff: r.backoff,
+            deduplication: r.deduplication,
+            remove_on_complete: Some(r.remove_on_complete),
+            remove_on_fail: Some(r.remove_on_fail),
+            lifo: Some(r.lifo),
+        }
     }
 }
 
 /// Deduplication configuration.
 ///
 /// Attached to a [`JobOptions`] via [`JobOptions::deduplicate`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dedup {
     /// Dedup key — multiple submissions with the same id collapse to one.
     pub id: String,
@@ -367,17 +492,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn job_options_defaults_are_safe() {
+    fn job_options_start_empty_and_resolve_to_safe_builtins() {
         let o = JobOptions::default();
-        assert!(o.id.is_none());
-        assert!(o.name.is_none());
-        assert!(o.delay.is_none());
-        assert_eq!(o.priority, 0);
-        assert_eq!(o.attempts, 1);
-        assert!(o.backoff.is_none());
-        assert!(matches!(o.remove_on_complete, Removal::Keep));
-        assert!(matches!(o.remove_on_fail, Removal::Keep));
-        assert!(!o.lifo);
+        assert_eq!(
+            o,
+            JobOptions {
+                id: None,
+                name: None,
+                delay: None,
+                priority: None,
+                attempts: None,
+                backoff: None,
+                deduplication: None,
+                remove_on_complete: None,
+                remove_on_fail: None,
+                lifo: None,
+            }
+        );
+        let r = o.resolve();
+        assert_eq!(r, ResolvedJobOptions::default());
+        assert_eq!(r.attempts, 1);
+        assert_eq!(r.priority, 0);
+        assert_eq!(r.remove_on_complete, Removal::Keep);
+        assert!(!r.lifo);
     }
 
     #[test]
@@ -398,18 +535,113 @@ mod tests {
         assert_eq!(o.id.as_deref(), Some("abc"));
         assert_eq!(o.name.as_deref(), Some("task"));
         assert_eq!(o.delay, Some(Duration::from_secs(5)));
-        assert_eq!(o.priority, 3);
-        assert_eq!(o.attempts, 7);
+        assert_eq!(o.priority, Some(3));
+        assert_eq!(o.attempts, Some(7));
         assert!(o.backoff.is_some());
         assert!(o.deduplication.is_some());
-        assert!(matches!(o.remove_on_complete, Removal::KeepLast(10)));
-        assert!(matches!(o.remove_on_fail, Removal::Remove));
-        assert!(o.lifo);
+        assert_eq!(o.remove_on_complete, Some(Removal::KeepLast(10)));
+        assert_eq!(o.remove_on_fail, Some(Removal::Remove));
+        assert_eq!(o.lifo, Some(true));
     }
 
     #[test]
     fn attempts_enforces_minimum_of_one() {
-        assert_eq!(JobOptions::new().attempts(0).attempts, 1);
+        assert_eq!(JobOptions::new().attempts(0).attempts, Some(1));
+        // Even a hand-built zero is floored when resolved.
+        let o = JobOptions {
+            attempts: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(o.resolve().attempts, 1);
+    }
+
+    #[test]
+    fn resolve_prefers_job_then_defaults_then_builtins() {
+        let defaults = JobOptions::new()
+            .id("never-inherited")
+            .name("default-name")
+            .delay(Duration::from_millis(100))
+            .priority(4)
+            .attempts(5)
+            .backoff(Backoff::ONE_SECOND)
+            .deduplicate("d", Duration::from_secs(1))
+            .remove_on_complete(Removal::Remove)
+            .remove_on_fail(Removal::KeepLast(3))
+            .lifo(true);
+        // Nothing set on the job: everything but `id` comes from defaults.
+        let r = JobOptions::new().resolve_with(&defaults);
+        assert_eq!(r.id, None);
+        assert_eq!(r.name.as_deref(), Some("default-name"));
+        assert_eq!(r.delay, Some(Duration::from_millis(100)));
+        assert_eq!(r.priority, 4);
+        assert_eq!(r.attempts, 5);
+        assert_eq!(r.backoff, Some(Backoff::ONE_SECOND));
+        assert_eq!(r.deduplication.as_ref().map(|d| d.id.as_str()), Some("d"));
+        assert_eq!(r.remove_on_complete, Removal::Remove);
+        assert_eq!(r.remove_on_fail, Removal::KeepLast(3));
+        assert!(r.lifo);
+
+        // Explicit values win, including ones equal to the built-ins.
+        let r = JobOptions::new()
+            .priority(0)
+            .attempts(1)
+            .lifo(false)
+            .remove_on_complete(Removal::Keep)
+            .resolve_with(&defaults);
+        assert_eq!(r.priority, 0);
+        assert_eq!(r.attempts, 1);
+        assert!(!r.lifo);
+        assert_eq!(r.remove_on_complete, Removal::Keep);
+        // Untouched fields still inherit.
+        assert_eq!(r.remove_on_fail, Removal::KeepLast(3));
+    }
+
+    #[test]
+    fn resolved_round_trips_through_job_options() {
+        let r = JobOptions::new().priority(2).lifo(true).resolve();
+        let back = JobOptions::from(r.clone()).resolve_with(&JobOptions::new().priority(9));
+        assert_eq!(back, r, "fully-specified options ignore queue defaults");
+    }
+
+    #[test]
+    fn resolved_reads_0_2_job_records() {
+        // `opts` JSON exactly as oxn 0.2.2 stored it in the job hash.
+        let v02 = r#"{"id":null,"name":null,"delay":null,"priority":0,"attempts":3,
+            "backoff":{"kind":"fixed","delay":{"secs":1,"nanos":0}},"deduplication":null,
+            "remove_on_complete":"Keep","remove_on_fail":{"KeepLast":5},"lifo":false}"#;
+        let r: ResolvedJobOptions = serde_json::from_str(v02).unwrap();
+        assert_eq!(r.attempts, 3);
+        assert_eq!(r.remove_on_fail, Removal::KeepLast(5));
+        assert_eq!(r.backoff, Some(Backoff::ONE_SECOND));
+        // And a sparse record (missing fields) falls back to built-ins.
+        let r: ResolvedJobOptions = serde_json::from_str(r#"{"attempts":2}"#).unwrap();
+        assert_eq!(r.attempts, 2);
+        assert_eq!(r.remove_on_complete, Removal::Keep);
+    }
+
+    #[test]
+    fn job_options_serialize_only_what_was_set() {
+        let j = serde_json::to_string(&JobOptions::new().attempts(2)).unwrap();
+        assert_eq!(j, r#"{"attempts":2}"#);
+        let back: JobOptions = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.attempts, Some(2));
+        assert_eq!(back.priority, None);
+    }
+
+    #[test]
+    fn queue_options_removal_shortcuts_set_defaults() {
+        let q = QueueOptions::default()
+            .remove_on_complete(Removal::Remove)
+            .remove_on_fail(Removal::KeepLast(7));
+        assert_eq!(
+            q.default_job_options.remove_on_complete,
+            Some(Removal::Remove)
+        );
+        assert_eq!(
+            q.default_job_options.remove_on_fail,
+            Some(Removal::KeepLast(7))
+        );
+        assert_eq!(q.default_job_options.attempts, None);
     }
 
     #[test]
@@ -475,7 +707,7 @@ mod tests {
         let j = serde_json::to_string(&o).unwrap();
         let back: JobOptions = serde_json::from_str(&j).unwrap();
         assert_eq!(back.name.as_deref(), Some("send-email"));
-        assert_eq!(back.attempts, 5);
+        assert_eq!(back.attempts, Some(5));
         assert_eq!(back.delay, Some(Duration::from_millis(250)));
         assert_eq!(back.deduplication.unwrap().id, "abc");
     }

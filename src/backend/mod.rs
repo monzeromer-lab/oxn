@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::events::Event;
 use crate::job::{JobId, JobState};
-use crate::options::JobOptions;
+use crate::options::ResolvedJobOptions;
 
 #[cfg(feature = "redis-backend")]
 #[cfg_attr(docsrs, doc(cfg(feature = "redis-backend")))]
@@ -40,8 +40,9 @@ pub struct RawJob {
     pub name: String,
     /// JSON-encoded payload.
     pub data: String,
-    /// Options originally used to submit the job.
-    pub opts: JobOptions,
+    /// The options the job runs with (per-job, queue defaults and
+    /// built-ins merged at submission).
+    pub opts: ResolvedJobOptions,
     /// Epoch-ms of the initial enqueue.
     pub timestamp_ms: i64,
     /// Epoch-ms of the most recent `move_to_active`, if any.
@@ -74,8 +75,8 @@ pub struct JobInsert {
     pub name: String,
     /// JSON-encoded payload.
     pub data: String,
-    /// Options (priority, delay, attempts, …).
-    pub opts: JobOptions,
+    /// Fully-resolved options (priority, delay, attempts, …).
+    pub opts: ResolvedJobOptions,
     /// Epoch-ms at submission.
     pub timestamp_ms: i64,
 }

@@ -105,7 +105,7 @@ impl FlowProducer {
         let insert = JobInsert {
             name: opts.name.clone().unwrap_or_else(|| name.clone()),
             data: data_json,
-            opts: opts.clone(),
+            opts: opts.resolve(),
             timestamp_ms: now_ms(),
         };
         let parent_id = self.backend.add(&queue, insert).await?;
