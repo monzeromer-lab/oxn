@@ -322,6 +322,12 @@ App::new().service(actix_scope(queue.backend()))
 `cargo run --example dashboard_axum --features dashboard-axum` →
 `http://localhost:8080/admin`.
 
+The UI derives its API base from the path it is served at, so it works
+wherever you nest it. Axum's `nest` does not route the trailing-slash form
+(`/admin/`); add `tower_http::normalize_path::NormalizePathLayer::trim_trailing_slash()`
+around your app if you want both to work. The dashboard has no
+authentication of its own — mount it behind your auth middleware.
+
 ## Custom backends
 
 `Backend` is object-safe and small (~25 async methods). Implement it for an

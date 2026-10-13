@@ -117,6 +117,11 @@ It contains breaking changes; see the migration notes below.
   hostile queue names, ids, names and failure reasons. A test fails on
   any new raw `${…}` interpolation. (Queue-name validation alone is not
   enough: `xss<img/src=x/onerror=…>` contains no whitespace or `:`.)
+- **The bundled UI works when nested (B17).** It computed its API base by
+  stripping the last path segment, so a dashboard mounted at `/admin` (as
+  the README shows) requested `/api/...` and could load nothing; it now
+  uses its own path as the base (`/admin`, `/admin/` → `/admin`; `/` →
+  ``). The API tests never loaded the page, which is why this survived.
 - The `dashboard_axum` example binds to `127.0.0.1` (it bound `0.0.0.0`,
   exposing an unauthenticated admin UI) and reads `REDIS_URL` / `PORT` /
   `BIND`.

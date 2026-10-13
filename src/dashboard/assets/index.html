@@ -128,11 +128,15 @@
     let openJobId = null;
 
     // Auto-detect base path: this file is served at the dashboard root.
-    (function detectBase() {
-      const p = window.location.pathname;
-      BASE = p.endsWith('/') ? p.slice(0, -1) : p.replace(/\/[^/]+$/, '');
-      document.getElementById('base').textContent = BASE || '/';
-    })();
+    // The page is only ever served at the dashboard's root route, so its
+    // own path *is* the mount point: /admin → "/admin", /admin/ → "/admin",
+    // / → "". (0.2 stripped the last segment as if this were
+    // /admin/index.html, so a dashboard nested at /admin requested /api/…)
+    function dashboardBase(pathname) {
+      return pathname.replace(/\/+$/, '');
+    }
+    BASE = dashboardBase(window.location.pathname);
+    document.getElementById('base').textContent = BASE || '/';
 
     async function api(path, opts) {
       const res = await fetch(BASE + path, opts);

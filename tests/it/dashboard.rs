@@ -479,3 +479,45 @@ fn dashboard_html_escapes_every_interpolation() {
         raw.join("\n")
     );
 }
+
+/// B17 — the UI derives its API base from its own URL. Runs the page's
+/// `dashboardBase` (extracted from the shipped HTML) under Node for every
+/// mount shape; skipped when `node` isn't installed.
+#[test]
+fn dashboard_ui_computes_its_api_base_from_the_mount_point() {
+    const HTML: &str = include_str!("../../src/dashboard/assets/index.html");
+    let start = HTML
+        .find("function dashboardBase(")
+        .expect("dashboardBase in index.html");
+    let end = start + HTML[start..].find("\n    }").expect("end of dashboardBase") + 6;
+    let func = &HTML[start..end];
+    let cases = [
+        ("/admin", "/admin"),
+        ("/admin/", "/admin"),
+        ("/ops/queues/oxn", "/ops/queues/oxn"),
+        ("/", ""),
+    ];
+    let script = format!(
+        "{func}\nconsole.log(JSON.stringify({}.map(p => dashboardBase(p))));",
+        serde_json::to_string(&cases.iter().map(|(p, _)| *p).collect::<Vec<_>>()).unwrap()
+    );
+    let out = match std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => {
+            eprintln!("skipping: node not installed");
+            return;
+        }
+    };
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let got: Vec<String> = serde_json::from_slice(&out.stdout).unwrap();
+    let want: Vec<&str> = cases.iter().map(|(_, b)| *b).collect();
+    assert_eq!(got, want);
+}
