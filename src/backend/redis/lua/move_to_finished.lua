@@ -73,35 +73,7 @@ redis.call('HDEL', hashKey, 'lockToken')
 -- event payload read before retention may delete the hash
 local attemptsMade = redis.call('HGET', hashKey, 'attemptsMade') or '0'
 
--- Delete the given members of the target zset together with all their
--- keys. Trims are capped at OXN_BATCH per call: a policy change over a
--- huge zset converges over the next few finishes instead of blocking.
-local function dropAll(ids)
-  if #ids == 0 then return end
-  redis.call('ZREM', targetKey, unpack(ids))
-  for i = 1, #ids do oxnRemoveJobKeys(hashPrefix, ids[i]) end
-end
-
--- retention policy
-if policy == 'remove' then
-  oxnRemoveJobKeys(hashPrefix, id)
-else
-  redis.call('ZADD', targetKey, nowMs, id)
-  if string.sub(policy, 1, 5) == 'last:' then
-    local n = tonumber(string.sub(policy, 6))
-    if n and n >= 0 then
-      local excess = redis.call('ZCARD', targetKey) - n
-      if excess > 0 then
-        dropAll(redis.call('ZRANGE', targetKey, 0, math.min(excess, OXN_BATCH) - 1))
-      end
-    end
-  elseif string.sub(policy, 1, 4) == 'for:' then
-    local ms = tonumber(string.sub(policy, 5))
-    if ms and ms > 0 then
-      dropAll(redis.call('ZRANGEBYSCORE', targetKey, 0, nowMs - ms, 'LIMIT', 0, OXN_BATCH))
-    end
-  end
-end
+oxnRetain(targetKey, hashPrefix, id, policy, nowMs)
 
 -- event
 if event == 'completed' then

@@ -213,6 +213,7 @@ pub struct WorkerSpec {
     pub lock_ms: u64,
     pub drain_delay_ms: Option<u64>,
     pub shutdown_timeout_ms: u64,
+    pub max_stalled: u32,
 }
 
 pub fn build_worker(
@@ -227,6 +228,7 @@ pub fn build_worker(
         lock_ms,
         drain_delay_ms,
         shutdown_timeout_ms,
+        max_stalled,
     } = spec;
     let mut b = Worker::builder(queue, move |job: Job<LoadJob>| {
         let sink = sink.clone();
@@ -274,6 +276,7 @@ pub fn build_worker(
     .lock_renew_interval(Duration::from_millis((lock_ms / 2).max(1)))
     .stalled_interval(Duration::from_millis((lock_ms / 2).clamp(250, 30_000)))
     .shutdown_timeout(Duration::from_millis(shutdown_timeout_ms))
+    .max_stalled(max_stalled)
     .id(format!("w{index}"))
     .cancellation_token(cancel);
     if let Some(d) = drain_delay_ms {
@@ -523,6 +526,7 @@ impl InProcPool {
                 lock_ms: self.cfg.lock_ms,
                 drain_delay_ms: self.cfg.drain_delay_ms,
                 shutdown_timeout_ms: self.cfg.shutdown_timeout_ms,
+                max_stalled: self.cfg.max_stalled,
             };
             let w = build_worker(
                 q,
@@ -607,7 +611,9 @@ impl ProcPool {
             .arg("--lock-ms")
             .arg(self.cfg.lock_ms.to_string())
             .arg("--max-stream-len")
-            .arg(self.cfg.max_stream_len.to_string());
+            .arg(self.cfg.max_stream_len.to_string())
+            .arg("--max-stalled")
+            .arg(self.cfg.max_stalled.to_string());
         if let Some(d) = self.cfg.drain_delay_ms {
             cmd.arg("--drain-delay-ms").arg(d.to_string());
         }
@@ -676,6 +682,7 @@ pub async fn child_worker_main(
     concurrency: usize,
     lock_ms: u64,
     drain_delay_ms: Option<u64>,
+    max_stalled: u32,
 ) -> anyhow::Result<()> {
     let backend = connect(&url, concurrency + 4).await?;
     let q = queue_on(backend, &queue, JobOptions::new());
@@ -686,6 +693,7 @@ pub async fn child_worker_main(
         lock_ms,
         drain_delay_ms,
         shutdown_timeout_ms: 10_000,
+        max_stalled,
     };
     let w = build_worker(q, spec, sink, CancellationToken::new());
     w.run().await?;
@@ -755,6 +763,11 @@ pub async fn observe_stream(
                     // `waiting` with prev=active is a release, not an add.
                     if event == "waiting" && get("prev").as_deref() == Some("active") {
                         event = "released".to_string();
+                    }
+                    // A job that ran out of stalls fails with a `stalled`
+                    // count instead of emitting a `stalled` event.
+                    if event == "failed" && get("stalled").is_some() {
+                        event = "stall-failed".to_string();
                     }
                     *counts.lock().entry(event.clone()).or_default() += 1;
                     if let Some(job) = get("jobId") {

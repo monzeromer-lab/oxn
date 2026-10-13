@@ -97,6 +97,20 @@ It contains breaking changes; see the migration notes below.
   immediately and its pool slot is detached instead of being returned with
   a block still pending; the stalled scanner is joined before `run()`
   returns.
+- **Stalled jobs follow a real lifecycle (B7).** A job that stalled more
+  than `max_stalled` times was removed from `active` but never added to
+  `failed`: it lived in no container, could not be listed or retried, and
+  its `remove_on_fail` policy never ran. Now it fails into `failed` with
+  `finishedOn`, reason "job stalled more than allowable limit", its own
+  retention applied, and a `failed` event carrying `attemptsMade` (plus a
+  `stalled` count). A requeued stalled job goes back to the head of its
+  ready container honoring priority and pause (it used to land in `wait`
+  regardless).
+- **A stall no longer uses up an attempt (B7, behaviour change).** Stalls
+  have their own budget (`max_stalled`); the interrupted attempt is
+  refunded, as BullMQ does. Before, whether a job got its full retry
+  budget depended on whether a stall happened before or after its real
+  failures.
 - **Re-adding an explicit job id is idempotent (B6).** It used to
   overwrite the existing job's hash in place (keeping stale fields such as
   the old return value) and push the id into `wait` again — a completed job

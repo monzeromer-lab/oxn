@@ -82,6 +82,8 @@ pub enum Mark {
     ServerActive,
     /// A shutting-down worker released the job back to the queue.
     Released,
+    /// The job exceeded max_stalled and was failed by the stalled scanner.
+    StallFailed,
 }
 
 /// Ledger row for one job.
@@ -103,6 +105,8 @@ pub struct Entry {
     pub stalls: u32,
     /// Releases by shutting-down workers.
     pub releases: u32,
+    /// Failed by the stalled scanner (max_stalled exceeded).
+    pub stall_failed: bool,
     /// Server `failed` events.
     pub server_failed: u32,
     /// Server `completed` events.
@@ -221,12 +225,18 @@ impl Ledger {
             "delayed" => Mark::ServerDelayed,
             "active" => Mark::ServerActive,
             "released" => Mark::Released,
+            "stall-failed" => Mark::StallFailed,
             _ => return,
         };
         self.with(seq, |e| {
             match mark {
                 Mark::Stalled => e.stalls += 1,
                 Mark::Released => e.releases += 1,
+                Mark::StallFailed => {
+                    e.stalls += 1;
+                    e.server_failed += 1;
+                    e.stall_failed = true;
+                }
                 Mark::ServerFailed => e.server_failed += 1,
                 Mark::ServerCompleted => e.server_completed += 1,
                 _ => {}
@@ -268,6 +278,19 @@ impl Ledger {
                         });
                     }
                 };
+                if e.stall_failed {
+                    // Ending failed after running out of stalls is the
+                    // documented outcome, whatever the plan said — even if a
+                    // handler had returned Ok: a worker killed between its
+                    // handler and complete() loses that outcome, the lock
+                    // lapses, and with no stalls left the job fails.
+                    v.stall_failures += 1;
+                    v.failed_jobs += 1;
+                    if e.oks > 0 {
+                        v.discarded_outcomes += 1;
+                    }
+                    continue;
+                }
                 if e.oks > 0 {
                     v.completed_jobs += 1;
                 } else if e.is_terminal(attempts) {
@@ -463,6 +486,12 @@ pub struct Verdict {
     pub explained_duplicates: u64,
     /// Attempts that started but never finished (killed / stalled).
     pub interrupted_attempts: u64,
+    /// Jobs failed for exceeding max_stalled.
+    pub stall_failures: u64,
+    /// Handler successes never recorded because the job's lock lapsed
+    /// first (worker killed / too slow); the job's fate went to the
+    /// stalled scanner instead.
+    pub discarded_outcomes: u64,
     /// Distinct jobs whose handler succeeded at least once.
     pub completed_jobs: u64,
     /// Distinct jobs that ended failed.
@@ -678,6 +707,40 @@ mod tests {
         let v = l.verify(3, 0);
         assert!(v.ok(), "{:?}", v.counts);
         assert_eq!(v.interrupted_attempts, 1);
+    }
+
+    #[test]
+    fn running_out_of_stalls_is_an_accepted_failure() {
+        let l = Ledger::new(24);
+        l.added(job(1, 0, false), "1".into(), 0);
+        l.start(1, 1, 0, 1); // killed
+        l.server_event("1", "stall-failed", 2);
+        let v = l.verify(3, 0);
+        assert!(v.ok(), "{:?}", v.counts);
+        assert_eq!(v.stall_failures, 1);
+        assert_eq!(v.failed_jobs, 1);
+    }
+
+    #[test]
+    fn ok_lost_to_a_killed_worker_then_stall_failed_is_accounted() {
+        let l = Ledger::new(24);
+        l.added(job(1, 0, false), "1".into(), 0);
+        l.start(1, 1, 0, 1);
+        l.finish(
+            1,
+            Mark::Ok {
+                worker: 0,
+                attempt: 1,
+            },
+            2,
+        ); // reported, then SIGKILL
+        l.server_event("1", "stall-failed", 3);
+        let v = l.verify(3, 0);
+        assert!(v.ok(), "{:?}", v.counts);
+        assert_eq!(
+            (v.completed_jobs, v.failed_jobs, v.discarded_outcomes),
+            (0, 1, 1)
+        );
     }
 
     #[test]

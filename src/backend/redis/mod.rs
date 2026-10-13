@@ -765,6 +765,11 @@ impl Backend for RedisBackend {
             .key(keys.events())
             .key(keys.job_hash_prefix())
             .key(keys.marker())
+            .key(keys.paused())
+            .key(keys.prioritized())
+            .key(keys.priority_counter())
+            .key(keys.meta())
+            .key(keys.failed())
             .arg(now_ms())
             .arg(max_stalled as i64)
             .arg(self.max_stream_length as i64);
@@ -1416,6 +1421,21 @@ fn parse_stream_entry(map: &std::collections::HashMap<String, redis::Value>) -> 
 mod tests {
     use super::*;
     use crate::error::ScriptError;
+
+    #[test]
+    fn removal_json_matches_what_the_lua_prelude_parses() {
+        // oxnPolicyFromOpts in common.lua reads these exact shapes out of
+        // the job's stored opts; a serde change here would silently turn
+        // every stall-failure policy into "keep".
+        let j = |r: Removal| serde_json::to_value(r).unwrap();
+        assert_eq!(j(Removal::Keep), serde_json::json!("Keep"));
+        assert_eq!(j(Removal::Remove), serde_json::json!("Remove"));
+        assert_eq!(j(Removal::KeepLast(5)), serde_json::json!({"KeepLast": 5}));
+        assert_eq!(
+            j(Removal::KeepFor(Duration::from_millis(1500))),
+            serde_json::json!({"KeepFor": {"secs": 1, "nanos": 500_000_000}})
+        );
+    }
 
     #[test]
     fn batch_size_matches_the_lua_prelude() {

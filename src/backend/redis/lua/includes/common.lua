@@ -88,3 +88,53 @@ local function oxnRemoveJobKeys(hashPrefix, id)
     hashKey .. ':dependencies', hashKey .. ':processed',
     hashKey .. ':unsuccessful', hashKey .. ':failed')
 end
+
+-- Apply a retention policy to a job that just finished into `targetKey`
+-- (completed or failed). `policy` is 'keep' | 'remove' | 'last:N' |
+-- 'for:MS'. Trims delete the dropped jobs' keys too and are capped at
+-- OXN_BATCH per call: a policy change over a huge zset converges over the
+-- next few finishes instead of blocking.
+local function oxnRetain(targetKey, hashPrefix, id, policy, nowMs)
+  if policy == 'remove' then
+    oxnRemoveJobKeys(hashPrefix, id)
+    return
+  end
+  redis.call('ZADD', targetKey, nowMs, id)
+  local drop
+  if string.sub(policy, 1, 5) == 'last:' then
+    local n = tonumber(string.sub(policy, 6))
+    if n and n >= 0 then
+      local excess = redis.call('ZCARD', targetKey) - n
+      if excess > 0 then
+        drop = redis.call('ZRANGE', targetKey, 0, math.min(excess, OXN_BATCH) - 1)
+      end
+    end
+  elseif string.sub(policy, 1, 4) == 'for:' then
+    local ms = tonumber(string.sub(policy, 5))
+    if ms and ms > 0 then
+      drop = redis.call('ZRANGEBYSCORE', targetKey, 0, nowMs - ms, 'LIMIT', 0, OXN_BATCH)
+    end
+  end
+  if drop and #drop > 0 then
+    redis.call('ZREM', targetKey, unpack(drop))
+    for i = 1, #drop do oxnRemoveJobKeys(hashPrefix, drop[i]) end
+  end
+end
+
+-- A `Removal` as serde stores it in the job's opts JSON ("Keep",
+-- "Remove", {"KeepLast": n}, {"KeepFor": {"secs": s, "nanos": n}}) →
+-- the policy string oxnRetain understands.
+local function oxnPolicyFromOpts(r)
+  if r == 'Remove' then return 'remove' end
+  if type(r) == 'table' then
+    if r['KeepLast'] ~= nil then
+      return 'last:' .. tostring(math.floor(tonumber(r['KeepLast']) or 0))
+    end
+    local d = r['KeepFor']
+    if type(d) == 'table' then
+      local ms = (tonumber(d['secs']) or 0) * 1000 + math.floor((tonumber(d['nanos']) or 0) / 1000000)
+      return 'for:' .. tostring(math.floor(ms))
+    end
+  end
+  return 'keep'
+end

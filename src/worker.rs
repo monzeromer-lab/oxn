@@ -630,7 +630,12 @@ where
         self
     }
 
-    /// How many times a job may stall before it's force-failed.
+    /// How many times a job may stall (its lock lapsed: the worker died,
+    /// hung past `lock_duration`, or lost Redis) and still be retried. A
+    /// stalled job goes back to the head of its queue without using up one
+    /// of its `attempts`; one more stall than this fails it into `failed`
+    /// (reason "job stalled more than allowable limit", with its
+    /// `remove_on_fail` policy applied). Default 1.
     #[must_use]
     pub fn max_stalled(mut self, n: u32) -> Self {
         self.opts.max_stalled = n;

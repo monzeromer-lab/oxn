@@ -1,69 +1,82 @@
 -- scan_stalled.lua
 --
--- Detect jobs in `active` whose lock has expired. Re-queue them if they
--- haven't exceeded max_stalled; otherwise fail them permanently.
+-- Detect jobs in `active` whose lock has expired (their worker died, hung
+-- past lock_duration, or lost its connection).
 --
--- KEYS[1] active
--- KEYS[2] wait
--- KEYS[3] stalled (set)
--- KEYS[4] stalled_check (rate-limit flag)
--- KEYS[5] events
--- KEYS[6] job-hash prefix
--- KEYS[7] marker (requeued jobs wake a blocked worker)
+-- * Up to max_stalled stalls: the job goes back to the head of its ready
+--   container (priority and pause respected) and the interrupted attempt
+--   is refunded — stalls have their own budget (max_stalled) and never
+--   eat into `attempts`.
+-- * Beyond max_stalled: the job fails for good into `failed`, with its own
+--   remove_on_fail retention applied, exactly like a handler failure.
+--
+-- KEYS[1]  active
+-- KEYS[2]  wait
+-- KEYS[3]  stalled (legacy set, deleted)
+-- KEYS[4]  stalled_check (rate-limit flag)
+-- KEYS[5]  events
+-- KEYS[6]  job-hash prefix
+-- KEYS[7]  marker
+-- KEYS[8]  paused
+-- KEYS[9]  prioritized
+-- KEYS[10] priority counter
+-- KEYS[11] meta
+-- KEYS[12] failed
 --
 -- ARGV[1] now (ms)
 -- ARGV[2] max stalled
 -- ARGV[3] max stream len
+--
+-- Returns the ids that were requeued.
 
-local activeKey   = KEYS[1]
-local waitKey     = KEYS[2]
-local stalledKey  = KEYS[3]
-local flagKey     = KEYS[4]
-local eventsKey   = KEYS[5]
-local hashPrefix  = KEYS[6]
-local markerKey   = KEYS[7]
+local activeKey  = KEYS[1]
+local eventsKey  = KEYS[5]
+local hashPrefix = KEYS[6]
+local failedKey  = KEYS[12]
 
-local nowMs     = tonumber(ARGV[1])
+local nowMs      = tonumber(ARGV[1])
 local maxStalled = tonumber(ARGV[2])
 local maxStream  = tonumber(ARGV[3])
 
--- run at most once per second globally; exit early otherwise
-local acquired = redis.call('SET', flagKey, nowMs, 'NX', 'PX', 1000)
-if not acquired then
+-- run at most once per second per queue; exit early otherwise
+if not redis.call('SET', KEYS[4], nowMs, 'NX', 'PX', 1000) then
   return {}
 end
 
--- The legacy `stalled` set was write-only; nothing ever read it. Drop it.
-redis.call('DEL', stalledKey)
+-- The legacy `stalled` set was write-only; nothing ever read it.
+redis.call('DEL', KEYS[3])
+
+local ready = {
+  wait = KEYS[2], paused = KEYS[8], prio = KEYS[9], pc = KEYS[10],
+  meta = KEYS[11], marker = KEYS[7],
+}
+local reason = 'job stalled more than allowable limit'
 
 local moved = {}
 local active = redis.call('LRANGE', activeKey, 0, -1)
 for i = 1, #active do
   local id = active[i]
   local hashKey = hashPrefix .. id
-  local lockKey = hashKey .. ':lock'
-  local has = redis.call('EXISTS', lockKey)
-  if has == 0 then
-    -- track how many times this job stalled
-    local stalled = tonumber(redis.call('HINCRBY', hashKey, 'stalledCounter', 1))
+  if redis.call('EXISTS', hashKey .. ':lock') == 0 then
     redis.call('LREM', activeKey, 1, id)
+    redis.call('HDEL', hashKey, 'lockToken', 'processedOn')
+    local stalled = tonumber(redis.call('HINCRBY', hashKey, 'stalledCounter', 1))
     if stalled > maxStalled then
-      redis.call('HSET', hashKey,
-        'failedReason', 'job stalled more than allowable limit',
-        'finishedOn', nowMs)
-      redis.call('XADD', eventsKey, 'MAXLEN', '~', maxStream, '*',
-        'event', 'failed', 'jobId', id, 'failedReason', 'stalled')
+      redis.call('HSET', hashKey, 'failedReason', reason, 'finishedOn', nowMs)
+      local attemptsMade = redis.call('HGET', hashKey, 'attemptsMade') or '0'
+      local policy = oxnPolicyFromOpts(oxnJobOpts(hashKey)['remove_on_fail'])
+      oxnRetain(failedKey, hashPrefix, id, policy, nowMs)
+      oxnEmit(eventsKey, maxStream, 'event', 'failed', 'jobId', id,
+        'failedReason', reason, 'attemptsMade', attemptsMade, 'stalled', tostring(stalled))
     else
-      -- the lock is gone; so is ownership
-      redis.call('HDEL', hashKey, 'lockToken', 'processedOn')
-      redis.call('LPUSH', waitKey, id)
-      redis.call('XADD', eventsKey, 'MAXLEN', '~', maxStream, '*',
-        'event', 'stalled', 'jobId', id)
+      if tonumber(redis.call('HGET', hashKey, 'attemptsMade') or '0') > 0 then
+        redis.call('HINCRBY', hashKey, 'attemptsMade', -1)
+      end
+      local landed = oxnPushReady(ready, id, hashKey, true)
+      oxnEmit(eventsKey, maxStream, 'event', 'stalled', 'jobId', id,
+        'stalledCounter', tostring(stalled), 'requeued', landed)
       table.insert(moved, id)
     end
   end
-end
-if #moved > 0 then
-  oxnWake(markerKey)
 end
 return moved

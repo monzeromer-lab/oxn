@@ -375,7 +375,12 @@ pub struct WorkerOptions {
     pub lock_renew_interval: Duration,
     /// How often to scan for stalled jobs.
     pub stalled_interval: Duration,
-    /// Max number of times a job can be marked stalled before being failed.
+    /// How many times a job may stall (its lock lapsed: the worker died,
+    /// hung past `lock_duration`, or lost Redis) and still be retried. A
+    /// stalled job goes back to the head of its queue without using up one
+    /// of its `attempts`; one more stall than this fails it into `failed`
+    /// (reason "job stalled more than allowable limit", with its
+    /// `remove_on_fail` policy applied). Default 1.
     pub max_stalled: u32,
     /// Longest an idle worker blocks waiting for work before re-checking.
     ///

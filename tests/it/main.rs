@@ -36,3 +36,4 @@ mod script_errors;
 mod script_preload;
 mod shutdown;
 mod stalled;
+mod stalled_lifecycle;

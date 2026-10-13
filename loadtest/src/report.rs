@@ -77,11 +77,13 @@ pub fn render(o: &Outcome) -> String {
     let _ = writeln!(s, "\n## Ledger verification\n");
     let _ = writeln!(
         s,
-        "{} jobs checked · {} completed · {} failed · {} interrupted attempt(s) (killed/stalled, re-run) · {} duplicate success(es) explained by stalls · {} success(es) without a server terminal event\n",
+        "{} jobs checked · {} completed · {} failed ({} by the stall limit) · {} interrupted attempt(s) (killed/stalled, re-run) · {} handler success(es) discarded by a lapsed lock · {} duplicate success(es) explained by stalls · {} success(es) without a server terminal event\n",
         v.total,
         v.completed_jobs,
         v.failed_jobs,
+        v.stall_failures,
         v.interrupted_attempts,
+        v.discarded_outcomes,
         v.explained_duplicates,
         v.missing_server_events
     );
