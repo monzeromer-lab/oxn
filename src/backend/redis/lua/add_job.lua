@@ -85,8 +85,9 @@ local queueState
 if delayMs > 0 then
   local score = timestamp + delayMs
   redis.call('ZADD', delayedKey, score, id)
-  -- wake any worker blocked on marker
-  redis.call('ZADD', markerKey, score, '0')
+  -- Wake a blocked worker so it re-computes how long to block: it may be
+  -- sleeping for a full drain_delay that ends after this job is due.
+  oxnWake(markerKey)
   queueState = 'delayed'
   redis.call('XADD', eventsKey, 'MAXLEN', '~', maxStream, '*',
     'event', 'delayed', 'jobId', id, 'delay', score)
@@ -95,6 +96,7 @@ elseif priority > 0 then
   -- pack: higher priority bits (inverted) then counter for FIFO within tier
   local score = priority * 0x100000000 + counter
   redis.call('ZADD', prioKey, score, id)
+  oxnWake(markerKey)
   queueState = 'prioritized'
 else
   -- choose wait or paused list based on meta.paused
@@ -107,6 +109,9 @@ else
     redis.call('RPUSH', target, id)
   else
     redis.call('LPUSH', target, id)
+  end
+  if target == waitKey then
+    oxnWake(markerKey)
   end
   queueState = 'waiting'
   redis.call('XADD', eventsKey, 'MAXLEN', '~', maxStream, '*',

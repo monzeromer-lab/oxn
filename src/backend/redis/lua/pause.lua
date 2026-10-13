@@ -4,6 +4,7 @@
 -- KEYS[2] paused
 -- KEYS[3] meta
 -- KEYS[4] events
+-- KEYS[5] marker (resume wakes a blocked worker)
 -- ARGV[1] action (pause|resume)
 -- ARGV[2] max stream len
 
@@ -11,6 +12,7 @@ local waitKey   = KEYS[1]
 local pausedKey = KEYS[2]
 local metaKey   = KEYS[3]
 local eventsKey = KEYS[4]
+local markerKey = KEYS[5]
 
 local action    = ARGV[1]
 local maxStream = tonumber(ARGV[2])
@@ -34,6 +36,9 @@ elseif action == 'resume' then
     end
   end
   redis.call('HSET', metaKey, 'paused', '0')
+  if redis.call('LLEN', waitKey) > 0 then
+    oxnWake(markerKey)
+  end
   redis.call('XADD', eventsKey, 'MAXLEN', '~', maxStream, '*', 'event', 'resumed')
 else
   return redis.error_reply('unknown action ' .. tostring(action))

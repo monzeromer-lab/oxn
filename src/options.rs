@@ -377,7 +377,12 @@ pub struct WorkerOptions {
     pub stalled_interval: Duration,
     /// Max number of times a job can be marked stalled before being failed.
     pub max_stalled: u32,
-    /// How long to BLOCK a blocking pop before falling back to non-blocking.
+    /// Longest an idle worker blocks waiting for work before re-checking.
+    ///
+    /// This is a safety net, not a polling interval: new, promoted,
+    /// retried and resumed jobs wake blocked workers immediately, and a
+    /// worker never blocks past the due time of the next delayed job.
+    /// Default 5s; `0` is treated as 1ms.
     pub drain_delay: Duration,
     /// Run the stalled-job scanner in this worker. Set to `false` if you run
     /// a dedicated housekeeper.
@@ -446,7 +451,7 @@ impl WorkerOptions {
         self
     }
 
-    /// Set the blocking fetch drain delay.
+    /// Set [`Self::drain_delay`](WorkerOptions#structfield.drain_delay).
     #[must_use]
     pub fn drain_delay(mut self, d: Duration) -> Self {
         self.drain_delay = d;

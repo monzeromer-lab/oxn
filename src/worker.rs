@@ -581,9 +581,12 @@ where
         self
     }
 
-    /// Maximum time a blocking fetch waits before it loops back to try
-    /// another non-blocking attempt. Lower values poll more often; higher
-    /// values reduce Redis chatter.
+    /// Longest an idle worker blocks waiting for work before re-checking.
+    ///
+    /// This is a safety net, not a polling interval: new, promoted,
+    /// retried and resumed jobs wake blocked workers immediately, and a
+    /// worker never blocks past the due time of the next delayed job.
+    /// Default 5s; `0` is treated as 1ms.
     #[must_use]
     pub fn drain_delay(mut self, d: Duration) -> Self {
         self.opts.drain_delay = d;

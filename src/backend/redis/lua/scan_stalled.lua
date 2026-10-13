@@ -9,6 +9,7 @@
 -- KEYS[4] stalled_check (rate-limit flag)
 -- KEYS[5] events
 -- KEYS[6] job-hash prefix
+-- KEYS[7] marker (requeued jobs wake a blocked worker)
 --
 -- ARGV[1] now (ms)
 -- ARGV[2] max stalled
@@ -20,6 +21,7 @@ local stalledKey  = KEYS[3]
 local flagKey     = KEYS[4]
 local eventsKey   = KEYS[5]
 local hashPrefix  = KEYS[6]
+local markerKey   = KEYS[7]
 
 local nowMs     = tonumber(ARGV[1])
 local maxStalled = tonumber(ARGV[2])
@@ -56,5 +58,8 @@ for i = 1, #active do
       table.insert(moved, id)
     end
   end
+end
+if #moved > 0 then
+  oxnWake(markerKey)
 end
 return moved

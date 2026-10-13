@@ -52,6 +52,23 @@ It contains breaking changes; see the migration notes below.
 
 ### Fixed
 
+- **Workers pick up new work immediately (B3).** A worker that found the
+  queue empty blocked on `BZPOPMIN` for the whole `drain_delay` (5s by
+  default) and nothing woke it: plain and prioritized adds never touched
+  the marker, `resume`/stall requeue didn't either, a burst woke at most
+  one of several blocked workers, and a delayed job woke workers only for
+  them to sleep another full `drain_delay`. Under steady traffic this
+  capped throughput at one burst per `drain_delay` (baseline: pickup p50
+  4,047ms / p99 5,001ms). Now:
+  - every path that makes a job ready (add, prioritized add, promote,
+    promote-all, retry, resume, stall requeue, retry backoff) wakes a
+    worker, and `move_to_active` re-arms the marker while work remains,
+    so a burst cascades through every blocked worker;
+  - when nothing is ready, `move_to_active` returns how long until the
+    next delayed job is due and the worker blocks only that long;
+  - `drain_delay(0)` is clamped to 1ms instead of sending `BZPOPMIN 0`
+    (block forever).
+  After: pickup p50 1.7ms / p99 2.0ms on the same scenario.
 - The worker no longer logs "transition applied" when the backend
   rejected the transition. A lost lock is logged as a warning ("lock
   lost, outcome discarded"); any other rejection as an error.
@@ -60,8 +77,8 @@ It contains breaking changes; see the migration notes below.
 
 - `oxn-testkit` and `oxn-load` workspace crates (unpublished), CI
   workflow, `scripts/test-redis.sh`. See `docs/load-results/`.
-- Tracing spans on every Lua call (`oxn.script`), fetch, process and
-  shutdown. `backend::redis::script_hashes()` maps script SHAs to names.
+- Tracing spans on every Lua call (`oxn.script`), fetch, blocking wait
+  (`oxn.block`, with `next_due_ms`), process and shutdown. `backend::redis::script_hashes()` maps script SHAs to names.
 
 ## [0.2.2] — Unreleased (folded into 0.3.0)
 

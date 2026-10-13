@@ -42,6 +42,6 @@ end
 -- Wipe the delayed zset (we just emptied it) and bump the marker so any
 -- worker blocking on BZPOPMIN wakes up and tries to fetch.
 redis.call('DEL', delayedKey)
-redis.call('ZADD', markerKey, 0, '0')
+oxnWake(markerKey)
 
 return #ids

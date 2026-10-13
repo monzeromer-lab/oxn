@@ -25,7 +25,7 @@ redis.call('ZREM', failedKey, id)
 redis.call('HDEL', hashKey, 'failedReason', 'finishedOn', 'stacktrace')
 redis.call('HSET', hashKey, 'attemptsMade', '0')
 redis.call('LPUSH', waitKey, id)
-redis.call('ZADD', markerKey, 0, '0')
+oxnWake(markerKey)
 
 redis.call('XADD', eventsKey, 'MAXLEN', '~', maxStream, '*',
   'event', 'waiting', 'jobId', id)

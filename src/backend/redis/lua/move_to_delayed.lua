@@ -40,7 +40,9 @@ if reason and reason ~= '' then
   redis.call('HSET', hashKey, 'failedReason', reason)
 end
 redis.call('ZADD', delayedKey, retryAt, id)
-redis.call('ZADD', markerKey, retryAt, '0')
+-- Wake a blocked worker so it re-computes its block time against this
+-- job's due time.
+oxnWake(markerKey)
 
 redis.call('XADD', eventsKey, 'MAXLEN', '~', maxStream, '*',
   'event', 'delayed', 'jobId', id, 'delay', retryAt)

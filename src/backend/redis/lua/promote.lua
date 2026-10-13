@@ -23,7 +23,7 @@ local score = redis.call('ZSCORE', delayedKey, id)
 if not score then return -3 end
 redis.call('ZREM', delayedKey, id)
 redis.call('LPUSH', waitKey, id)
-redis.call('ZADD', markerKey, 0, '0')
+oxnWake(markerKey)
 
 redis.call('XADD', eventsKey, 'MAXLEN', '~', maxStream, '*',
   'event', 'waiting', 'jobId', id)

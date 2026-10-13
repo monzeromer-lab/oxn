@@ -2,6 +2,11 @@
 --
 -- Atomically pop the next ready job and acquire a lock.
 --
+-- Returns { id, hashFields } for a job, { nextDueMs } when nothing is ready
+-- but a delayed job will be due in nextDueMs (≥ 1), or {} when there is
+-- nothing to wait for (empty or paused). The worker blocks on the marker
+-- for at most nextDueMs, so delayed jobs run on time.
+--
 -- KEYS[1] wait
 -- KEYS[2] paused
 -- KEYS[3] active
@@ -32,7 +37,7 @@ local lockMs   = tonumber(ARGV[2])
 local nowMs    = tonumber(ARGV[3])
 local maxStream = tonumber(ARGV[4])
 
--- short-circuit if paused
+-- short-circuit if paused (resume wakes workers)
 if redis.call('HGET', metaKey, 'paused') == '1' then
   return {}
 end
@@ -45,9 +50,6 @@ if #due > 0 then
     redis.call('LPUSH', waitKey, due[i])
   end
 end
-
--- trim marker zset so it doesn't grow forever
-redis.call('ZREMRANGEBYSCORE', markerKey, 0, nowMs)
 
 -- Pick a job: prioritized first, then wait (FIFO via RPOPLPUSH).
 local id
@@ -63,8 +65,18 @@ else
 end
 
 if id == nil then
+  redis.call('DEL', markerKey)
+  local nextDue = redis.call('ZRANGE', delayedKey, 0, 0, 'WITHSCORES')
+  if #nextDue == 2 then
+    local wait = math.floor(tonumber(nextDue[2]) - nowMs)
+    if wait < 1 then wait = 1 end
+    return { wait }
+  end
   return {}
 end
+
+-- More ready work left? Wake the next blocked worker (cascade).
+oxnRearm(markerKey, waitKey, prioKey)
 
 if fromPrio then
   -- prioritized path: we popped from zset, now push to active

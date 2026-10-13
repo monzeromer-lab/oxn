@@ -40,27 +40,11 @@ async fn connect_preloads_every_script_so_first_add_is_warm() {
     let cfg = RedisConfig::new(common::redis_url()).prefix(common::TEST_PREFIX);
     let _backend = RedisBackend::connect(cfg).await.unwrap();
 
-    // Every script we ship — discovered via the same Lua bodies the
-    // backend loads from — must now exist in Redis's script cache.
-    //
-    // We re-derive the SHAs from the same Lua sources so the test
-    // never drifts from the production list.
-    let bodies: &[&str] = &[
-        include_str!("../src/backend/redis/lua/add_job.lua"),
-        include_str!("../src/backend/redis/lua/move_to_active.lua"),
-        include_str!("../src/backend/redis/lua/move_to_finished.lua"),
-        include_str!("../src/backend/redis/lua/move_to_delayed.lua"),
-        include_str!("../src/backend/redis/lua/extend_lock.lua"),
-        include_str!("../src/backend/redis/lua/scan_stalled.lua"),
-        include_str!("../src/backend/redis/lua/pause.lua"),
-        include_str!("../src/backend/redis/lua/promote.lua"),
-        include_str!("../src/backend/redis/lua/retry.lua"),
-        include_str!("../src/backend/redis/lua/remove.lua"),
-    ];
-    let shas: Vec<String> = bodies
-        .iter()
-        .map(|b| redis::Script::new(b).get_hash().to_string())
-        .collect();
+    // Every script we ship must now exist in Redis's script cache.
+    // `script_hashes()` hashes the exact bodies the backend loads (shared
+    // prelude included), so the test can't drift from the production list.
+    let scripts = oxn::backend::redis::script_hashes();
+    let shas: Vec<String> = scripts.iter().map(|(_, sha)| sha.clone()).collect();
     let exists: Vec<bool> = redis::cmd("SCRIPT")
         .arg("EXISTS")
         .arg(&shas)
@@ -69,12 +53,18 @@ async fn connect_preloads_every_script_so_first_add_is_warm() {
         .unwrap();
     assert_eq!(
         exists.len(),
-        bodies.len(),
+        scripts.len(),
         "SCRIPT EXISTS returned the wrong arity"
     );
     assert!(
         exists.iter().all(|b| *b),
-        "not every script was preloaded; cache state: {exists:?}"
+        "not every script was preloaded: {:?}",
+        scripts
+            .iter()
+            .zip(&exists)
+            .filter(|(_, e)| !**e)
+            .map(|((n, _), _)| n)
+            .collect::<Vec<_>>()
     );
 }
 

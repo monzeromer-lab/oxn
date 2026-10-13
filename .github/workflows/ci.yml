@@ -83,6 +83,8 @@ jobs:
       - run: cargo build -p oxn-load --release
       - name: smoke
         run: target/release/oxn-load run --redis redis://127.0.0.1:6379 --scenario smoke
+      - name: latency (pickup p99 < 50ms at the default drain_delay)
+        run: target/release/oxn-load run --redis redis://127.0.0.1:6379 --scenario latency --duration 20s
       - name: Upload load reports
         if: always()
         uses: actions/upload-artifact@v4

@@ -410,7 +410,7 @@ impl RedisBackend {
         queue: &str,
         worker_token: &str,
         lock_duration: Duration,
-    ) -> Result<Option<Fetched>> {
+    ) -> Result<Moved> {
         let keys = self.keys(queue);
         let mut inv = self.scripts.move_to_active.prepare_invoke();
         inv.key(keys.wait())
@@ -432,6 +432,31 @@ impl RedisBackend {
             .await?;
         parse_fetched(reply, worker_token)
     }
+}
+
+/// Outcome of one `move_to_active` call.
+#[derive(Debug)]
+enum Moved {
+    /// A job was moved to `active` and locked.
+    Job(Box<Fetched>),
+    /// Nothing ready. `next_due` is how long until the earliest delayed
+    /// job becomes eligible, if there is one.
+    Empty { next_due: Option<Duration> },
+}
+
+/// Smallest block time handed to `BZPOPMIN`. A timeout of `0` means
+/// "block forever" in Redis, so a configured `drain_delay` of zero (or a
+/// delayed job due right now) must never reach the server as 0.
+const MIN_BLOCK: Duration = Duration::from_millis(1);
+
+/// How long a worker that found nothing to do should block: until the
+/// next delayed job is due, but never longer than `drain_delay`.
+fn block_time(drain_delay: Duration, next_due: Option<Duration>) -> Duration {
+    let t = match next_due {
+        Some(due) => drain_delay.min(due),
+        None => drain_delay,
+    };
+    t.max(MIN_BLOCK)
 }
 
 /// Translate a script's negative return code into an [`Error`].
@@ -525,12 +550,14 @@ impl Backend for RedisBackend {
         block_for: Duration,
     ) -> Result<Option<Fetched>> {
         // First: try non-blocking move-to-active via Lua.
-        if let Some(fetched) = self
+        let next_due = match self
             .move_to_active(queue, worker_token, lock_duration)
             .await?
         {
-            return Ok(Some(fetched));
-        }
+            Moved::Job(f) => return Ok(Some(*f)),
+            Moved::Empty { next_due } => next_due,
+        };
+        let block_for = block_time(block_for, next_due);
 
         // BZPOPMIN(marker) for up to `block_for`. Crucially, this is done
         // on a **dedicated pool slot** rather than a shared multiplexed
@@ -544,12 +571,13 @@ impl Backend for RedisBackend {
             "oxn.block",
             queue,
             block_ms = block_for.as_millis() as u64,
+            next_due_ms = next_due.map(|d| d.as_millis() as u64),
             woke = tracing::field::Empty,
             elapsed_us = tracing::field::Empty,
         );
         let start = std::time::Instant::now();
         let mut blocking = self.conn().await?;
-        let secs = block_for.as_secs_f64().max(0.0);
+        let secs = block_for.as_secs_f64();
         let popped: Option<(String, String, f64)> = redis::cmd("BZPOPMIN")
             .arg(keys.marker())
             .arg(secs)
@@ -563,8 +591,13 @@ impl Backend for RedisBackend {
         span.record("elapsed_us", start.elapsed().as_micros() as u64);
         drop(span);
 
-        self.move_to_active(queue, worker_token, lock_duration)
-            .await
+        match self
+            .move_to_active(queue, worker_token, lock_duration)
+            .await?
+        {
+            Moved::Job(f) => Ok(Some(*f)),
+            Moved::Empty { .. } => Ok(None),
+        }
     }
 
     async fn complete(
@@ -686,6 +719,7 @@ impl Backend for RedisBackend {
             .key(keys.stalled_check())
             .key(keys.events())
             .key(keys.job_hash_prefix())
+            .key(keys.marker())
             .arg(now_ms())
             .arg(max_stalled as i64)
             .arg(self.max_stream_length as i64);
@@ -1018,6 +1052,7 @@ impl RedisBackend {
             .key(keys.paused())
             .key(keys.meta())
             .key(keys.events())
+            .key(keys.marker())
             .arg(action)
             .arg(self.max_stream_length as i64);
         let mut conn = self.conn().await?;
@@ -1137,11 +1172,18 @@ fn hash_to_raw(
     })
 }
 
-fn parse_fetched(reply: redis::Value, token: &str) -> Result<Option<Fetched>> {
+fn parse_fetched(reply: redis::Value, token: &str) -> Result<Moved> {
     use redis::Value;
     let arr = match reply {
-        Value::Nil => return Ok(None),
-        Value::Array(a) if a.is_empty() => return Ok(None),
+        Value::Nil => return Ok(Moved::Empty { next_due: None }),
+        Value::Array(a) if a.is_empty() => return Ok(Moved::Empty { next_due: None }),
+        // [ nextDueMs ] — nothing ready, a delayed job is due in that long.
+        Value::Array(a) if a.len() == 1 => {
+            let ms: u64 = redis::from_redis_value(&a[0])?;
+            return Ok(Moved::Empty {
+                next_due: Some(Duration::from_millis(ms)),
+            });
+        }
         Value::Array(a) => a,
         other => {
             return Err(Error::Config(format!(
@@ -1160,10 +1202,10 @@ fn parse_fetched(reply: redis::Value, token: &str) -> Result<Option<Fetched>> {
         map.insert(k, v);
     }
     let raw = hash_to_raw(JobId::new(id), map, Some(JobState::Active))?;
-    Ok(Some(Fetched {
+    Ok(Moved::Job(Box::new(Fetched {
         job: raw,
         token: token.to_string(),
-    }))
+    })))
 }
 
 impl RedisBackend {
@@ -1277,6 +1319,48 @@ fn parse_stream_entry(map: &std::collections::HashMap<String, redis::Value>) -> 
 mod tests {
     use super::*;
     use crate::error::ScriptError;
+
+    #[test]
+    fn block_time_waits_for_the_next_due_job_but_never_forever() {
+        let s = Duration::from_secs;
+        let ms = Duration::from_millis;
+        assert_eq!(block_time(s(5), None), s(5));
+        assert_eq!(block_time(s(5), Some(ms(400))), ms(400));
+        assert_eq!(block_time(ms(50), Some(s(10))), ms(50));
+        // BZPOPMIN 0 = block forever: never send it.
+        assert_eq!(block_time(Duration::ZERO, None), MIN_BLOCK);
+        assert_eq!(block_time(s(5), Some(Duration::ZERO)), MIN_BLOCK);
+    }
+
+    #[test]
+    fn parse_fetched_shapes() {
+        use redis::Value;
+        assert!(matches!(
+            parse_fetched(Value::Array(vec![]), "t").unwrap(),
+            Moved::Empty { next_due: None }
+        ));
+        assert!(matches!(
+            parse_fetched(Value::Array(vec![Value::Int(250)]), "t").unwrap(),
+            Moved::Empty { next_due: Some(d) } if d == Duration::from_millis(250)
+        ));
+        let job = Value::Array(vec![
+            Value::BulkString(b"7".to_vec()),
+            Value::Array(vec![
+                Value::BulkString(b"name".to_vec()),
+                Value::BulkString(b"n".to_vec()),
+                Value::BulkString(b"attemptsMade".to_vec()),
+                Value::BulkString(b"2".to_vec()),
+            ]),
+        ]);
+        match parse_fetched(job, "tok").unwrap() {
+            Moved::Job(f) => {
+                assert_eq!(f.job.id.as_str(), "7");
+                assert_eq!(f.job.attempts_made, 2);
+                assert_eq!(f.token, "tok");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn missing_job_maps_to_not_found_with_context() {

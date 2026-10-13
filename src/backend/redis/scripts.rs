@@ -21,24 +21,39 @@ use redis::Script;
 
 use crate::error::Result;
 
+/// Every script body is `includes/common.lua` (shared helpers such as
+/// `oxnWake`) followed by the script itself, assembled at compile time.
+macro_rules! script {
+    ($name:literal) => {
+        (
+            $name,
+            concat!(
+                include_str!("lua/includes/common.lua"),
+                "\n",
+                include_str!(concat!("lua/", $name, ".lua"))
+            ),
+        )
+    };
+}
+
 /// Source-of-truth table of every Lua script we ship, as `(name, body)`.
 ///
 /// Indexes line up with the field declarations in [`Scripts`]. Anything
 /// added here must be added to `Scripts::new` in the same position. The
 /// name is what tracing spans and test tooling report instead of the SHA.
 pub(super) const ALL_SCRIPTS: &[(&str, &str)] = &[
-    ("add_job", include_str!("lua/add_job.lua")),
-    ("move_to_active", include_str!("lua/move_to_active.lua")),
-    ("move_to_finished", include_str!("lua/move_to_finished.lua")),
-    ("move_to_delayed", include_str!("lua/move_to_delayed.lua")),
-    ("extend_lock", include_str!("lua/extend_lock.lua")),
-    ("scan_stalled", include_str!("lua/scan_stalled.lua")),
-    ("pause", include_str!("lua/pause.lua")),
-    ("promote", include_str!("lua/promote.lua")),
-    ("retry", include_str!("lua/retry.lua")),
-    ("remove", include_str!("lua/remove.lua")),
-    ("clean", include_str!("lua/clean.lua")),
-    ("promote_all", include_str!("lua/promote_all.lua")),
+    script!("add_job"),
+    script!("move_to_active"),
+    script!("move_to_finished"),
+    script!("move_to_delayed"),
+    script!("extend_lock"),
+    script!("scan_stalled"),
+    script!("pause"),
+    script!("promote"),
+    script!("retry"),
+    script!("remove"),
+    script!("clean"),
+    script!("promote_all"),
 ];
 
 pub(super) struct Scripts {
@@ -109,6 +124,20 @@ pub fn script_hashes() -> Vec<(&'static str, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_script_carries_the_common_prelude() {
+        for (name, body) in ALL_SCRIPTS {
+            assert!(
+                body.starts_with("-- common.lua"),
+                "{name} lacks the prelude"
+            );
+            assert!(
+                body.contains(&format!("-- {name}.lua")) || body.contains(&format!("-- {name}")),
+                "{name} body missing"
+            );
+        }
+    }
 
     #[test]
     fn script_names_are_unique_and_hashes_stable() {
