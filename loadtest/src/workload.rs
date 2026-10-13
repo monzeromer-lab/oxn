@@ -45,6 +45,7 @@ pub enum WEvent {
     Done {
         seq: u64,
         kind: DoneKind,
+        attempt: u32,
         worker: u32,
         at_us: u64,
         run_us: u64,
@@ -75,6 +76,7 @@ impl WEvent {
             WEvent::Done {
                 seq,
                 kind,
+                attempt,
                 worker,
                 at_us,
                 run_us,
@@ -85,7 +87,7 @@ impl WEvent {
                     DoneKind::Err => 'e',
                     DoneKind::Fatal => 'f',
                 };
-                format!("D {seq} {k} {worker} {at_us} {run_us} {due_us}")
+                format!("D {seq} {k} {attempt} {worker} {at_us} {run_us} {due_us}")
             }
         }
     }
@@ -113,6 +115,7 @@ impl WEvent {
                 Some(WEvent::Done {
                     seq,
                     kind,
+                    attempt: n()?.parse().ok()?,
                     worker: n()?.parse().ok()?,
                     at_us: n()?.parse().ok()?,
                     run_us: n()?.parse().ok()?,
@@ -143,6 +146,7 @@ pub fn apply(ledger: &Ledger, stats: &Stats, ev: WEvent) {
         WEvent::Done {
             seq,
             kind,
+            attempt,
             worker,
             at_us,
             run_us,
@@ -153,15 +157,15 @@ pub fn apply(ledger: &Ledger, stats: &Stats, ev: WEvent) {
                 DoneKind::Ok => {
                     stats.ok.fetch_add(1, Ordering::Relaxed);
                     stats.e2e.record(at_us.saturating_sub(due_us));
-                    Mark::Ok { worker }
+                    Mark::Ok { worker, attempt }
                 }
                 DoneKind::Err => {
                     stats.err.fetch_add(1, Ordering::Relaxed);
-                    Mark::Err { worker }
+                    Mark::Err { worker, attempt }
                 }
                 DoneKind::Fatal => {
                     stats.fatal.fetch_add(1, Ordering::Relaxed);
-                    Mark::Fatal { worker }
+                    Mark::Fatal { worker, attempt }
                 }
             };
             ledger.finish(seq, mark, at_us);
@@ -238,6 +242,7 @@ pub fn build_worker(
             sink.emit(WEvent::Done {
                 seq: d.seq,
                 kind,
+                attempt,
                 worker: index,
                 at_us: end,
                 run_us: end - start,
@@ -727,6 +732,7 @@ mod tests {
             WEvent::Done {
                 seq: 7,
                 kind: DoneKind::Fatal,
+                attempt: 2,
                 worker: 3,
                 at_us: 200,
                 run_us: 100,

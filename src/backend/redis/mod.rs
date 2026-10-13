@@ -360,6 +360,10 @@ impl RedisBackend {
     /// Every state transition funnels through here, so a single
     /// `RUST_LOG=oxn=debug` (or the test kit's capture layer) shows which
     /// script ran, for which job, how long it took and what it returned.
+    ///
+    /// A negative integer reply is the script refusing the call; it is
+    /// turned into a typed error here, in one place (see [`script_error`]).
+    /// Scripts that return counts never return negatives.
     async fn eval(
         &self,
         conn: &mut PooledConn,
@@ -385,6 +389,11 @@ impl RedisBackend {
             Ok(redis::Value::Int(n)) => {
                 span.record("lua_rc", *n);
                 span.record("reply", "int");
+                if *n < 0 {
+                    let err = script_error(*n, script, queue, job_id);
+                    span.in_scope(|| tracing::debug!(error = %err, "script rejected the call"));
+                    return Err(err);
+                }
             }
             Ok(v) => {
                 span.record("reply", reply_kind(v));
@@ -422,6 +431,21 @@ impl RedisBackend {
             .eval(&mut conn, "move_to_active", queue, None, &inv)
             .await?;
         parse_fetched(reply, worker_token)
+    }
+}
+
+/// Translate a script's negative return code into an [`Error`].
+///
+/// `-1` ("the job does not exist") becomes [`Error::NotFound`] so callers
+/// and HTTP layers treat it like any other missing resource; every other
+/// code becomes the matching [`crate::error::ScriptError`].
+fn script_error(code: i64, script: &str, queue: &str, job_id: Option<&str>) -> Error {
+    match code {
+        -1 => Error::NotFound(match job_id {
+            Some(id) => format!("job `{id}` in queue `{queue}`"),
+            None => format!("job in queue `{queue}` ({script})"),
+        }),
+        other => Error::Script(crate::error::ScriptError::from_code(other)),
     }
 }
 
@@ -648,13 +672,8 @@ impl Backend for RedisBackend {
             .arg(token)
             .arg(duration.as_millis() as i64);
         let mut conn = self.conn().await?;
-        let reply = self
-            .eval(&mut conn, "extend_lock", queue, Some(id.as_str()), &inv)
+        self.eval(&mut conn, "extend_lock", queue, Some(id.as_str()), &inv)
             .await?;
-        let reply: i64 = redis::from_redis_value(&reply)?;
-        if reply < 0 {
-            return Err(Error::Script(crate::error::ScriptError::from_code(reply)));
-        }
         Ok(())
     }
 
@@ -763,6 +782,7 @@ impl Backend for RedisBackend {
             .key(keys.wait())
             .key(keys.events())
             .key(keys.marker())
+            .key(keys.job_hash(id.as_str()))
             .arg(id.as_str())
             .arg(self.max_stream_length as i64);
         let mut conn = self.conn().await?;
@@ -1250,5 +1270,38 @@ fn parse_stream_entry(map: &std::collections::HashMap<String, redis::Value>) -> 
             count: s(map, "count").and_then(|c| c.parse().ok()).unwrap_or(0),
         },
         _ => Event::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ScriptError;
+
+    #[test]
+    fn missing_job_maps_to_not_found_with_context() {
+        match script_error(-1, "retry", "emails", Some("42")) {
+            Error::NotFound(m) => assert_eq!(m, "job `42` in queue `emails`"),
+            e => panic!("unexpected {e:?}"),
+        }
+        assert!(
+            matches!(script_error(-1, "clean", "q", None), Error::NotFound(m) if m.contains("clean"))
+        );
+    }
+
+    #[test]
+    fn other_codes_map_to_script_errors() {
+        for (code, want) in [
+            (-2, ScriptError::LockNotFound),
+            (-3, ScriptError::NotInExpectedState),
+            (-6, ScriptError::LockMismatch),
+            (-7, ScriptError::JobLocked),
+            (-99, ScriptError::Unknown(-99)),
+        ] {
+            match script_error(code, "s", "q", Some("1")) {
+                Error::Script(e) => assert_eq!(e, want, "code {code}"),
+                e => panic!("code {code}: unexpected {e:?}"),
+            }
+        }
     }
 }

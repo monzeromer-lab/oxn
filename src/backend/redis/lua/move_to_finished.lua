@@ -14,6 +14,9 @@
 -- ARGV[6] now (ms)
 -- ARGV[7] remove policy ("keep" | "remove" | "last:N" | "for:MS")
 -- ARGV[8] max stream len
+--
+-- Returns 1, or -1 (job hash gone) / -2 (lock missing) / -6 (lock held by
+-- another token).
 
 local activeKey = KEYS[1]
 local targetKey = KEYS[2]
@@ -29,6 +32,14 @@ local reason   = ARGV[5]
 local nowMs    = tonumber(ARGV[6])
 local policy   = ARGV[7]
 local maxStream = tonumber(ARGV[8])
+
+-- the job hash vanished while the job was active: clean up the dangling
+-- active entry and lock, and report it.
+if redis.call('EXISTS', hashKey) == 0 then
+  redis.call('LREM', activeKey, 0, id)
+  redis.call('DEL', lockKey)
+  return -1
+end
 
 -- verify lock ownership
 local held = redis.call('GET', lockKey)

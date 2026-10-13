@@ -187,6 +187,7 @@ impl actix_web::error::ResponseError for ApiError {
         match &self.0 {
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::Config(_) => StatusCode::BAD_REQUEST,
+            e if e.is_conflict() => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

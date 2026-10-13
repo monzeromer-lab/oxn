@@ -12,6 +12,8 @@
 -- ARGV[3] retry_at (ms)
 -- ARGV[4] reason
 -- ARGV[5] max stream len
+--
+-- Returns 1, or -2 (lock missing) / -6 (lock held by another token).
 
 local activeKey  = KEYS[1]
 local delayedKey = KEYS[2]

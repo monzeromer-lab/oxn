@@ -392,9 +392,6 @@ async fn process_one_inner<D, R>(
                 .complete(&queue, &id, &token, json, remove_on_complete)
                 .await;
             log_transition("completed", &r);
-            if let Err(e) = r {
-                tracing::error!(job = %id, error = %e, "complete failed");
-            }
         }
         Err(Error::Delayed { delay_ms }) => {
             let retry_at = chrono_like_now_ms() + delay_ms as i64;
@@ -410,9 +407,6 @@ async fn process_one_inner<D, R>(
                 )
                 .await;
             log_transition("delayed", &r);
-            if let Err(e) = r {
-                tracing::error!(job = %id, error = %e, "delay requeue failed");
-            }
         }
         Err(Error::RateLimited { delay_ms }) => {
             let retry_at = chrono_like_now_ms() + delay_ms as i64;
@@ -428,9 +422,6 @@ async fn process_one_inner<D, R>(
                 )
                 .await;
             log_transition("delayed", &r);
-            if let Err(e) = r {
-                tracing::error!(job = %id, error = %e, "rate-limit requeue failed");
-            }
         }
         Err(Error::Unrecoverable(msg)) => {
             span.record("transition", "failed");
@@ -438,9 +429,6 @@ async fn process_one_inner<D, R>(
                 .fail(&queue, &id, &token, &msg, None, remove_on_fail)
                 .await;
             log_transition("failed", &r);
-            if let Err(e) = r {
-                tracing::error!(job = %id, error = %e, "fail permanent failed");
-            }
         }
         Err(err) => {
             // `attempts_made` has already been incremented by `fetch_next`
@@ -464,18 +452,12 @@ async fn process_one_inner<D, R>(
                     )
                     .await;
                 log_transition("retry-delayed", &r);
-                if let Err(e) = r {
-                    tracing::error!(job = %id, error = %e, "retry requeue failed");
-                }
             } else {
                 span.record("transition", "failed");
                 let r = backend
                     .fail(&queue, &id, &token, &err.to_string(), None, remove_on_fail)
                     .await;
                 log_transition("failed", &r);
-                if let Err(e) = r {
-                    tracing::error!(job = %id, error = %e, "final fail failed");
-                }
             }
         }
     }
@@ -492,10 +474,21 @@ fn outcome_label<R>(r: &Result<R>) -> &'static str {
     }
 }
 
+/// Report how the backend answered a state transition.
+///
+/// A lost lock is expected under contention (the stalled scanner or another
+/// worker took the job over) and is a warning: this worker's outcome is
+/// discarded and the job's new owner decides its fate. Anything else is an
+/// error — the outcome was not recorded and nobody else owns the job yet.
 fn log_transition(to: &'static str, r: &Result<()>) {
     match r {
         Ok(()) => tracing::debug!(to, "transition applied"),
-        Err(e) => tracing::debug!(to, error = %e, "transition rejected"),
+        Err(e) if e.is_lock_lost() => tracing::warn!(
+            to,
+            error = %e,
+            "transition rejected: lock lost, outcome discarded (the job now belongs to another worker or the stalled scanner)"
+        ),
+        Err(e) => tracing::error!(to, error = %e, "transition rejected"),
     }
 }
 

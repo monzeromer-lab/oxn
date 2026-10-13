@@ -102,6 +102,31 @@ impl Error {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Unrecoverable(_) | Self::NotFound(_))
     }
+
+    /// `true` when the operation was refused because the job is in the
+    /// wrong state or another worker owns it — the HTTP layers map this to
+    /// `409 Conflict`.
+    pub fn is_conflict(&self) -> bool {
+        matches!(
+            self,
+            Self::Script(
+                ScriptError::NotInExpectedState
+                    | ScriptError::LockNotFound
+                    | ScriptError::LockMismatch
+                    | ScriptError::JobLocked
+                    | ScriptError::PendingChildren
+            )
+        )
+    }
+
+    /// `true` when the job's lock was lost: the worker no longer owns the
+    /// job and its outcome was discarded.
+    pub fn is_lock_lost(&self) -> bool {
+        matches!(
+            self,
+            Self::Script(ScriptError::LockNotFound | ScriptError::LockMismatch)
+        )
+    }
 }
 
 /// Typed variants of the negative integer codes returned from Lua scripts.
@@ -130,6 +155,10 @@ pub enum ScriptError {
     /// The token passed to a finalization script doesn't match the held lock.
     #[error("lock token does not match worker token")]
     LockMismatch,
+    /// The job is active and its lock is held by a worker, so it can't be
+    /// removed out from under it.
+    #[error("job is locked by an active worker")]
+    JobLocked,
     /// A parent has children that failed permanently.
     #[error("parent has failed children")]
     FailedChildren,
@@ -151,6 +180,7 @@ impl ScriptError {
             -4 => Self::PendingChildren,
             -5 => Self::ParentNotFound,
             -6 => Self::LockMismatch,
+            -7 => Self::JobLocked,
             -9 => Self::FailedChildren,
             other => Self::Unknown(other),
         }
@@ -183,6 +213,7 @@ mod tests {
         assert_eq!(ScriptError::from_code(-4), ScriptError::PendingChildren);
         assert_eq!(ScriptError::from_code(-5), ScriptError::ParentNotFound);
         assert_eq!(ScriptError::from_code(-6), ScriptError::LockMismatch);
+        assert_eq!(ScriptError::from_code(-7), ScriptError::JobLocked);
         assert_eq!(ScriptError::from_code(-9), ScriptError::FailedChildren);
         assert_eq!(ScriptError::from_code(-42), ScriptError::Unknown(-42));
     }
@@ -194,6 +225,16 @@ mod tests {
         assert!(!Error::Delayed { delay_ms: 100 }.is_terminal());
         assert!(!Error::RateLimited { delay_ms: 100 }.is_terminal());
         assert!(!Error::Closed.is_terminal());
+    }
+
+    #[test]
+    fn conflict_and_lock_lost_classification() {
+        assert!(Error::Script(ScriptError::NotInExpectedState).is_conflict());
+        assert!(Error::Script(ScriptError::JobLocked).is_conflict());
+        assert!(!Error::NotFound("x".into()).is_conflict());
+        assert!(Error::Script(ScriptError::LockMismatch).is_lock_lost());
+        assert!(Error::Script(ScriptError::LockNotFound).is_lock_lost());
+        assert!(!Error::Script(ScriptError::JobLocked).is_lock_lost());
     }
 
     #[test]

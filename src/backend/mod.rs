@@ -185,6 +185,11 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
 
     /// Mark a job completed and record `return_value_json`.
     ///
+    /// Fails with [`ScriptError::LockMismatch`](crate::error::ScriptError) /
+    /// `LockNotFound` when `token` no longer owns the job (the worker's
+    /// outcome is then discarded), or [`crate::Error::NotFound`] if the job
+    /// was deleted while active.
+    ///
     /// `removal` is the job's `JobOptions::remove_on_complete` policy; the
     /// caller passes it from the in-memory job record so the backend
     /// doesn't need a round trip to re-read it from storage.
@@ -200,6 +205,8 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
     /// Mark a job failed. If `retry_at_ms` is `Some`, the job goes to
     /// `delayed` for re-execution at that timestamp; otherwise it's moved
     /// to `failed` with `removal` applied.
+    ///
+    /// Same lock errors as [`Self::complete`].
     async fn fail(
         &self,
         queue: &str,
@@ -240,6 +247,10 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
     async fn obliterate(&self, queue: &str, force: bool) -> Result<()>;
 
     /// Move a delayed job into `wait` ahead of schedule.
+    ///
+    /// Fails with [`crate::Error::NotFound`] if the job doesn't exist and
+    /// [`ScriptError::NotInExpectedState`](crate::error::ScriptError) if it
+    /// isn't delayed.
     async fn promote(&self, queue: &str, id: &JobId) -> Result<()>;
 
     /// Move **every** delayed job into `wait` (or `paused`, if the queue
@@ -262,9 +273,17 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
     async fn clean(&self, queue: &str, state: JobState, limit: u64) -> Result<u64>;
 
     /// Retry a failed job by moving it back to `wait`.
+    ///
+    /// Fails with [`crate::Error::NotFound`] if the job doesn't exist and
+    /// [`ScriptError::NotInExpectedState`](crate::error::ScriptError) if it
+    /// isn't in `failed`.
     async fn retry(&self, queue: &str, id: &JobId) -> Result<()>;
 
     /// Remove a job and its auxiliary keys.
+    ///
+    /// Fails with [`crate::Error::NotFound`] if the job doesn't exist and
+    /// [`ScriptError::JobLocked`](crate::error::ScriptError) if it is
+    /// active and a worker still holds its lock.
     async fn remove(&self, queue: &str, id: &JobId) -> Result<()>;
 
     /// Fetch a job record by id.

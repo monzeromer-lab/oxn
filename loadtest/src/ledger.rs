@@ -65,11 +65,11 @@ pub enum Mark {
     /// Handler started (attempt number from `attemptsMade`).
     Start { attempt: u32, worker: u32 },
     /// Handler returned `Ok`.
-    Ok { worker: u32 },
+    Ok { worker: u32, attempt: u32 },
     /// Handler returned a transient error.
-    Err { worker: u32 },
+    Err { worker: u32, attempt: u32 },
     /// Handler returned `Unrecoverable`.
-    Fatal { worker: u32 },
+    Fatal { worker: u32, attempt: u32 },
     /// Server emitted `stalled`.
     Stalled,
     /// Server emitted `failed`.
@@ -109,6 +109,8 @@ pub struct Entry {
     pub ok_us: Option<u64>,
     /// Highest attempt number seen.
     pub max_attempt: u32,
+    /// Highest attempt number that ended in a transient error.
+    pub max_err_attempt: u32,
     /// Most recent marks, epoch-µs.
     pub history: Vec<(u64, Mark)>,
 }
@@ -191,7 +193,10 @@ impl Ledger {
                     e.oks += 1;
                     e.ok_us.get_or_insert(at_us);
                 }
-                Mark::Err { .. } => e.errs += 1,
+                Mark::Err { attempt, .. } => {
+                    e.errs += 1;
+                    e.max_err_attempt = e.max_err_attempt.max(attempt);
+                }
                 Mark::Fatal { .. } => e.fatals += 1,
                 _ => {}
             }
@@ -288,50 +293,104 @@ impl Ledger {
                         v.explained_duplicates += extra as u64;
                     }
                 }
-                match exp {
-                    Expected::Completed { starts } => {
-                        if e.oks == 0 {
-                            push(
-                                Anomaly::WrongOutcome,
-                                format!(
-                                    "planned to succeed on attempt {starts} but failed after {} start(s)",
-                                    e.starts
-                                ),
-                            );
+                // Attempts that started but never reported back were cut
+                // short (SIGKILL, stall, shutdown). The handler fails by
+                // attempt *number*, so an interruption shifts the plan: the
+                // job legitimately needs more starts and may even succeed
+                // where the plan alone predicted a failure. Without
+                // interruptions the plan is exact; with them, check that oxn
+                // followed its retry rules for the history actually seen.
+                // Attempt numbers are assigned by the server at fetch time, so
+                // a gap (attempt 3 seen, only 2 handler runs) is an attempt a
+                // worker took and died with before its handler even started.
+                let finished = e.oks + e.errs + e.fatals;
+                let interrupted = e.starts.max(e.max_attempt).saturating_sub(finished);
+                if interrupted == 0 {
+                    match exp {
+                        Expected::Completed { starts } => {
+                            if e.oks == 0 {
+                                push(
+                                    Anomaly::WrongOutcome,
+                                    format!(
+                                        "planned to succeed on attempt {starts} but failed after {} start(s)",
+                                        e.starts
+                                    ),
+                                );
+                            }
+                            // Duplicate successes are judged above.
+                            let allowed = starts + (e.oks.saturating_sub(1)) + allow_extra_starts;
+                            if e.starts > allowed {
+                                push(
+                                    Anomaly::ExtraStarts,
+                                    format!(
+                                        "{} starts > planned {starts}, none of them interrupted",
+                                        e.starts
+                                    ),
+                                );
+                            }
                         }
-                        let allowed = starts + e.stalls + allow_extra_starts;
-                        if e.starts > allowed {
-                            push(
-                                Anomaly::ExtraStarts,
-                                format!(
-                                    "{} starts > planned {starts} + {} stall(s) + {allow_extra_starts} chaos allowance",
-                                    e.starts, e.stalls
-                                ),
-                            );
-                        } else if e.starts > starts {
-                            v.explained_extra_starts += (e.starts - starts) as u64;
+                        Expected::Failed { starts } => {
+                            if e.oks > 0 {
+                                push(
+                                    Anomaly::WrongOutcome,
+                                    format!(
+                                        "planned to fail after {starts} start(s) but completed"
+                                    ),
+                                );
+                            }
+                            if !job.fatal && e.starts < starts && e.server_failed > 0 {
+                                push(
+                                    Anomaly::PrematureFailure,
+                                    format!(
+                                        "failed for good after {} of {starts} attempts",
+                                        e.starts
+                                    ),
+                                );
+                            }
                         }
                     }
-                    Expected::Failed { starts } => {
-                        if e.oks > 0 {
-                            push(
-                                Anomaly::WrongOutcome,
-                                format!("planned to fail after {starts} start(s) but completed"),
-                            );
-                        }
-                        if job.fatal && e.starts > 1 + e.stalls + allow_extra_starts {
-                            push(
-                                Anomaly::FatalRetried,
-                                format!("unrecoverable job started {} times", e.starts),
-                            );
-                        }
-                        if !job.fatal && e.starts < starts && e.server_failed > 0 {
-                            push(
-                                Anomaly::PrematureFailure,
-                                format!("failed for good after {} of {starts} attempts", e.starts),
-                            );
-                        }
+                } else {
+                    v.interrupted_attempts += interrupted as u64;
+                    v.explained_extra_starts += interrupted as u64;
+                    if interrupted > e.stalls + allow_extra_starts {
+                        push(
+                            Anomaly::ExtraStarts,
+                            format!(
+                                "{interrupted} interrupted attempt(s) but only {} stall(s) recorded",
+                                e.stalls
+                            ),
+                        );
                     }
+                    if e.oks > 0 && e.max_err_attempt >= attempts {
+                        push(
+                            Anomaly::WrongOutcome,
+                            format!(
+                                "failed on attempt {} (limit {attempts}) yet was retried and completed",
+                                e.max_err_attempt
+                            ),
+                        );
+                    }
+                    if e.oks == 0
+                        && e.fatals == 0
+                        && e.server_failed > 0
+                        && e.max_err_attempt < attempts
+                        && e.stalls == 0
+                    {
+                        push(
+                            Anomaly::PrematureFailure,
+                            format!(
+                                "failed for good though its last failure was attempt {} of {attempts}",
+                                e.max_err_attempt
+                            ),
+                        );
+                    }
+                }
+                // A fatal job may only run again if a stall took it back.
+                if job.fatal && e.starts > 1 + e.stalls + allow_extra_starts {
+                    push(
+                        Anomaly::FatalRetried,
+                        format!("unrecoverable job started {} times", e.starts),
+                    );
                 }
                 if job.delay_ms > 0
                     && let Some(first) = e.first_start_us
@@ -396,6 +455,8 @@ pub struct Verdict {
     pub explained_extra_starts: u64,
     /// Repeat successes explained by stalls (at-least-once delivery).
     pub explained_duplicates: u64,
+    /// Attempts that started but never finished (killed / stalled).
+    pub interrupted_attempts: u64,
     /// Distinct jobs whose handler succeeded at least once.
     pub completed_jobs: u64,
     /// Distinct jobs that ended failed.
@@ -446,9 +507,23 @@ mod tests {
         let l = Ledger::new(24);
         l.added(job(1, 1, false), "1".into(), 0);
         l.start(1, 1, 0, 10);
-        l.finish(1, Mark::Err { worker: 0 }, 11);
+        l.finish(
+            1,
+            Mark::Err {
+                worker: 0,
+                attempt: 1,
+            },
+            11,
+        );
         l.start(1, 2, 0, 20);
-        l.finish(1, Mark::Ok { worker: 0 }, 21);
+        l.finish(
+            1,
+            Mark::Ok {
+                worker: 0,
+                attempt: 2,
+            },
+            21,
+        );
         l.server_event("1", "completed", 22);
         assert_eq!(l.pending(3), 0);
         let v = l.verify(3, 0);
@@ -457,24 +532,155 @@ mod tests {
     }
 
     #[test]
-    fn detects_lost_duplicate_and_extra_starts() {
+    fn detects_lost_duplicate_and_fatal_retried() {
         let l = Ledger::new(24);
         l.added(job(1, 0, false), "1".into(), 0); // never started → lost
         l.added(job(2, 0, false), "2".into(), 0);
         for _ in 0..2 {
             l.start(2, 1, 0, 1);
-            l.finish(2, Mark::Ok { worker: 0 }, 2);
+            l.finish(
+                2,
+                Mark::Ok {
+                    worker: 0,
+                    attempt: 1,
+                },
+                2,
+            );
         }
         l.added(job(3, 0, true), "3".into(), 0);
         l.start(3, 1, 0, 1);
-        l.finish(3, Mark::Fatal { worker: 0 }, 2);
+        l.finish(
+            3,
+            Mark::Fatal {
+                worker: 0,
+                attempt: 1,
+            },
+            2,
+        );
         l.start(3, 2, 0, 3);
         let v = l.verify(3, 0);
         assert_eq!(v.counts.get(&Anomaly::Lost), Some(&1));
         assert_eq!(v.counts.get(&Anomaly::DuplicateCompletion), Some(&1));
-        assert_eq!(v.counts.get(&Anomaly::ExtraStarts), Some(&1));
         assert_eq!(v.counts.get(&Anomaly::FatalRetried), Some(&1));
+        assert_eq!(
+            v.counts.get(&Anomaly::ExtraStarts),
+            Some(&1),
+            "job 3's restart is unexplained"
+        );
         assert_eq!(v.anomalies[&Anomaly::Lost][0].seq, 1);
+    }
+
+    #[test]
+    fn interrupted_attempt_without_stall_is_flagged() {
+        let l = Ledger::new(24);
+        l.added(job(1, 0, false), "1".into(), 0);
+        l.start(1, 1, 0, 1); // never reports back, no stall recorded
+        l.start(1, 2, 0, 2);
+        l.finish(
+            1,
+            Mark::Ok {
+                worker: 0,
+                attempt: 2,
+            },
+            3,
+        );
+        let v = l.verify(3, 0);
+        assert_eq!(v.counts.get(&Anomaly::ExtraStarts), Some(&1));
+    }
+
+    #[test]
+    fn killed_final_attempt_may_legitimately_succeed() {
+        // The kill-worker case: plan says fail 3× with 3 attempts, but
+        // attempt 3 was killed (stall), so attempt 4 runs and succeeds.
+        let l = Ledger::new(24);
+        l.added(job(1, 3, false), "1".into(), 0);
+        for a in 1..=2 {
+            l.start(1, a, 0, a as u64);
+            l.finish(
+                1,
+                Mark::Err {
+                    worker: 0,
+                    attempt: a,
+                },
+                a as u64,
+            );
+        }
+        l.start(1, 3, 0, 10);
+        l.server_event("1", "stalled", 11);
+        l.start(1, 4, 1, 12);
+        l.finish(
+            1,
+            Mark::Ok {
+                worker: 1,
+                attempt: 4,
+            },
+            13,
+        );
+        let v = l.verify(3, 0);
+        assert!(v.ok(), "{:?}", v.counts);
+        assert_eq!(v.interrupted_attempts, 1);
+    }
+
+    #[test]
+    fn attempt_taken_but_never_started_counts_as_interrupted() {
+        // r3 of the B1 kill-worker run: attempt 2 was fetched by a worker
+        // that died before its handler ran; attempt 3 fails at the limit.
+        let l = Ledger::new(24);
+        l.added(job(1, 5, false), "1".into(), 0);
+        l.start(1, 1, 0, 1);
+        l.finish(
+            1,
+            Mark::Err {
+                worker: 0,
+                attempt: 1,
+            },
+            2,
+        );
+        l.server_event("1", "stalled", 3);
+        l.start(1, 3, 1, 4);
+        l.finish(
+            1,
+            Mark::Err {
+                worker: 1,
+                attempt: 3,
+            },
+            5,
+        );
+        l.server_event("1", "failed", 6);
+        let v = l.verify(3, 0);
+        assert!(v.ok(), "{:?}", v.counts);
+        assert_eq!(v.interrupted_attempts, 1);
+    }
+
+    #[test]
+    fn retry_past_the_limit_is_flagged_even_with_interruptions() {
+        let l = Ledger::new(24);
+        l.added(job(1, 5, false), "1".into(), 0);
+        l.start(1, 1, 0, 1); // killed
+        l.server_event("1", "stalled", 2);
+        for a in 2..=3 {
+            l.start(1, a, 0, a as u64 * 10);
+            l.finish(
+                1,
+                Mark::Err {
+                    worker: 0,
+                    attempt: a,
+                },
+                a as u64 * 10 + 1,
+            );
+        }
+        // attempt 3 failed at the limit of 3 — oxn must not run it again.
+        l.start(1, 6, 0, 100);
+        l.finish(
+            1,
+            Mark::Ok {
+                worker: 0,
+                attempt: 6,
+            },
+            101,
+        );
+        let v = l.verify(3, 0);
+        assert_eq!(v.counts.get(&Anomaly::WrongOutcome), Some(&1));
     }
 
     #[test]
@@ -484,7 +690,14 @@ mod tests {
         l.start(1, 1, 0, 1);
         l.server_event("1", "stalled", 2);
         l.start(1, 2, 1, 3);
-        l.finish(1, Mark::Ok { worker: 1 }, 4);
+        l.finish(
+            1,
+            Mark::Ok {
+                worker: 1,
+                attempt: 2,
+            },
+            4,
+        );
         let v = l.verify(3, 0);
         assert!(v.ok(), "{:?}", v.counts);
         assert_eq!(v.explained_extra_starts, 1);
@@ -498,7 +711,14 @@ mod tests {
         j.enq_us = 1_000_000;
         l.added(j, "1".into(), 0);
         l.start(1, 1, 0, 1_100_000); // 900ms early
-        l.finish(1, Mark::Ok { worker: 0 }, 1_100_001);
+        l.finish(
+            1,
+            Mark::Ok {
+                worker: 0,
+                attempt: 2,
+            },
+            1_100_001,
+        );
         let v = l.verify(3, 0);
         assert_eq!(v.counts.get(&Anomaly::RanEarly), Some(&1));
     }

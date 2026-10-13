@@ -311,6 +311,13 @@ impl Recorder {
     /// Panic (after writing the report) if any step left the queue in a
     /// state that breaks an invariant.
     pub fn assert_clean(&mut self) {
+        self.assert_clean_from(1);
+    }
+
+    /// Like [`Self::assert_clean`], but only considers steps numbered
+    /// `first` and later — for tests that corrupt state on purpose and then
+    /// check that oxn recovers from it.
+    pub fn assert_clean_from(&mut self, first: usize) {
         let min = if self.strict {
             Severity::Warning
         } else {
@@ -319,12 +326,13 @@ impl Recorder {
         let bad: Vec<String> = self
             .violations(min)
             .into_iter()
+            .filter(|(i, _)| *i >= first)
             .map(|(i, v)| format!("  step {i}: {v}"))
             .collect();
         if !bad.is_empty() {
             let path = self.write_report();
             panic!(
-                "{} invariant violation(s) in `{}`:\n{}\ntimeline: {}",
+                "{} invariant violation(s) in `{}` (from step {first}):\n{}\ntimeline: {}",
                 bad.len(),
                 self.test,
                 bad.join("\n"),

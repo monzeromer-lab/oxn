@@ -207,16 +207,25 @@ where
     }
 
     /// Promote a delayed job to `wait`.
+    ///
+    /// Errors with [`Error::NotFound`] for an unknown id and
+    /// [`Error::Script`]`(NotInExpectedState)` if the job isn't delayed.
     pub async fn promote(&self, id: &JobId) -> Result<()> {
         self.backend.promote(&self.name, id).await
     }
 
     /// Retry a failed job.
+    ///
+    /// Errors with [`Error::NotFound`] for an unknown id and
+    /// [`Error::Script`]`(NotInExpectedState)` if the job isn't failed.
     pub async fn retry(&self, id: &JobId) -> Result<()> {
         self.backend.retry(&self.name, id).await
     }
 
-    /// Remove a job.
+    /// Remove a job and everything attached to it.
+    ///
+    /// Errors with [`Error::NotFound`] for an unknown id and
+    /// [`Error::Script`]`(JobLocked)` while a worker is processing it.
     pub async fn remove(&self, id: &JobId) -> Result<()> {
         self.backend.remove(&self.name, id).await
     }

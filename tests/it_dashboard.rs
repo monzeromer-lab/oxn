@@ -343,3 +343,63 @@ async fn dashboard_promote_all_endpoint_returns_zero_when_empty() {
     let _ = srv.handle.await;
     common::teardown(&q).await;
 }
+
+/// B1: rejected operations surface as 404 / 409 with a JSON error body,
+/// instead of a 204 that pretends the action happened.
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboard_maps_rejected_operations_to_http_status() {
+    let (q, backend) = common::fresh_queue::<T>("dash-b1").await;
+    let waiting = q.add(T(1), JobOptions::new()).await.unwrap();
+    q.add(T(2), JobOptions::new()).await.unwrap();
+    let active = backend
+        .fetch_next(
+            q.name(),
+            "A",
+            Duration::from_secs(30),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .job
+        .id;
+    let waiting = if waiting == active {
+        JobId::new("2")
+    } else {
+        waiting
+    };
+
+    let srv = spawn_dashboard(backend.clone() as Arc<dyn Backend>).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let http = reqwest::Client::new();
+    let post = |path: String| {
+        let http = http.clone();
+        let url = format!("{}/api/queues/{}/jobs/{path}", srv.base, q.name());
+        async move { http.post(url).send().await.unwrap() }
+    };
+
+    for (path, want, needle) in [
+        (format!("{waiting}/retry"), 409, "not in the expected state"),
+        (
+            format!("{waiting}/promote"),
+            409,
+            "not in the expected state",
+        ),
+        ("missing/retry".to_string(), 404, "not found"),
+        ("missing/promote".to_string(), 404, "not found"),
+        ("missing/remove".to_string(), 404, "not found"),
+        (format!("{active}/remove"), 409, "locked"),
+    ] {
+        let r = post(path.clone()).await;
+        assert_eq!(r.status(), want, "POST {path}");
+        let body: serde_json::Value = r.json().await.unwrap();
+        let msg = body["error"].as_str().unwrap_or_default();
+        assert!(msg.contains(needle), "POST {path}: {msg}");
+    }
+    // A legitimate remove still works.
+    assert_eq!(post(format!("{waiting}/remove")).await.status(), 204);
+
+    srv.cancel.cancel();
+    let _ = srv.handle.await;
+    common::teardown(&q).await;
+}

@@ -17,6 +17,8 @@ local markerKey = KEYS[5]
 local id        = ARGV[1]
 local maxStream = tonumber(ARGV[2])
 
+-- -1: no such job; -3: the job exists but is not in `failed`.
+if redis.call('EXISTS', hashKey) == 0 then return -1 end
 local score = redis.call('ZSCORE', failedKey, id)
 if not score then return -3 end
 redis.call('ZREM', failedKey, id)

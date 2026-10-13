@@ -6,7 +6,46 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [SemVer](https://semver.org/) (pre-1.0: minor bumps
 may break public API, patch bumps are fixes/additions only).
 
-## [0.2.2] — Unreleased
+## [0.3.0] — Unreleased
+
+0.3.0 is a correctness release: every bug found in the 0.2.2 review is
+fixed with a regression test, and the repo gains `oxn-testkit` (step
+recorder + invariant checker) and `oxn-load` (load/soak/chaos harness).
+It contains breaking changes; see the migration notes below.
+
+### Changed (breaking)
+
+- **Rejected operations now return errors (B1).** Lua scripts' negative
+  return codes used to be ignored everywhere except `extend_lock`, so
+  `retry`, `promote`, `remove`, `complete` and `fail` reported `Ok` even
+  when nothing happened. They now return:
+  - `Error::NotFound` — the job doesn't exist (`retry`, `promote`,
+    `remove`, and `complete`/`fail` when the job was deleted mid-flight);
+  - `Error::Script(NotInExpectedState)` — `retry` on a job that isn't
+    failed, `promote` on a job that isn't delayed;
+  - `Error::Script(LockMismatch | LockNotFound)` — `complete`/`fail`/
+    `extend_lock` with a token that no longer owns the job;
+  - `Error::Script(JobLocked)` (new, code `-7`) — `remove` on an active
+    job whose lock is held. It used to delete the job out from under the
+    worker processing it.
+- Dashboard (axum and actix) maps `NotFound` → **404** and state/lock
+  conflicts → **409**, with `{"error": "..."}` bodies, instead of `204`.
+- New `Error::is_conflict()` and `Error::is_lock_lost()` helpers.
+
+### Fixed
+
+- The worker no longer logs "transition applied" when the backend
+  rejected the transition. A lost lock is logged as a warning ("lock
+  lost, outcome discarded"); any other rejection as an error.
+
+### Added
+
+- `oxn-testkit` and `oxn-load` workspace crates (unpublished), CI
+  workflow, `scripts/test-redis.sh`. See `docs/load-results/`.
+- Tracing spans on every Lua call (`oxn.script`), fetch, process and
+  shutdown. `backend::redis::script_hashes()` maps script SHAs to names.
+
+## [0.2.2] — Unreleased (folded into 0.3.0)
 
 ### Added
 

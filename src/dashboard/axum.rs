@@ -184,6 +184,7 @@ impl IntoResponse for AppError {
         let status = match &self.0 {
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::Config(_) => StatusCode::BAD_REQUEST,
+            e if e.is_conflict() => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = serde_json::json!({ "error": self.0.to_string() });
