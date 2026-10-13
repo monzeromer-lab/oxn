@@ -3,8 +3,8 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use oxn::prelude::*;
@@ -95,9 +95,7 @@ async fn promote_moves_delayed_into_waiting() {
 async fn handler_returning_delayed_reschedules_job() {
     let (q, _be) = common::fresh_queue::<Task>("handler-delayed").await;
 
-    q.add(Task, JobOptions::new().attempts(5))
-        .await
-        .unwrap();
+    q.add(Task, JobOptions::new().attempts(5)).await.unwrap();
 
     let attempts = Arc::new(AtomicU32::new(0));
     let a = attempts.clone();

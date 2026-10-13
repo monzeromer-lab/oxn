@@ -2,8 +2,8 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use oxn::prelude::*;
@@ -105,16 +105,18 @@ async fn complete_preserves_return_value() {
 
     // List the completed jobs and confirm return_value decoded.
     let jobs: Vec<Job<Payload>> = q
-        .list(
-            JobState::Completed,
-            oxn::backend::JobRange::first(5),
-        )
+        .list(JobState::Completed, oxn::backend::JobRange::first(5))
         .await
         .unwrap();
     assert_eq!(jobs.len(), 1);
     // The return type parameter on list() is unit by default, so we read the
     // raw hash for the string value.
-    let raw = q.backend().get(q.name(), &jobs[0].id).await.unwrap().unwrap();
+    let raw = q
+        .backend()
+        .get(q.name(), &jobs[0].id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         raw.return_value_json.as_deref(),
         Some("\"done-result\""),
@@ -132,7 +134,11 @@ async fn add_returns_distinct_ids_for_distinct_jobs() {
 
     let a = q.add(Payload { step: 1 }, JobOptions::new()).await.unwrap();
     let b = q.add(Payload { step: 2 }, JobOptions::new()).await.unwrap();
-    assert_ne!(a.as_str(), b.as_str(), "ids should be monotonically distinct");
+    assert_ne!(
+        a.as_str(),
+        b.as_str(),
+        "ids should be monotonically distinct"
+    );
 
     common::teardown(&q).await;
 }
@@ -142,10 +148,7 @@ async fn explicit_job_id_is_honored() {
     let (q, _be) = common::fresh_queue::<Payload>("explicit-id").await;
 
     let id = q
-        .add(
-            Payload { step: 0 },
-            JobOptions::new().id("my-custom-id"),
-        )
+        .add(Payload { step: 0 }, JobOptions::new().id("my-custom-id"))
         .await
         .unwrap();
     assert_eq!(id.as_str(), "my-custom-id");

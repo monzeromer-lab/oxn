@@ -10,8 +10,8 @@
 
 use std::sync::Arc;
 
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::backend::{Backend, JobInsert};
@@ -84,11 +84,7 @@ impl FlowProducer {
         Box::pin(self.add_impl(node, None)).await
     }
 
-    async fn add_impl(
-        &self,
-        node: FlowNode,
-        parent: Option<ParentRef>,
-    ) -> Result<JobId> {
+    async fn add_impl(&self, node: FlowNode, parent: Option<ParentRef>) -> Result<JobId> {
         // Children first.
         let FlowNode {
             queue,
@@ -152,10 +148,7 @@ mod tests {
     fn tree_builds_with_depth() {
         let root = FlowNode::new("parent", "root", &Task { step: 0 }, JobOptions::default())
             .unwrap()
-            .child(
-                FlowNode::new("child", "a", &Task { step: 1 }, JobOptions::default())
-                    .unwrap(),
-            )
+            .child(FlowNode::new("child", "a", &Task { step: 1 }, JobOptions::default()).unwrap())
             .child(
                 FlowNode::new("child", "b", &Task { step: 2 }, JobOptions::default())
                     .unwrap()

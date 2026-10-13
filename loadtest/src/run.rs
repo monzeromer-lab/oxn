@@ -379,12 +379,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
     );
     let pickup = stats.pickup.summary();
     if let Some(slo) = cfg.slo_pickup_p99_ms
-        && pickup.p99_ms > slo {
-            failures.push(format!(
-                "pickup p99 {:.1}ms exceeds the {slo:.0}ms SLO",
-                pickup.p99_ms
-            ));
-        }
+        && pickup.p99_ms > slo
+    {
+        failures.push(format!(
+            "pickup p99 {:.1}ms exceeds the {slo:.0}ms SLO",
+            pickup.p99_ms
+        ));
+    }
 
     let health_after_cleanup = if cfg.keep {
         None

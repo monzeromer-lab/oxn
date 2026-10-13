@@ -11,10 +11,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::future::BoxFuture;
 use futures::FutureExt;
-use serde::de::DeserializeOwned;
+use futures::future::BoxFuture;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -24,14 +24,12 @@ use crate::backend::{Backend, Fetched};
 use crate::error::{Error, Result};
 use crate::job::Job;
 use crate::options::WorkerOptions;
-use crate::queue::{decode_job, Queue};
+use crate::queue::{Queue, decode_job};
 
 /// Boxed future returned by a handler.
 pub type HandlerFuture<R> = Pin<Box<dyn Future<Output = Result<R>> + Send + 'static>>;
 
-type HandlerFn<D, R> = Arc<
-    dyn Fn(Job<D>) -> HandlerFuture<R> + Send + Sync + 'static,
->;
+type HandlerFn<D, R> = Arc<dyn Fn(Job<D>) -> HandlerFuture<R> + Send + Sync + 'static>;
 
 /// A worker polling a queue and dispatching jobs to a handler.
 pub struct Worker<D, R = ()>
@@ -263,7 +261,9 @@ where
         let drain = async {
             let _ = semaphore.acquire_many(total as u32).await;
         };
-        let drained = tokio::time::timeout(opts.shutdown_timeout, drain).await.is_ok();
+        let drained = tokio::time::timeout(opts.shutdown_timeout, drain)
+            .await
+            .is_ok();
         tracing::debug!(
             queue = %queue,
             worker = %id,
@@ -300,9 +300,18 @@ async fn process_one<D, R>(
         elapsed_us = tracing::field::Empty,
     );
     let started = std::time::Instant::now();
-    process_one_inner(backend, queue, raw, token, handler, opts, cancel, span.clone())
-        .instrument(span.clone())
-        .await;
+    process_one_inner(
+        backend,
+        queue,
+        raw,
+        token,
+        handler,
+        opts,
+        cancel,
+        span.clone(),
+    )
+    .instrument(span.clone())
+    .await;
     span.record("elapsed_us", started.elapsed().as_micros() as u64);
 }
 

@@ -20,11 +20,11 @@
 use std::sync::Arc;
 
 use actix_web::web::{Data, Json, Path, Query};
-use actix_web::{web, HttpResponse, Responder, Scope};
+use actix_web::{HttpResponse, Responder, Scope, web};
 
 use crate::backend::Backend;
 use crate::dashboard::api::{self, CleanBody, ListQuery, LogsQuery};
-use crate::dashboard::{DashboardState, DASHBOARD_HTML};
+use crate::dashboard::{DASHBOARD_HTML, DashboardState};
 use crate::error::Error;
 use crate::job::JobId;
 
@@ -38,15 +38,33 @@ pub fn scope(backend: Arc<dyn Backend>) -> Scope {
         .route("/api/queues/{queue}/counts", web::get().to(get_counts))
         .route("/api/queues/{queue}/jobs", web::get().to(get_jobs))
         .route("/api/queues/{queue}/jobs/{id}", web::get().to(get_job))
-        .route("/api/queues/{queue}/jobs/{id}/logs", web::get().to(get_job_logs))
-        .route("/api/queues/{queue}/jobs/{id}/retry", web::post().to(retry_job))
-        .route("/api/queues/{queue}/jobs/{id}/promote", web::post().to(promote_job))
-        .route("/api/queues/{queue}/jobs/{id}/remove", web::post().to(remove_job))
+        .route(
+            "/api/queues/{queue}/jobs/{id}/logs",
+            web::get().to(get_job_logs),
+        )
+        .route(
+            "/api/queues/{queue}/jobs/{id}/retry",
+            web::post().to(retry_job),
+        )
+        .route(
+            "/api/queues/{queue}/jobs/{id}/promote",
+            web::post().to(promote_job),
+        )
+        .route(
+            "/api/queues/{queue}/jobs/{id}/remove",
+            web::post().to(remove_job),
+        )
         .route("/api/queues/{queue}/pause", web::post().to(pause_queue))
         .route("/api/queues/{queue}/resume", web::post().to(resume_queue))
         .route("/api/queues/{queue}/drain", web::post().to(drain_queue))
-        .route("/api/queues/{queue}/clean/{state}", web::post().to(clean_state))
-        .route("/api/queues/{queue}/promote-all", web::post().to(promote_all_delayed))
+        .route(
+            "/api/queues/{queue}/clean/{state}",
+            web::post().to(clean_state),
+        )
+        .route(
+            "/api/queues/{queue}/promote-all",
+            web::post().to(promote_all_delayed),
+        )
 }
 
 async fn index() -> impl Responder {
@@ -65,11 +83,7 @@ async fn get_counts(s: Data<DashboardState>, path: Path<String>) -> ApiResult {
     Ok(HttpResponse::Ok().json(v))
 }
 
-async fn get_jobs(
-    s: Data<DashboardState>,
-    path: Path<String>,
-    q: Query<ListQuery>,
-) -> ApiResult {
+async fn get_jobs(s: Data<DashboardState>, path: Path<String>, q: Query<ListQuery>) -> ApiResult {
     let v = api::list_jobs(s.get_ref(), &path, q.into_inner()).await?;
     Ok(HttpResponse::Ok().json(v))
 }
@@ -145,10 +159,7 @@ async fn clean_state(
     Ok(HttpResponse::Ok().json(r))
 }
 
-async fn promote_all_delayed(
-    s: Data<DashboardState>,
-    path: Path<String>,
-) -> ApiResult {
+async fn promote_all_delayed(s: Data<DashboardState>, path: Path<String>) -> ApiResult {
     let r = api::promote_all(s.get_ref(), &path).await?;
     Ok(HttpResponse::Ok().json(r))
 }

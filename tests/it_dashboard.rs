@@ -83,7 +83,11 @@ async fn dashboard_lists_queues_counts_and_jobs() {
 
     // GET /api/queues/{q}/jobs?state=waiting
     let list: serde_json::Value = http
-        .get(format!("{}/api/queues/{}/jobs?state=waiting", srv.base, q.name()))
+        .get(format!(
+            "{}/api/queues/{}/jobs?state=waiting",
+            srv.base,
+            q.name()
+        ))
         .send()
         .await
         .unwrap()
@@ -157,12 +161,10 @@ async fn dashboard_clean_endpoint_removes_completed_jobs() {
     for _ in 0..3u32 {
         q.add(T(0), JobOptions::new()).await.unwrap();
     }
-    let worker = Worker::builder(q.clone(), |_: Job<T>| async {
-        Ok::<_, oxn::Error>(())
-    })
-    .concurrency(1)
-    .drain_delay(Duration::from_millis(50))
-    .build();
+    let worker = Worker::builder(q.clone(), |_: Job<T>| async { Ok::<_, oxn::Error>(()) })
+        .concurrency(1)
+        .drain_delay(Duration::from_millis(50))
+        .build();
     let cancel = worker.cancellation_token();
     let h = tokio::spawn(worker.run());
     common::wait_for(Duration::from_secs(5), || {
@@ -206,12 +208,10 @@ async fn dashboard_clean_endpoint_works_without_a_body() {
     for _ in 0..2u32 {
         q.add(T(0), JobOptions::new()).await.unwrap();
     }
-    let worker = oxn::Worker::builder(q.clone(), |_: Job<T>| async {
-        Ok::<_, oxn::Error>(())
-    })
-    .concurrency(1)
-    .drain_delay(Duration::from_millis(50))
-    .build();
+    let worker = oxn::Worker::builder(q.clone(), |_: Job<T>| async { Ok::<_, oxn::Error>(()) })
+        .concurrency(1)
+        .drain_delay(Duration::from_millis(50))
+        .build();
     let cancel = worker.cancellation_token();
     let h = tokio::spawn(worker.run());
     common::wait_for(Duration::from_secs(5), || {

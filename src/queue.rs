@@ -8,8 +8,8 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tracing::Instrument;
 
 use crate::backend::{Backend, JobInsert, JobRange, RawJob, StateCounts};
@@ -129,16 +129,18 @@ where
     pub async fn add(&self, data: D, opts: JobOptions) -> Result<JobId> {
         let opts = merge_opts(&self.opts.default_job_options, opts);
         let insert = JobInsert {
-            name: opts
-                .name
-                .clone()
-                .unwrap_or_else(|| self.name.clone()),
+            name: opts.name.clone().unwrap_or_else(|| self.name.clone()),
             data: serde_json::to_string(&data)?,
             opts,
             timestamp_ms: now_ms(),
         };
-        let span = tracing::debug_span!("oxn.add", queue = %self.name, job_id = tracing::field::Empty);
-        let id = self.backend.add(&self.name, insert).instrument(span.clone()).await?;
+        let span =
+            tracing::debug_span!("oxn.add", queue = %self.name, job_id = tracing::field::Empty);
+        let id = self
+            .backend
+            .add(&self.name, insert)
+            .instrument(span.clone())
+            .await?;
         span.record("job_id", id.as_str());
         Ok(id)
     }
@@ -166,10 +168,7 @@ where
             .into_iter()
             .map(|(d, opts)| {
                 let opts = merge_opts(&self.opts.default_job_options, opts);
-                let name = opts
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| self.name.clone());
+                let name = opts.name.clone().unwrap_or_else(|| self.name.clone());
                 Ok(JobInsert {
                     name,
                     data: serde_json::to_string(&d)?,
@@ -259,7 +258,9 @@ pub(crate) fn merge_opts(default: &JobOptions, override_: JobOptions) -> JobOpti
         },
         attempts: override_.attempts.max(1),
         backoff: override_.backoff.or(default.backoff),
-        deduplication: override_.deduplication.or_else(|| default.deduplication.clone()),
+        deduplication: override_
+            .deduplication
+            .or_else(|| default.deduplication.clone()),
         remove_on_complete: override_.remove_on_complete,
         remove_on_fail: override_.remove_on_fail,
         lifo: override_.lifo,
@@ -480,8 +481,7 @@ mod tests {
 
     #[test]
     fn merge_inherits_dedup_when_override_is_none() {
-        let default =
-            JobOptions::new().deduplicate("abc", std::time::Duration::from_secs(10));
+        let default = JobOptions::new().deduplicate("abc", std::time::Duration::from_secs(10));
         let merged = merge_opts(&default, JobOptions::new());
         let d = merged.deduplication.unwrap();
         assert_eq!(d.id, "abc");

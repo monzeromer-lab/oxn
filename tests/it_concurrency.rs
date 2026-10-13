@@ -2,8 +2,8 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::time::Duration;
 
 use oxn::prelude::*;
@@ -21,7 +21,9 @@ async fn every_job_runs_exactly_once_under_concurrency() {
         q.add(T(i), JobOptions::new()).await.unwrap();
     }
 
-    let seen = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::<u32>::new()));
+    let seen = Arc::new(std::sync::Mutex::new(
+        std::collections::BTreeSet::<u32>::new(),
+    ));
     let done = Arc::new(AtomicU32::new(0));
 
     let seen_c = seen.clone();

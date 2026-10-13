@@ -2,8 +2,8 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use oxn::prelude::*;
@@ -84,7 +84,11 @@ async fn worker_does_not_process_while_paused() {
     let handle = tokio::spawn(worker.run());
 
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(processed.load(Ordering::SeqCst), 0, "handler ran despite pause");
+    assert_eq!(
+        processed.load(Ordering::SeqCst),
+        0,
+        "handler ran despite pause"
+    );
 
     q.resume().await.unwrap();
     let ok = common::wait_for(Duration::from_secs(3), || {

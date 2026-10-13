@@ -334,19 +334,20 @@ impl Ledger {
                     }
                 }
                 if job.delay_ms > 0
-                    && let Some(first) = e.first_start_us {
-                        let due = job.enq_us + job.delay_ms * 1000;
-                        // 5ms tolerance for clock granularity.
-                        if first + 5_000 < due {
-                            push(
-                                Anomaly::RanEarly,
-                                format!(
-                                    "started {:.1}ms before its delay elapsed",
-                                    (due - first) as f64 / 1000.0
-                                ),
-                            );
-                        }
+                    && let Some(first) = e.first_start_us
+                {
+                    let due = job.enq_us + job.delay_ms * 1000;
+                    // 5ms tolerance for clock granularity.
+                    if first + 5_000 < due {
+                        push(
+                            Anomaly::RanEarly,
+                            format!(
+                                "started {:.1}ms before its delay elapsed",
+                                (due - first) as f64 / 1000.0
+                            ),
+                        );
                     }
+                }
                 if e.oks == 1 && e.server_completed == 0 && e.server_failed == 0 {
                     v.missing_server_events += 1;
                 }

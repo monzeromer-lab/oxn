@@ -179,10 +179,7 @@ mod tests {
     fn script_error_codes_cover_bullmq_table() {
         assert_eq!(ScriptError::from_code(-1), ScriptError::JobNotFound);
         assert_eq!(ScriptError::from_code(-2), ScriptError::LockNotFound);
-        assert_eq!(
-            ScriptError::from_code(-3),
-            ScriptError::NotInExpectedState
-        );
+        assert_eq!(ScriptError::from_code(-3), ScriptError::NotInExpectedState);
         assert_eq!(ScriptError::from_code(-4), ScriptError::PendingChildren);
         assert_eq!(ScriptError::from_code(-5), ScriptError::ParentNotFound);
         assert_eq!(ScriptError::from_code(-6), ScriptError::LockMismatch);
@@ -214,4 +211,3 @@ mod tests {
         assert!(s.contains("750"));
     }
 }
-

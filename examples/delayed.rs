@@ -18,7 +18,8 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     // Fires immediately.
-    q.add(Task("now".into()), JobOptions::new().priority(1)).await?;
+    q.add(Task("now".into()), JobOptions::new().priority(1))
+        .await?;
     // Delayed by 2s.
     q.add(
         Task("later".into()),

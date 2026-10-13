@@ -40,7 +40,12 @@ async fn obliterate_refuses_while_active_unless_forced() {
     // Take the job into `active` without completing it.
     let tok = "w:0".to_string();
     backend
-        .fetch_next(q.name(), &tok, Duration::from_secs(30), Duration::from_millis(100))
+        .fetch_next(
+            q.name(),
+            &tok,
+            Duration::from_secs(30),
+            Duration::from_millis(100),
+        )
         .await
         .unwrap();
 

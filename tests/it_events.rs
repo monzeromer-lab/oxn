@@ -44,12 +44,10 @@ async fn subscriber_receives_added_and_completed_events() {
 
     q.add(T, JobOptions::new()).await.unwrap();
 
-    let worker = Worker::builder(q.clone(), |_job: Job<T>| async move {
-        Ok::<_, Error>(())
-    })
-    .concurrency(1)
-    .drain_delay(Duration::from_millis(100))
-    .build();
+    let worker = Worker::builder(q.clone(), |_job: Job<T>| async move { Ok::<_, Error>(()) })
+        .concurrency(1)
+        .drain_delay(Duration::from_millis(100))
+        .build();
 
     let cancel = worker.cancellation_token();
     let wh = tokio::spawn(worker.run());

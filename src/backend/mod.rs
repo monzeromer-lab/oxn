@@ -256,12 +256,7 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
     /// `limit = 0` means "every job in that state". Returns the number of
     /// jobs removed. Job hash + auxiliary keys (logs, dependencies, etc.)
     /// are deleted along with the zset entries.
-    async fn clean(
-        &self,
-        queue: &str,
-        state: JobState,
-        limit: u64,
-    ) -> Result<u64>;
+    async fn clean(&self, queue: &str, state: JobState, limit: u64) -> Result<u64>;
 
     /// Retry a failed job by moving it back to `wait`.
     async fn retry(&self, queue: &str, id: &JobId) -> Result<()>;
@@ -276,12 +271,7 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
     async fn counts(&self, queue: &str) -> Result<StateCounts>;
 
     /// Iterate jobs in a particular state.
-    async fn list(
-        &self,
-        queue: &str,
-        state: JobState,
-        range: JobRange,
-    ) -> Result<Vec<RawJob>>;
+    async fn list(&self, queue: &str, state: JobState, range: JobRange) -> Result<Vec<RawJob>>;
 
     /// Append a log line attached to a job.
     async fn log(&self, queue: &str, id: &JobId, line: &str) -> Result<()>;
@@ -290,12 +280,7 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
     async fn get_logs(&self, queue: &str, id: &JobId, range: JobRange) -> Result<Vec<String>>;
 
     /// Update in-progress progress value.
-    async fn update_progress(
-        &self,
-        queue: &str,
-        id: &JobId,
-        progress_json: &str,
-    ) -> Result<()>;
+    async fn update_progress(&self, queue: &str, id: &JobId, progress_json: &str) -> Result<()>;
 
     /// Subscribe to the queue's event stream. Each call yields an
     /// independent cursor; backpressure-friendly.

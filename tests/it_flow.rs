@@ -21,21 +21,26 @@ async fn flow_tree_creates_one_job_per_node() {
     let child_q: Queue<Job> = common::queue(backend.clone(), &child_name).await;
 
     let fp = FlowProducer::new(backend.clone());
-    let tree = FlowNode::new(root_q.name(), "root", &Job { step: 0 }, JobOptions::default())
-        .unwrap()
-        .child(
-            FlowNode::new(&child_name, "a", &Job { step: 1 }, JobOptions::default())
-                .unwrap(),
-        )
-        .child(
-            FlowNode::new(&child_name, "b", &Job { step: 2 }, JobOptions::default())
-                .unwrap(),
-        );
+    let tree = FlowNode::new(
+        root_q.name(),
+        "root",
+        &Job { step: 0 },
+        JobOptions::default(),
+    )
+    .unwrap()
+    .child(FlowNode::new(&child_name, "a", &Job { step: 1 }, JobOptions::default()).unwrap())
+    .child(FlowNode::new(&child_name, "b", &Job { step: 2 }, JobOptions::default()).unwrap());
 
     let root_id = fp.add(tree).await.unwrap();
 
     // Parent exists.
-    assert!(backend.get(root_q.name(), &root_id).await.unwrap().is_some());
+    assert!(
+        backend
+            .get(root_q.name(), &root_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
     // Each child queue has one waiting job.
     let c = backend.counts(&child_name).await.unwrap();
     assert_eq!(c.waiting, 2);

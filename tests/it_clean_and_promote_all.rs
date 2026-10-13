@@ -19,11 +19,10 @@ async fn clean_completed_drops_jobs_and_their_hashes() {
     for _ in 0..3u32 {
         q.add(T, JobOptions::new()).await.unwrap();
     }
-    let worker =
-        Worker::builder(q.clone(), |_: Job<T>| async { Ok::<_, Error>(()) })
-            .concurrency(1)
-            .drain_delay(Duration::from_millis(50))
-            .build();
+    let worker = Worker::builder(q.clone(), |_: Job<T>| async { Ok::<_, Error>(()) })
+        .concurrency(1)
+        .drain_delay(Duration::from_millis(50))
+        .build();
     let cancel = worker.cancellation_token();
     let h = tokio::spawn(worker.run());
 
@@ -68,11 +67,10 @@ async fn clean_with_limit_only_removes_oldest_n() {
     for _ in 0..5u32 {
         q.add(T, JobOptions::new()).await.unwrap();
     }
-    let worker =
-        Worker::builder(q.clone(), |_: Job<T>| async { Ok::<_, Error>(()) })
-            .concurrency(1)
-            .drain_delay(Duration::from_millis(50))
-            .build();
+    let worker = Worker::builder(q.clone(), |_: Job<T>| async { Ok::<_, Error>(()) })
+        .concurrency(1)
+        .drain_delay(Duration::from_millis(50))
+        .build();
     let cancel = worker.cancellation_token();
     let h = tokio::spawn(worker.run());
 
@@ -212,7 +210,10 @@ async fn clean_works_on_delayed_state() {
 #[tokio::test(flavor = "multi_thread")]
 async fn clean_returns_zero_when_state_is_empty() {
     let (q, backend) = common::fresh_queue::<T>("clean-empty").await;
-    let removed = backend.clean(q.name(), JobState::Completed, 0).await.unwrap();
+    let removed = backend
+        .clean(q.name(), JobState::Completed, 0)
+        .await
+        .unwrap();
     assert_eq!(removed, 0);
     common::teardown(&q).await;
 }
@@ -267,19 +268,26 @@ async fn clean_emits_cleaned_event_on_event_stream() {
     });
     tokio::time::sleep(Duration::from_millis(150)).await; // let stream attach
 
-    let removed = backend.clean(q.name(), JobState::Completed, 0).await.unwrap();
+    let removed = backend
+        .clean(q.name(), JobState::Completed, 0)
+        .await
+        .unwrap();
     assert_eq!(removed, 1);
 
     let count = reader.await.unwrap();
-    assert_eq!(count, Some(1), "Event::Cleaned with count=1 should have arrived");
+    assert_eq!(
+        count,
+        Some(1),
+        "Event::Cleaned with count=1 should have arrived"
+    );
 
     common::teardown(&q).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn promote_all_wakes_up_a_blocked_worker() {
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     let (q, backend) = common::fresh_queue::<T>("promote-wakes-worker").await;
 
@@ -339,11 +347,10 @@ async fn clean_one_queue_does_not_touch_another() {
         for _ in 0..2u32 {
             q.add(T, JobOptions::new()).await.unwrap();
         }
-        let worker =
-            Worker::builder(q.clone(), |_: Job<T>| async { Ok::<_, Error>(()) })
-                .concurrency(1)
-                .drain_delay(Duration::from_millis(50))
-                .build();
+        let worker = Worker::builder(q.clone(), |_: Job<T>| async { Ok::<_, Error>(()) })
+            .concurrency(1)
+            .drain_delay(Duration::from_millis(50))
+            .build();
         let c = worker.cancellation_token();
         let h = tokio::spawn(worker.run());
         common::wait_for(Duration::from_secs(5), || {
@@ -357,7 +364,10 @@ async fn clean_one_queue_does_not_touch_another() {
     assert_eq!(a.counts().await.unwrap().completed, 2);
     assert_eq!(b.counts().await.unwrap().completed, 2);
 
-    backend.clean(a.name(), JobState::Completed, 0).await.unwrap();
+    backend
+        .clean(a.name(), JobState::Completed, 0)
+        .await
+        .unwrap();
 
     assert_eq!(a.counts().await.unwrap().completed, 0);
     assert_eq!(

@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use cron::Schedule;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::error::{Error, Result};
 use crate::job::JobId;
@@ -77,12 +77,7 @@ where
     D: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     /// Create a scheduler (does not enqueue anything yet).
-    pub fn new(
-        queue: Queue<D>,
-        id: impl Into<String>,
-        repeat: RepeatOptions,
-        template: D,
-    ) -> Self {
+    pub fn new(queue: Queue<D>, id: impl Into<String>, repeat: RepeatOptions, template: D) -> Self {
         Self {
             queue,
             id: id.into(),
@@ -109,10 +104,7 @@ where
     }
 
     /// Run forever, enqueueing on each tick. Consume in a `tokio::spawn`.
-    pub async fn run(
-        self,
-        cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<()> {
+    pub async fn run(self, cancel: tokio_util::sync::CancellationToken) -> Result<()> {
         loop {
             let delay = self.repeat.next_delay();
             tokio::select! {

@@ -20,12 +20,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use deadpool_redis::{Config as PoolConfig, Connection as PooledConn, Pool, Runtime};
 use futures::stream::{Stream, StreamExt};
-use tracing::Instrument;
 use redis::AsyncCommands;
+use tracing::Instrument;
 
-use crate::backend::{
-    Backend, EventStream, Fetched, JobInsert, JobRange, RawJob, StateCounts,
-};
+use crate::backend::{Backend, EventStream, Fetched, JobInsert, JobRange, RawJob, StateCounts};
 use crate::error::{Error, Result};
 use crate::events::Event;
 use crate::job::{JobId, JobState};
@@ -237,15 +235,14 @@ impl RedisBackend {
         // into a several-second cliff during connect(). With try_join_all,
         // every getter is polled simultaneously and deadpool mints all
         // slots concurrently.
-        let conn_futures = (0..pool_size).map(|_| async {
-            self.pool.get().await.map_err(crate::Error::from)
-        });
+        let conn_futures =
+            (0..pool_size).map(|_| async { self.pool.get().await.map_err(crate::Error::from) });
         let conns = futures::future::try_join_all(conn_futures).await?;
         // Preload on every slot in parallel; each future owns its conn,
         // and dropping it returns the slot to the pool.
-        let preloads = conns.into_iter().map(|mut conn| async move {
-            scripts::Scripts::preload(&mut *conn).await
-        });
+        let preloads = conns
+            .into_iter()
+            .map(|mut conn| async move { scripts::Scripts::preload(&mut *conn).await });
         futures::future::try_join_all(preloads).await?;
         Ok(())
     }
@@ -447,13 +444,14 @@ impl Backend for RedisBackend {
         self.register_queue(queue).await?;
         let keys = self.keys(queue);
         let opts_json = opts_to_json(&insert.opts)?;
-        let delay_ms = insert
-            .opts
-            .delay
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+        let delay_ms = insert.opts.delay.map(|d| d.as_millis() as i64).unwrap_or(0);
         let priority = insert.opts.priority as i64;
-        let dedup_id = insert.opts.deduplication.as_ref().map(|d| d.id.clone()).unwrap_or_default();
+        let dedup_id = insert
+            .opts
+            .deduplication
+            .as_ref()
+            .map(|d| d.id.clone())
+            .unwrap_or_default();
         let dedup_ttl_ms = insert
             .opts
             .deduplication
@@ -488,7 +486,9 @@ impl Backend for RedisBackend {
             .arg(self.max_stream_length as i64);
         let mut conn = self.conn().await?;
         let explicit = (!explicit_id.is_empty()).then_some(explicit_id.as_str());
-        let reply = self.eval(&mut conn, "add_job", queue, explicit, &inv).await?;
+        let reply = self
+            .eval(&mut conn, "add_job", queue, explicit, &inv)
+            .await?;
         let id: String = redis::from_redis_value(&reply)?;
         Ok(JobId::new(id))
     }
@@ -501,7 +501,10 @@ impl Backend for RedisBackend {
         block_for: Duration,
     ) -> Result<Option<Fetched>> {
         // First: try non-blocking move-to-active via Lua.
-        if let Some(fetched) = self.move_to_active(queue, worker_token, lock_duration).await? {
+        if let Some(fetched) = self
+            .move_to_active(queue, worker_token, lock_duration)
+            .await?
+        {
             return Ok(Some(fetched));
         }
 
@@ -536,7 +539,8 @@ impl Backend for RedisBackend {
         span.record("elapsed_us", start.elapsed().as_micros() as u64);
         drop(span);
 
-        self.move_to_active(queue, worker_token, lock_duration).await
+        self.move_to_active(queue, worker_token, lock_duration)
+            .await
     }
 
     async fn complete(
@@ -564,8 +568,14 @@ impl Backend for RedisBackend {
             .arg(remove)
             .arg(self.max_stream_length as i64);
         let mut conn = self.conn().await?;
-        self.eval(&mut conn, "move_to_finished", queue, Some(id.as_str()), &inv)
-            .await?;
+        self.eval(
+            &mut conn,
+            "move_to_finished",
+            queue,
+            Some(id.as_str()),
+            &inv,
+        )
+        .await?;
         Ok(())
     }
 
@@ -614,8 +624,14 @@ impl Backend for RedisBackend {
             .arg(now_ms())
             .arg(remove)
             .arg(self.max_stream_length as i64);
-        self.eval(&mut conn, "move_to_finished", queue, Some(id.as_str()), &inv)
-            .await?;
+        self.eval(
+            &mut conn,
+            "move_to_finished",
+            queue,
+            Some(id.as_str()),
+            &inv,
+        )
+        .await?;
         Ok(())
     }
 
@@ -655,7 +671,9 @@ impl Backend for RedisBackend {
             .arg(max_stalled as i64)
             .arg(self.max_stream_length as i64);
         let mut conn = self.conn().await?;
-        let reply = self.eval(&mut conn, "scan_stalled", queue, None, &inv).await?;
+        let reply = self
+            .eval(&mut conn, "scan_stalled", queue, None, &inv)
+            .await?;
         let moved: Vec<String> = redis::from_redis_value(&reply)?;
         Ok(moved.into_iter().map(JobId::new).collect())
     }
@@ -692,7 +710,12 @@ impl Backend for RedisBackend {
     }
 
     async fn obliterate(&self, queue: &str, force: bool) -> Result<()> {
-        let span = tracing::debug_span!("oxn.obliterate", queue, force, deleted = tracing::field::Empty);
+        let span = tracing::debug_span!(
+            "oxn.obliterate",
+            queue,
+            force,
+            deleted = tracing::field::Empty
+        );
         let keys = self.keys(queue);
         let mut conn = self.conn().await?;
         if !force {
@@ -759,17 +782,14 @@ impl Backend for RedisBackend {
             .key(keys.paused())
             .arg(self.max_stream_length as i64);
         let mut conn = self.conn().await?;
-        let reply = self.eval(&mut conn, "promote_all", queue, None, &inv).await?;
+        let reply = self
+            .eval(&mut conn, "promote_all", queue, None, &inv)
+            .await?;
         let moved: i64 = redis::from_redis_value(&reply)?;
         Ok(moved.max(0) as u64)
     }
 
-    async fn clean(
-        &self,
-        queue: &str,
-        state: JobState,
-        limit: u64,
-    ) -> Result<u64> {
+    async fn clean(&self, queue: &str, state: JobState, limit: u64) -> Result<u64> {
         let keys = self.keys(queue);
         let zset = match state {
             JobState::Completed => keys.completed(),
@@ -781,7 +801,7 @@ impl Backend for RedisBackend {
                 return Err(Error::Config(format!(
                     "clean({state}): list-backed states cannot be cleaned via this API; \
                      use drain() or obliterate() instead"
-                )))
+                )));
             }
         };
         let mut inv = self.scripts.clean.prepare_invoke();
@@ -881,12 +901,7 @@ impl Backend for RedisBackend {
         })
     }
 
-    async fn list(
-        &self,
-        queue: &str,
-        state: JobState,
-        range: JobRange,
-    ) -> Result<Vec<RawJob>> {
+    async fn list(&self, queue: &str, state: JobState, range: JobRange) -> Result<Vec<RawJob>> {
         let keys = self.keys(queue);
         let mut conn = self.conn().await?;
         let start = range.start as isize;
@@ -940,12 +955,7 @@ impl Backend for RedisBackend {
         Ok(v)
     }
 
-    async fn update_progress(
-        &self,
-        queue: &str,
-        id: &JobId,
-        progress_json: &str,
-    ) -> Result<()> {
+    async fn update_progress(&self, queue: &str, id: &JobId, progress_json: &str) -> Result<()> {
         let keys = self.keys(queue);
         let mut conn = self.conn().await?;
         let _: () = conn
@@ -1002,9 +1012,11 @@ where
 {
     use redis::AsyncCommands;
     let v: Vec<String> = if range.descending {
-        conn.zrevrange(key, range.start as isize, range.end as isize).await?
+        conn.zrevrange(key, range.start as isize, range.end as isize)
+            .await?
     } else {
-        conn.zrange(key, range.start as isize, range.end as isize).await?
+        conn.zrange(key, range.start as isize, range.end as isize)
+            .await?
     };
     Ok(v)
 }
@@ -1114,7 +1126,7 @@ fn parse_fetched(reply: redis::Value, token: &str) -> Result<Option<Fetched>> {
         other => {
             return Err(Error::Config(format!(
                 "moveToActive: unexpected reply shape: {other:?}"
-            )))
+            )));
         }
     };
     // Script shape: [ id, hashFieldsArray ]
@@ -1189,7 +1201,9 @@ fn parse_stream_entry(map: &std::collections::HashMap<String, redis::Value>) -> 
         }
     }
     let event = s(map, "event").unwrap_or_default();
-    let id = s(map, "jobId").map(JobId::new).unwrap_or_else(|| JobId::new(""));
+    let id = s(map, "jobId")
+        .map(JobId::new)
+        .unwrap_or_else(|| JobId::new(""));
     match event.as_str() {
         "added" => Event::Added {
             id,
@@ -1207,7 +1221,9 @@ fn parse_stream_entry(map: &std::collections::HashMap<String, redis::Value>) -> 
         "failed" => Event::Failed {
             id,
             reason: s(map, "failedReason").unwrap_or_default(),
-            attempts_made: s(map, "attemptsMade").and_then(|x| x.parse().ok()).unwrap_or(0),
+            attempts_made: s(map, "attemptsMade")
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(0),
         },
         "delayed" => Event::Delayed {
             id,

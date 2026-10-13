@@ -369,9 +369,10 @@ pub async fn producer(
             break;
         }
         if let Some(d) = cfg.duration
-            && started.elapsed() >= d {
-                break;
-            }
+            && started.elapsed() >= d
+        {
+            break;
+        }
         if cfg.bursty {
             // 2s on, 3s off: the idle gaps send workers into their blocking
             // wait, so the first job of every burst measures wake-up latency.

@@ -146,9 +146,7 @@ async fn warmup_preloads_scripts_on_every_pool_connection() {
     // `script` so we're robust to the exact format.
     let calls: u64 = raw
         .lines()
-        .filter(|l| {
-            l.starts_with("cmdstat_script:") || l.starts_with("cmdstat_script|load:")
-        })
+        .filter(|l| l.starts_with("cmdstat_script:") || l.starts_with("cmdstat_script|load:"))
         .filter_map(|l| {
             l.split_once(':')
                 .and_then(|(_, rest)| rest.split(',').next())

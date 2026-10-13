@@ -38,30 +38,15 @@ async fn worker_consumes_high_priority_first() {
     let (q, _be) = common::fresh_queue::<Task>("prio-order").await;
 
     // Submit in reverse order on purpose.
-    q.add(
-        Task {
-            label: "c".into(),
-        },
-        JobOptions::new().priority(30),
-    )
-    .await
-    .unwrap();
-    q.add(
-        Task {
-            label: "a".into(),
-        },
-        JobOptions::new().priority(10),
-    )
-    .await
-    .unwrap();
-    q.add(
-        Task {
-            label: "b".into(),
-        },
-        JobOptions::new().priority(20),
-    )
-    .await
-    .unwrap();
+    q.add(Task { label: "c".into() }, JobOptions::new().priority(30))
+        .await
+        .unwrap();
+    q.add(Task { label: "a".into() }, JobOptions::new().priority(10))
+        .await
+        .unwrap();
+    q.add(Task { label: "b".into() }, JobOptions::new().priority(20))
+        .await
+        .unwrap();
 
     let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let seen_c = seen.clone();

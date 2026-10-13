@@ -2,8 +2,8 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use oxn::job::Backoff;
@@ -75,11 +75,9 @@ async fn exhausted_attempts_put_job_in_failed_set() {
 
     q.add(
         T,
-        JobOptions::new()
-            .attempts(2)
-            .backoff(Backoff::Fixed {
-                delay: Duration::from_millis(50),
-            }),
+        JobOptions::new().attempts(2).backoff(Backoff::Fixed {
+            delay: Duration::from_millis(50),
+        }),
     )
     .await
     .unwrap();
@@ -99,7 +97,11 @@ async fn exhausted_attempts_put_job_in_failed_set() {
         async move { q.counts().await.map(|c| c.failed == 1).unwrap_or(false) }
     })
     .await;
-    assert!(ok, "job never landed in failed set: {:?}", q.counts().await.unwrap());
+    assert!(
+        ok,
+        "job never landed in failed set: {:?}",
+        q.counts().await.unwrap()
+    );
 
     cancel.cancel();
     handle.await.unwrap().unwrap();

@@ -23,7 +23,7 @@ use axum::{Json, Router};
 
 use crate::backend::Backend;
 use crate::dashboard::api::{self, CleanBody, ListQuery, LogsQuery};
-use crate::dashboard::{DashboardState, DASHBOARD_HTML};
+use crate::dashboard::{DASHBOARD_HTML, DashboardState};
 use crate::error::Error;
 use crate::job::JobId;
 

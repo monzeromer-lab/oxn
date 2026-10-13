@@ -3,8 +3,8 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use oxn::backend::Backend;
@@ -23,7 +23,12 @@ async fn scan_stalled_requeues_jobs_with_expired_locks() {
 
     let token = "ghost-worker-1:0".to_string();
     let fetched = backend
-        .fetch_next(q.name(), &token, Duration::from_millis(300), Duration::from_millis(100))
+        .fetch_next(
+            q.name(),
+            &token,
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+        )
         .await
         .unwrap();
     assert!(fetched.is_some(), "fetch_next should succeed");
@@ -47,7 +52,12 @@ async fn stalled_scanner_is_rate_limited() {
     q.add(T, JobOptions::new()).await.unwrap();
     let token = "t".to_string();
     backend
-        .fetch_next(q.name(), &token, Duration::from_millis(200), Duration::from_millis(100))
+        .fetch_next(
+            q.name(),
+            &token,
+            Duration::from_millis(200),
+            Duration::from_millis(100),
+        )
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -76,7 +86,12 @@ async fn worker_recovers_stalled_job_automatically() {
     // result.
     let token = "dead-1:0".to_string();
     backend
-        .fetch_next(q.name(), &token, Duration::from_millis(200), Duration::from_millis(100))
+        .fetch_next(
+            q.name(),
+            &token,
+            Duration::from_millis(200),
+            Duration::from_millis(100),
+        )
         .await
         .unwrap();
 
