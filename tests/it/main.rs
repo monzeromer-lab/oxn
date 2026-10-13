@@ -38,3 +38,4 @@ mod script_preload;
 mod shutdown;
 mod stalled;
 mod stalled_lifecycle;
+mod state_machine;

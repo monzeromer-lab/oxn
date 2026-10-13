@@ -111,17 +111,20 @@ pub struct StateCounts {
     pub failed: u64,
 }
 
-/// A half-open range into one of the job state lists/zsets.
+/// A range into one of the job state lists/zsets.
 ///
-/// Follows Redis `LRANGE`/`ZRANGE` semantics: `start` and `end` are
-/// inclusive, and `-1` means "the last element".
+/// `start` and `end` are inclusive positions, `-1` meaning the last one.
+/// Positions count in **ascending** order unless `descending` is set:
+/// for `wait` / `paused` / `active` that is processing order (next job to
+/// run first); for zsets it is ascending score (next due / highest
+/// priority / oldest finished first).
 #[derive(Debug, Clone, Copy)]
 pub struct JobRange {
     /// Zero-based start index (inclusive).
     pub start: i64,
     /// End index (inclusive). Use `-1` for "to the end".
     pub end: i64,
-    /// If true, iterate newest-first; else oldest-first.
+    /// Iterate newest-first instead of ascending order.
     pub descending: bool,
 }
 
@@ -220,6 +223,12 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
         retry_at_ms: Option<i64>,
         removal: crate::options::Removal,
     ) -> Result<()>;
+
+    /// Postpone an active job until `until_ms` without counting it as a
+    /// failure: the attempt is refunded and no `failedReason` is recorded.
+    /// Backs `Error::Delayed` / `Error::RateLimited` from handlers. Same
+    /// lock errors as [`Self::complete`].
+    async fn delay(&self, queue: &str, id: &JobId, token: &str, until_ms: i64) -> Result<()>;
 
     /// Hand an active job back without recording an outcome: drop the lock,
     /// refund the attempt the fetch counted, and put the job back at the

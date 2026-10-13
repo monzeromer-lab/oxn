@@ -12,6 +12,8 @@
 -- ARGV[3] retry_at (ms)
 -- ARGV[4] reason
 -- ARGV[5] max stream len
+-- ARGV[6] postpone (1 = Error::Delayed / RateLimited: refund the attempt
+--         and record no failure; 0 = retry backoff after a real failure)
 --
 -- Returns 1, or -2 (lock missing) / -6 (lock held by another token).
 
@@ -27,6 +29,7 @@ local token    = ARGV[2]
 local retryAt  = tonumber(ARGV[3])
 local reason   = ARGV[4]
 local maxStream = tonumber(ARGV[5])
+local postpone = ARGV[6] == '1'
 
 -- verify lock
 local held = redis.call('GET', lockKey)
@@ -36,7 +39,12 @@ if held ~= token then return -6 end
 redis.call('LREM', activeKey, 1, id)
 redis.call('DEL', lockKey)
 redis.call('HDEL', hashKey, 'lockToken', 'processedOn')
-if reason and reason ~= '' then
+if postpone then
+  -- not a failure: the handler asked to run later
+  if tonumber(redis.call('HGET', hashKey, 'attemptsMade') or '0') > 0 then
+    redis.call('HINCRBY', hashKey, 'attemptsMade', -1)
+  end
+elseif reason and reason ~= '' then
   redis.call('HSET', hashKey, 'failedReason', reason)
 end
 redis.call('ZADD', delayedKey, retryAt, id)
@@ -45,6 +53,6 @@ redis.call('ZADD', delayedKey, retryAt, id)
 oxnWake(markerKey)
 
 redis.call('XADD', eventsKey, 'MAXLEN', '~', maxStream, '*',
-  'event', 'delayed', 'jobId', id, 'delay', retryAt)
+  'event', 'delayed', 'jobId', id, 'delay', retryAt, 'postponed', postpone and '1' or '0')
 
 return 1

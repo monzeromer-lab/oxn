@@ -16,6 +16,7 @@
 -- KEYS[7] meta
 -- KEYS[8] marker
 -- KEYS[9] job-hash prefix (trailing ':')
+-- KEYS[10] priority counter
 --
 -- ARGV[1] worker token
 -- ARGV[2] lock duration (ms)
@@ -43,11 +44,16 @@ if redis.call('HGET', metaKey, 'paused') == '1' then
 end
 
 -- promote any delayed jobs whose score <= now
+-- (through oxnPushReady: a prioritized job stays prioritized)
 local due = redis.call('ZRANGEBYSCORE', delayedKey, 0, nowMs, 'LIMIT', 0, 50)
 if #due > 0 then
+  local ready = {
+    wait = waitKey, paused = pausedKey, prio = prioKey, pc = KEYS[10],
+    meta = metaKey, marker = markerKey,
+  }
   for i = 1, #due do
     redis.call('ZREM', delayedKey, due[i])
-    redis.call('LPUSH', waitKey, due[i])
+    oxnPushReady(ready, due[i], hashPrefix .. due[i], false)
   end
 end
 

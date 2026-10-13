@@ -5,6 +5,10 @@
 -- KEYS[3] job hash
 -- KEYS[4] events
 -- KEYS[5] marker
+-- KEYS[6] paused
+-- KEYS[7] prioritized
+-- KEYS[8] priority counter
+-- KEYS[9] meta
 -- ARGV[1] id
 -- ARGV[2] max stream len
 
@@ -24,9 +28,9 @@ if not score then return -3 end
 redis.call('ZREM', failedKey, id)
 redis.call('HDEL', hashKey, 'failedReason', 'finishedOn', 'stacktrace')
 redis.call('HSET', hashKey, 'attemptsMade', '0')
-redis.call('LPUSH', waitKey, id)
-oxnWake(markerKey)
-
-redis.call('XADD', eventsKey, 'MAXLEN', '~', maxStream, '*',
-  'event', 'waiting', 'jobId', id)
+local landed = oxnPushReady({
+  wait = waitKey, paused = KEYS[6], prio = KEYS[7], pc = KEYS[8],
+  meta = KEYS[9], marker = markerKey,
+}, id, hashKey, false)
+oxnEmit(eventsKey, maxStream, 'event', 'waiting', 'jobId', id, 'prev', 'failed', 'landed', landed)
 return 1

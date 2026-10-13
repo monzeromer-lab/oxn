@@ -255,6 +255,11 @@ where
     }
 
     /// List jobs in a specific state. `range.end = -1` means "to the end".
+    ///
+    /// Ascending ranges are in processing order for `Waiting` / `Paused` /
+    /// `Active` (next job to run first) and ascending score for the zsets
+    /// (next due, highest priority, oldest finished first); set
+    /// `descending` for newest-first.
     pub async fn list(&self, state: JobState, range: JobRange) -> Result<Vec<Job<D>>> {
         let raw = self.backend.list(&self.name, state, range).await?;
         raw.into_iter().map(decode_job).collect()

@@ -430,6 +430,7 @@ impl RedisBackend {
             .key(keys.meta())
             .key(keys.marker())
             .key(keys.job_hash_prefix())
+            .key(keys.priority_counter())
             .arg(worker_token)
             .arg(lock_duration.as_millis() as i64)
             .arg(now_ms())
@@ -629,6 +630,27 @@ impl Backend for RedisBackend {
         }
     }
 
+    async fn delay(&self, queue: &str, id: &JobId, token: &str, until_ms: i64) -> Result<()> {
+        let keys = self.keys(queue);
+        let mut inv = self.scripts.move_to_delayed.prepare_invoke();
+        inv.key(keys.active())
+            .key(keys.delayed())
+            .key(keys.job_hash(id.as_str()))
+            .key(keys.job_lock(id.as_str()))
+            .key(keys.events())
+            .key(keys.marker())
+            .arg(id.as_str())
+            .arg(token)
+            .arg(until_ms)
+            .arg("")
+            .arg(self.max_stream_length as i64)
+            .arg(1);
+        let mut conn = self.conn().await?;
+        self.eval(&mut conn, "move_to_delayed", queue, Some(id.as_str()), &inv)
+            .await?;
+        Ok(())
+    }
+
     async fn release(&self, queue: &str, id: &JobId, token: &str) -> Result<()> {
         let keys = self.keys(queue);
         let mut inv = self.scripts.release.prepare_invoke();
@@ -712,7 +734,8 @@ impl Backend for RedisBackend {
                 .arg(token)
                 .arg(ts)
                 .arg(reason)
-                .arg(self.max_stream_length as i64);
+                .arg(self.max_stream_length as i64)
+                .arg(0);
             self.eval(&mut conn, "move_to_delayed", queue, Some(id.as_str()), &inv)
                 .await?;
             return Ok(());
@@ -888,6 +911,10 @@ impl Backend for RedisBackend {
             .key(keys.events())
             .key(keys.marker())
             .key(keys.job_hash(id.as_str()))
+            .key(keys.paused())
+            .key(keys.prioritized())
+            .key(keys.priority_counter())
+            .key(keys.meta())
             .arg(id.as_str())
             .arg(self.max_stream_length as i64);
         let mut conn = self.conn().await?;
@@ -905,13 +932,23 @@ impl Backend for RedisBackend {
             .key(keys.marker())
             .key(keys.meta())
             .key(keys.paused())
+            .key(keys.prioritized())
+            .key(keys.priority_counter())
+            .key(keys.job_hash_prefix())
             .arg(self.max_stream_length as i64);
-        let mut conn = self.conn().await?;
-        let reply = self
-            .eval(&mut conn, "promote_all", queue, None, &inv)
-            .await?;
-        let moved: i64 = redis::from_redis_value(&reply)?;
-        Ok(moved.max(0) as u64)
+        // One batch per script call so a huge delayed set never blocks Redis.
+        let mut total = 0u64;
+        loop {
+            let mut conn = self.conn().await?;
+            let reply = self
+                .eval(&mut conn, "promote_all", queue, None, &inv)
+                .await?;
+            let n: u64 = redis::from_redis_value(&reply)?;
+            total += n;
+            if n < SCRIPT_BATCH {
+                return Ok(total);
+            }
+        }
     }
 
     async fn clean(&self, queue: &str, state: JobState, limit: u64) -> Result<u64> {
@@ -972,6 +1009,10 @@ impl Backend for RedisBackend {
             .key(keys.job_hash(id.as_str()))
             .key(keys.events())
             .key(keys.marker())
+            .key(keys.paused())
+            .key(keys.prioritized())
+            .key(keys.priority_counter())
+            .key(keys.meta())
             .arg(id.as_str())
             .arg(self.max_stream_length as i64);
         let mut conn = self.conn().await?;
@@ -1054,32 +1095,32 @@ impl Backend for RedisBackend {
     async fn list(&self, queue: &str, state: JobState, range: JobRange) -> Result<Vec<RawJob>> {
         let keys = self.keys(queue);
         let mut conn = self.conn().await?;
-        let start = range.start as isize;
-        let end = range.end as isize;
         let ids: Vec<String> = match state {
-            JobState::Waiting => {
-                if range.descending {
-                    let n: isize = conn.llen(keys.wait()).await?;
-                    let s = (n - end - 1).max(0);
-                    let e = n - start - 1;
-                    conn.lrange(keys.wait(), s, e).await?
-                } else {
-                    conn.lrange(keys.wait(), start, end).await?
-                }
-            }
-            JobState::Paused => conn.lrange(keys.paused(), start, end).await?,
-            JobState::Active => conn.lrange(keys.active(), start, end).await?,
+            JobState::Waiting => list_ids(&mut *conn, keys.wait(), range).await?,
+            JobState::Paused => list_ids(&mut *conn, keys.paused(), range).await?,
+            JobState::Active => list_ids(&mut *conn, keys.active(), range).await?,
             JobState::Delayed => zrange(&mut *conn, keys.delayed(), range).await?,
             JobState::Prioritized => zrange(&mut *conn, keys.prioritized(), range).await?,
             JobState::WaitingChildren => zrange(&mut *conn, keys.waiting_children(), range).await?,
             JobState::Completed => zrange(&mut *conn, keys.completed(), range).await?,
             JobState::Failed => zrange(&mut *conn, keys.failed(), range).await?,
         };
-        drop(conn);
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One pipelined round trip for every hash. The state is the
+        // container we listed; no per-job lookup needed.
+        let mut pipe = redis::pipe();
+        for id in &ids {
+            pipe.hgetall(keys.job_hash(id));
+        }
+        let maps: Vec<std::collections::HashMap<String, String>> =
+            pipe.query_async(&mut *conn).await?;
         let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(raw) = self.get(queue, &JobId::new(id)).await? {
-                out.push(raw);
+        for (id, map) in ids.into_iter().zip(maps) {
+            // A job can finish between reading the container and its hash.
+            if !map.is_empty() {
+                out.push(hash_to_raw(JobId::new(id), map, Some(state))?);
             }
         }
         Ok(out)
@@ -1222,61 +1263,71 @@ async fn find_state<C>(conn: &mut C, keys: &KeyBuilder, id: &JobId) -> Result<Op
 where
     C: redis::aio::ConnectionLike + Send,
 {
+    // Every container in one round trip; the first non-nil reply wins.
+    const ORDER: [JobState; 8] = [
+        JobState::Waiting,
+        JobState::Paused,
+        JobState::Active,
+        JobState::Delayed,
+        JobState::Prioritized,
+        JobState::WaitingChildren,
+        JobState::Completed,
+        JobState::Failed,
+    ];
+    let id = id.as_str();
+    let replies: Vec<redis::Value> = redis::pipe()
+        .cmd("LPOS")
+        .arg(keys.wait())
+        .arg(id)
+        .cmd("LPOS")
+        .arg(keys.paused())
+        .arg(id)
+        .cmd("LPOS")
+        .arg(keys.active())
+        .arg(id)
+        .zscore(keys.delayed(), id)
+        .zscore(keys.prioritized(), id)
+        .zscore(keys.waiting_children(), id)
+        .zscore(keys.completed(), id)
+        .zscore(keys.failed(), id)
+        .query_async(conn)
+        .await?;
+    Ok(ORDER
+        .into_iter()
+        .zip(replies)
+        .find_map(|(state, v)| (!matches!(v, redis::Value::Nil)).then_some(state)))
+}
+
+/// Ids from a list-backed container in **processing order**: jobs are
+/// pushed on the left and popped from the right, so "first" (ascending)
+/// means rightmost — the next job to run — and descending means newest.
+async fn list_ids<C>(conn: &mut C, key: String, range: JobRange) -> Result<Vec<String>>
+where
+    C: redis::aio::ConnectionLike + Send,
+{
     use redis::AsyncCommands;
-    macro_rules! lmember {
-        ($k:expr) => {{
-            let v: i64 = conn
-                .lpos::<_, _, Option<i64>>($k, id.as_str(), redis::LposOptions::default())
-                .await?
-                .unwrap_or(-1);
-            v >= 0
-        }};
+    if range.descending {
+        return Ok(conn
+            .lrange(key, range.start as isize, range.end as isize)
+            .await?);
     }
-    if lmember!(keys.wait()) {
-        return Ok(Some(JobState::Waiting));
+    let len: i64 = conn.llen(&key).await?;
+    let (start, end) = (
+        range.start.max(0),
+        if range.end < 0 {
+            len + range.end
+        } else {
+            range.end.min(len - 1)
+        },
+    );
+    if len == 0 || start > end {
+        return Ok(Vec::new());
     }
-    if lmember!(keys.paused()) {
-        return Ok(Some(JobState::Paused));
-    }
-    if lmember!(keys.active()) {
-        return Ok(Some(JobState::Active));
-    }
-    if conn
-        .zscore::<_, _, Option<f64>>(keys.delayed(), id.as_str())
-        .await?
-        .is_some()
-    {
-        return Ok(Some(JobState::Delayed));
-    }
-    if conn
-        .zscore::<_, _, Option<f64>>(keys.prioritized(), id.as_str())
-        .await?
-        .is_some()
-    {
-        return Ok(Some(JobState::Prioritized));
-    }
-    if conn
-        .zscore::<_, _, Option<f64>>(keys.waiting_children(), id.as_str())
-        .await?
-        .is_some()
-    {
-        return Ok(Some(JobState::WaitingChildren));
-    }
-    if conn
-        .zscore::<_, _, Option<f64>>(keys.completed(), id.as_str())
-        .await?
-        .is_some()
-    {
-        return Ok(Some(JobState::Completed));
-    }
-    if conn
-        .zscore::<_, _, Option<f64>>(keys.failed(), id.as_str())
-        .await?
-        .is_some()
-    {
-        return Ok(Some(JobState::Failed));
-    }
-    Ok(None)
+    let mut ids: Vec<String> = conn
+        .lrange(key, (len - 1 - end) as isize, (len - 1 - start) as isize)
+        .await?;
+    ids.reverse();
+    Ok(ids)
 }
 
 fn hash_to_raw(

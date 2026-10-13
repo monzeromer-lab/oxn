@@ -5,6 +5,10 @@
 -- KEYS[3] events
 -- KEYS[4] marker
 -- KEYS[5] job hash
+-- KEYS[6] paused
+-- KEYS[7] prioritized
+-- KEYS[8] priority counter
+-- KEYS[9] meta
 -- ARGV[1] id
 -- ARGV[2] max stream len
 
@@ -22,9 +26,10 @@ if redis.call('EXISTS', hashKey) == 0 then return -1 end
 local score = redis.call('ZSCORE', delayedKey, id)
 if not score then return -3 end
 redis.call('ZREM', delayedKey, id)
-redis.call('LPUSH', waitKey, id)
-oxnWake(markerKey)
-
-redis.call('XADD', eventsKey, 'MAXLEN', '~', maxStream, '*',
-  'event', 'waiting', 'jobId', id)
+-- priority and pause respected, like every other path into ready
+local landed = oxnPushReady({
+  wait = waitKey, paused = KEYS[6], prio = KEYS[7], pc = KEYS[8],
+  meta = KEYS[9], marker = markerKey,
+}, id, hashKey, false)
+oxnEmit(eventsKey, maxStream, 'event', 'waiting', 'jobId', id, 'prev', 'delayed', 'landed', landed)
 return 1

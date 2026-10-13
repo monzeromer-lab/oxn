@@ -58,6 +58,7 @@ pub enum DoneKind {
     Ok,
     Err,
     Fatal,
+    Postponed,
 }
 
 impl WEvent {
@@ -86,6 +87,7 @@ impl WEvent {
                     DoneKind::Ok => 'o',
                     DoneKind::Err => 'e',
                     DoneKind::Fatal => 'f',
+                    DoneKind::Postponed => 'p',
                 };
                 format!("D {seq} {k} {attempt} {worker} {at_us} {run_us} {due_us}")
             }
@@ -110,6 +112,7 @@ impl WEvent {
                     "o" => DoneKind::Ok,
                     "e" => DoneKind::Err,
                     "f" => DoneKind::Fatal,
+                    "p" => DoneKind::Postponed,
                     _ => return None,
                 };
                 Some(WEvent::Done {
@@ -166,6 +169,10 @@ pub fn apply(ledger: &Ledger, stats: &Stats, ev: WEvent) {
                 DoneKind::Fatal => {
                     stats.fatal.fetch_add(1, Ordering::Relaxed);
                     Mark::Fatal { worker, attempt }
+                }
+                DoneKind::Postponed => {
+                    stats.postponed.fetch_add(1, Ordering::Relaxed);
+                    Mark::Postponed { worker, attempt }
                 }
             };
             ledger.finish(seq, mark, at_us);
@@ -247,7 +254,11 @@ pub fn build_worker(
             if d.work_us > 0 {
                 tokio::time::sleep(Duration::from_micros(d.work_us)).await;
             }
-            let kind = if d.fatal {
+            // Postpone on the first pickup only: once the postponement has
+            // elapsed the job is past its window and runs normally.
+            let kind = if d.postpone_ms > 0 && start < due_us + d.postpone_ms * 1000 {
+                DoneKind::Postponed
+            } else if d.fatal {
                 DoneKind::Fatal
             } else if attempt <= d.fail_attempts {
                 DoneKind::Err
@@ -268,6 +279,9 @@ pub fn build_worker(
                 DoneKind::Ok => Ok(d.seq),
                 DoneKind::Err => Err(Error::handler(Transient(attempt))),
                 DoneKind::Fatal => Err(Error::unrecoverable("planned fatal failure")),
+                DoneKind::Postponed => Err(Error::Delayed {
+                    delay_ms: d.postpone_ms,
+                }),
             }
         }
     })
@@ -352,6 +366,11 @@ pub fn plan(cfg: &Config, seq: u64, seed: u64) -> (LoadJob, JobOptions) {
         0
     };
     let fatal = rng.gen_bool(cfg.fatal_rate.clamp(0.0, 1.0));
+    let postpone_ms = if rng.gen_bool(cfg.postpone_rate.clamp(0.0, 1.0)) {
+        rng.gen_range(50..=300)
+    } else {
+        0
+    };
     let delay_ms = if rng.gen_bool(cfg.delay_rate.clamp(0.0, 1.0)) {
         rng.gen_range(100..=2000)
     } else {
@@ -383,6 +402,7 @@ pub fn plan(cfg: &Config, seq: u64, seed: u64) -> (LoadJob, JobOptions) {
         fail_attempts,
         fatal,
         work_us,
+        postpone_ms,
     };
     let mut opts = if cfg.options_at_queue {
         JobOptions::new()

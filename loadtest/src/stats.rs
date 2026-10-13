@@ -99,6 +99,7 @@ pub struct Stats {
     pub ok: AtomicU64,
     pub err: AtomicU64,
     pub fatal: AtomicU64,
+    pub postponed: AtomicU64,
     /// First-attempt pickup: start − max(enqueue, due time).
     pub pickup: Hist,
     /// Handler runtime per attempt.

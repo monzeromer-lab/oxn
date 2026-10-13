@@ -430,35 +430,13 @@ async fn process_one_inner<D, R>(
                 .await;
             log_transition("completed", &r);
         }
-        Err(Error::Delayed { delay_ms }) => {
-            let retry_at = chrono_like_now_ms() + delay_ms as i64;
-            span.record("transition", "delayed");
-            let r = backend
-                .fail(
-                    &queue,
-                    &id,
-                    &token,
-                    "delayed by handler",
-                    Some(retry_at),
-                    remove_on_fail,
-                )
-                .await;
-            log_transition("delayed", &r);
-        }
-        Err(Error::RateLimited { delay_ms }) => {
-            let retry_at = chrono_like_now_ms() + delay_ms as i64;
-            span.record("transition", "delayed");
-            let r = backend
-                .fail(
-                    &queue,
-                    &id,
-                    &token,
-                    "rate limited",
-                    Some(retry_at),
-                    remove_on_fail,
-                )
-                .await;
-            log_transition("delayed", &r);
+        // Postponements, not failures: the attempt is refunded and no
+        // failedReason is recorded.
+        Err(Error::Delayed { delay_ms }) | Err(Error::RateLimited { delay_ms }) => {
+            let until = chrono_like_now_ms() + delay_ms as i64;
+            span.record("transition", "postponed");
+            let r = backend.delay(&queue, &id, &token, until).await;
+            log_transition("postponed", &r);
         }
         Err(Error::Unrecoverable(msg)) => {
             span.record("transition", "failed");

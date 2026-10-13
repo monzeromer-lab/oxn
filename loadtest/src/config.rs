@@ -94,6 +94,10 @@ pub struct RunArgs {
     /// Attempts per job.
     #[arg(long)]
     pub attempts: Option<u32>,
+    /// Fraction of jobs whose first pickup returns `Error::Delayed`
+    /// (50–300ms) — a postponement that must not cost an attempt.
+    #[arg(long)]
+    pub postpone_rate: Option<f64>,
     /// Fraction of jobs added with a delay (0–2s).
     #[arg(long)]
     pub delay_rate: Option<f64>,
@@ -171,6 +175,7 @@ pub struct Config {
     pub work_us: u64,
     pub fail_rate: f64,
     pub fatal_rate: f64,
+    pub postpone_rate: f64,
     pub attempts: u32,
     pub delay_rate: f64,
     pub priority_rate: f64,
@@ -231,6 +236,7 @@ impl Config {
             work_us: 200,
             fail_rate: 0.05,
             fatal_rate: 0.01,
+            postpone_rate: 0.0,
             attempts: 3,
             delay_rate: 0.05,
             priority_rate: 0.1,
@@ -355,6 +361,7 @@ impl Config {
             work_us,
             fail_rate,
             fatal_rate,
+            postpone_rate,
             attempts,
             delay_rate,
             priority_rate,

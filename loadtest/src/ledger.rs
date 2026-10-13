@@ -29,6 +29,10 @@ pub struct LoadJob {
     pub fatal: bool,
     /// Simulated work.
     pub work_us: u64,
+    /// If > 0, the first pickup returns `Error::Delayed` for this long — a
+    /// postponement that must not cost an attempt.
+    #[serde(default)]
+    pub postpone_ms: u64,
 }
 
 /// Terminal state the plan predicts.
@@ -70,6 +74,8 @@ pub enum Mark {
     Err { worker: u32, attempt: u32 },
     /// Handler returned `Unrecoverable`.
     Fatal { worker: u32, attempt: u32 },
+    /// Handler returned `Error::Delayed` (planned postponement).
+    Postponed { worker: u32, attempt: u32 },
     /// Server emitted `stalled`.
     Stalled,
     /// Server emitted `failed`.
@@ -101,6 +107,8 @@ pub struct Entry {
     pub errs: u32,
     /// Fatal returns.
     pub fatals: u32,
+    /// Planned postponements (`Error::Delayed`) returned.
+    pub postpones: u32,
     /// Server `stalled` events.
     pub stalls: u32,
     /// Releases by shutting-down workers.
@@ -206,6 +214,7 @@ impl Ledger {
                     e.max_err_attempt = e.max_err_attempt.max(attempt);
                 }
                 Mark::Fatal { .. } => e.fatals += 1,
+                Mark::Postponed { .. } => e.postpones += 1,
                 _ => {}
             }
             e.mark(cap, at_us, mark);
@@ -332,7 +341,7 @@ impl Ledger {
                 // Attempt numbers are assigned by the server at fetch time, so
                 // a gap (attempt 3 seen, only 2 handler runs) is an attempt a
                 // worker took and died with before its handler even started.
-                let finished = e.oks + e.errs + e.fatals;
+                let finished = e.oks + e.errs + e.fatals + e.postpones;
                 let interrupted = e.starts.max(e.max_attempt).saturating_sub(finished);
                 if interrupted == 0 {
                     match exp {
@@ -347,7 +356,10 @@ impl Ledger {
                                 );
                             }
                             // Duplicate successes are judged above.
-                            let allowed = starts + (e.oks.saturating_sub(1)) + allow_extra_starts;
+                            let allowed = starts
+                                + e.postpones
+                                + (e.oks.saturating_sub(1))
+                                + allow_extra_starts;
                             if e.starts > allowed {
                                 push(
                                     Anomaly::ExtraStarts,
@@ -415,12 +427,13 @@ impl Ledger {
                     }
                 }
                 // A fatal job may only run again if a stall took it back.
-                if job.fatal && e.starts > 1 + e.stalls + allow_extra_starts {
+                if job.fatal && e.starts > 1 + e.stalls + e.postpones + allow_extra_starts {
                     push(
                         Anomaly::FatalRetried,
                         format!("unrecoverable job started {} times", e.starts),
                     );
                 }
+                v.postponements += e.postpones as u64;
                 if job.delay_ms > 0
                     && let Some(first) = e.first_start_us
                 {
@@ -488,6 +501,8 @@ pub struct Verdict {
     pub interrupted_attempts: u64,
     /// Jobs failed for exceeding max_stalled.
     pub stall_failures: u64,
+    /// Planned `Error::Delayed` postponements returned by handlers.
+    pub postponements: u64,
     /// Handler successes never recorded because the job's lock lapsed
     /// first (worker killed / too slow); the job's fate went to the
     /// stalled scanner instead.
@@ -520,6 +535,7 @@ mod tests {
             fail_attempts: fail,
             fatal,
             work_us: 0,
+            postpone_ms: 0,
         }
     }
 
@@ -741,6 +757,69 @@ mod tests {
             (v.completed_jobs, v.failed_jobs, v.discarded_outcomes),
             (0, 1, 1)
         );
+    }
+
+    #[test]
+    fn a_postponement_is_neither_an_attempt_nor_a_failure() {
+        // fail twice, succeed on the 3rd of 3 attempts, after one postponement
+        let l = Ledger::new(24);
+        l.added(job(1, 2, false), "1".into(), 0);
+        l.start(1, 1, 0, 1);
+        l.finish(
+            1,
+            Mark::Postponed {
+                worker: 0,
+                attempt: 1,
+            },
+            2,
+        );
+        for a in 1..=2 {
+            l.start(1, a, 0, 10 + a as u64);
+            l.finish(
+                1,
+                Mark::Err {
+                    worker: 0,
+                    attempt: a,
+                },
+                11 + a as u64,
+            );
+        }
+        l.start(1, 3, 0, 20);
+        l.finish(
+            1,
+            Mark::Ok {
+                worker: 0,
+                attempt: 3,
+            },
+            21,
+        );
+        let v = l.verify(3, 0);
+        assert!(v.ok(), "{:?}", v.counts);
+        assert_eq!(v.postponements, 1);
+
+        // A fatal job postponed first starts twice; that is not a retry.
+        let l = Ledger::new(24);
+        l.added(job(2, 0, true), "2".into(), 0);
+        l.start(2, 1, 0, 1);
+        l.finish(
+            2,
+            Mark::Postponed {
+                worker: 0,
+                attempt: 1,
+            },
+            2,
+        );
+        l.start(2, 1, 0, 3);
+        l.finish(
+            2,
+            Mark::Fatal {
+                worker: 0,
+                attempt: 1,
+            },
+            4,
+        );
+        let v = l.verify(3, 0);
+        assert!(v.ok(), "{:?}", v.counts);
     }
 
     #[test]

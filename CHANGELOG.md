@@ -67,7 +67,8 @@ It contains breaking changes; see the migration notes below.
   `&CancellationToken` and must honor it only while *waiting* (B4); new
   required method `release(queue, id, token)` hands an active job back
   without an outcome (B4); `subscribe` takes a `StreamStart` and returns
-  `EventRecord`s (B8).
+  `EventRecord`s (B8); new required `delay(queue, id, token, until_ms)`
+  for postponements (B9).
 - Dashboard (axum and actix) maps `NotFound` → **404** and state/lock
   conflicts → **409**, with `{"error": "..."}` bodies, instead of `204`.
 - New `Error::is_conflict()` and `Error::is_lock_lost()` helpers.
@@ -104,6 +105,24 @@ It contains breaking changes; see the migration notes below.
   immediately and its pool slot is detached instead of being returned with
   a block still pending; the stalled scanner is joined before `run()`
   returns.
+- **Priority and pause survive every path back to ready (B9).** Delayed
+  jobs coming due (including retry backoffs), `promote`, `promote_all` and
+  `retry` pushed jobs straight onto `wait`: a prioritized job lost its
+  priority and a paused queue received work. They now all go through the
+  same Lua helper as release and stall recovery. `promote_all` works in
+  batches of 1,000.
+- **`Error::Delayed` / `Error::RateLimited` are postponements (B9).** They
+  consumed one of the job's attempts and stamped `failedReason = "delayed
+  by handler"`; a job that postponed itself once lost a real retry. New
+  `Backend::delay` refunds the attempt and records no failure; the
+  `delayed` event carries `postponed=1`.
+- **`list()` order and cost (B9).** List-backed states (`wait`, `paused`,
+  `active`) came back newest-first while documented oldest-first;
+  ascending now means processing order (next to run first, LIFO jobs
+  included). `list()` used to re-derive each job's state with up to eight
+  commands per job; it now pipelines one `HGETALL` per job and takes the
+  state from the container it listed. `get()` finds the state in one
+  pipelined round trip.
 - **The event stream loses nothing (B8).** `QueueEvents::stream()` read
   from `$` lazily on the first poll, so everything emitted between
   `stream()` and that poll was lost (the 0.2 probe saw 0 of 40 events);
