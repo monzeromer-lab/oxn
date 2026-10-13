@@ -7,7 +7,6 @@
 
 mod common;
 
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use oxn::backend::redis::{RedisBackend, RedisConfig};
@@ -20,11 +19,11 @@ struct Dummy;
 // `SCRIPT FLUSH` and `CONFIG RESETSTAT` are server-global. Tests that
 // touch them must not interleave or one will pull state out from under
 // the other.
-static SCRIPT_CACHE_LOCK: Mutex<()> = Mutex::new(());
+static SCRIPT_CACHE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test(flavor = "multi_thread")]
 async fn connect_preloads_every_script_so_first_add_is_warm() {
-    let _guard = SCRIPT_CACHE_LOCK.lock().unwrap();
+    let _guard = SCRIPT_CACHE_LOCK.lock().await;
     // Wipe any previously-cached scripts so the test is hermetic.
     let mut admin = redis::Client::open(common::redis_url())
         .unwrap()
@@ -81,7 +80,7 @@ async fn connect_preloads_every_script_so_first_add_is_warm() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn warmup_is_idempotent_and_recovers_from_script_flush() {
-    let _guard = SCRIPT_CACHE_LOCK.lock().unwrap();
+    let _guard = SCRIPT_CACHE_LOCK.lock().await;
     let cfg = RedisConfig::new(common::redis_url()).prefix(common::TEST_PREFIX);
     let backend = RedisBackend::connect(cfg).await.unwrap();
 
@@ -111,7 +110,7 @@ async fn warmup_preloads_scripts_on_every_pool_connection() {
     // We verify here that warmup issues SCRIPT LOAD on `pool_size` distinct
     // connections by counting Redis's per-command call counter via
     // `INFO commandstats`.
-    let _guard = SCRIPT_CACHE_LOCK.lock().unwrap();
+    let _guard = SCRIPT_CACHE_LOCK.lock().await;
 
     let mut admin = redis::Client::open(common::redis_url())
         .unwrap()

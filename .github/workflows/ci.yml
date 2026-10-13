@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [master, "release/**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: fmt · clippy · docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - name: clippy (feature matrix)
+        run: |
+          cargo clippy -p oxn --lib --no-default-features -- -D warnings
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --workspace --all-targets --features dashboard-actix -- -D warnings
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo doc -p oxn --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p oxn --all-features
+
+  test:
+    name: unit · integration · doc tests
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7.4
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s
+          --health-timeout 2s --health-retries 15
+    env:
+      TEST_REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p oxn --lib --no-default-features
+      - run: cargo test --workspace --features "scheduler,flow,dashboard-axum"
+      - run: cargo test -p oxn --features dashboard-actix --lib
+      - name: Upload timeline reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-timelines
+          path: target/oxn-reports/
+          if-no-files-found: ignore
+
+  load-smoke:
+    name: load smoke (ledger + invariant gate)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7.4
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s
+          --health-timeout 2s --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p oxn-load --release
+      - name: smoke
+        run: target/release/oxn-load run --redis redis://127.0.0.1:6379 --scenario smoke
+      - name: Upload load reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-reports
+          path: target/oxn-reports/load/
+          if-no-files-found: ignore

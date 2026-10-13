@@ -155,6 +155,9 @@ pub type EventStream = Pin<Box<dyn Stream<Item = Result<Event>> + Send + 'static
 /// `Backend` instance is shared across a `Queue`, any number of `Worker`s
 /// and a `QueueEvents` via `Arc<dyn Backend>` — construct it once and clone
 /// the `Arc`.
+// `async_trait` marks the generated methods `#[must_use]` on top of the
+// boxed future they return, which newer clippy flags as double_must_use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Backend: Send + Sync + fmt::Debug + 'static {
     /// Submit a new job. Returns the assigned id.
