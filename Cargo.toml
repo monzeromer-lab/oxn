@@ -10,6 +10,9 @@ readme = "README.md"
 keywords = ["queue", "redis", "jobs", "async", "tokio"]
 categories = ["asynchronous", "database"]
 
+[workspace]
+members = [".", "testkit", "loadtest"]
+
 [features]
 default = ["redis-backend"]
 
@@ -123,6 +126,7 @@ futures = "0.3"
 tokio-util = "0.7"
 redis = { version = "0.27", default-features = false, features = ["tokio-comp"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+oxn-testkit = { path = "testkit" }
 
 [[example]]
 name = "basic"

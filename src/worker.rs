@@ -17,6 +17,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::backend::{Backend, Fetched};
@@ -187,10 +188,37 @@ where
                         id,
                         token_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     );
+                    let fetch_span = tracing::debug_span!(
+                        "oxn.fetch",
+                        queue = %queue,
+                        worker = %id,
+                        token = %token,
+                        job_id = tracing::field::Empty,
+                        outcome = tracing::field::Empty,
+                    );
                     let fetched = tokio::select! {
-                        _ = cancel.cancelled() => { drop(permit); break 'main; }
-                        r = backend.fetch_next(&queue, &token, opts.lock_duration, opts.drain_delay) => r,
+                        _ = cancel.cancelled() => {
+                            fetch_span.record("outcome", "cancelled");
+                            drop(permit);
+                            break 'main;
+                        }
+                        r = backend
+                            .fetch_next(&queue, &token, opts.lock_duration, opts.drain_delay)
+                            .instrument(fetch_span.clone()) => r,
                     };
+                    match &fetched {
+                        Ok(Some(f)) => {
+                            fetch_span.record("job_id", f.job.id.as_str());
+                            fetch_span.record("outcome", "job");
+                        }
+                        Ok(None) => {
+                            fetch_span.record("outcome", "idle");
+                        }
+                        Err(_) => {
+                            fetch_span.record("outcome", "error");
+                        }
+                    }
+                    drop(fetch_span);
                     match fetched {
                         Ok(Some(Fetched { job: raw, token })) => {
                             let backend = backend.clone();
@@ -217,7 +245,7 @@ where
                             drop(permit);
                         }
                         Err(e) => {
-                            tracing::warn!(queue = %queue, error = %e, "fetch_next failed");
+                            tracing::warn!(queue = %queue, worker = %id, error = %e, "fetch_next failed");
                             drop(permit);
                             tokio::time::sleep(Duration::from_millis(250)).await;
                         }
@@ -229,10 +257,21 @@ where
         // Graceful shutdown: wait for in-flight jobs up to the timeout by
         // blocking on the semaphore reaching full capacity again.
         let total = opts.concurrency;
+        let in_flight = total - semaphore.available_permits();
+        tracing::debug!(queue = %queue, worker = %id, in_flight, "oxn.shutdown: waiting for in-flight jobs");
+        let started = std::time::Instant::now();
         let drain = async {
             let _ = semaphore.acquire_many(total as u32).await;
         };
-        let _ = tokio::time::timeout(opts.shutdown_timeout, drain).await;
+        let drained = tokio::time::timeout(opts.shutdown_timeout, drain).await.is_ok();
+        tracing::debug!(
+            queue = %queue,
+            worker = %id,
+            drained,
+            still_running = total - semaphore.available_permits(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "oxn.shutdown: done"
+        );
         Ok(())
     }
 }
@@ -249,6 +288,38 @@ async fn process_one<D, R>(
     D: DeserializeOwned + Send + Sync + 'static,
     R: Serialize + Send + 'static,
 {
+    let span = tracing::debug_span!(
+        "oxn.process",
+        queue = %queue,
+        job_id = %raw.id,
+        attempt = raw.attempts_made,
+        attempts_total = raw.opts.attempts,
+        token = %token,
+        outcome = tracing::field::Empty,
+        transition = tracing::field::Empty,
+        elapsed_us = tracing::field::Empty,
+    );
+    let started = std::time::Instant::now();
+    process_one_inner(backend, queue, raw, token, handler, opts, cancel, span.clone())
+        .instrument(span.clone())
+        .await;
+    span.record("elapsed_us", started.elapsed().as_micros() as u64);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_one_inner<D, R>(
+    backend: Arc<dyn Backend>,
+    queue: String,
+    raw: crate::backend::RawJob,
+    token: String,
+    handler: HandlerFn<D, R>,
+    opts: WorkerOptions,
+    cancel: CancellationToken,
+    span: tracing::Span,
+) where
+    D: DeserializeOwned + Send + Sync + 'static,
+    R: Serialize + Send + 'static,
+{
     let id = raw.id.clone();
     let attempts_made = raw.attempts_made;
     let attempts_total = raw.opts.attempts;
@@ -261,7 +332,10 @@ async fn process_one<D, R>(
     let job: Job<D> = match decode_job::<D>(raw) {
         Ok(j) => j,
         Err(e) => {
-            let _ = backend
+            span.record("outcome", "decode-error");
+            span.record("transition", "failed");
+            tracing::warn!(error = %e, "payload decode failed");
+            let r = backend
                 .fail(
                     &queue,
                     &id,
@@ -271,6 +345,7 @@ async fn process_one<D, R>(
                     remove_on_fail,
                 )
                 .await;
+            log_transition("failed", &r);
             return;
         }
     };
@@ -279,35 +354,43 @@ async fn process_one<D, R>(
     renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     renew.tick().await; // consume the zero-tick
 
+    tracing::trace!("handler started");
     let mut handler_fut: BoxFuture<'static, Result<R>> = (handler)(job).boxed();
     let outcome: Result<R> = loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
+                tracing::debug!("cancellation observed while handler running");
                 break Err(Error::Closed);
             }
             _ = renew.tick() => {
-                if let Err(e) = backend.extend_lock(&queue, &id, &token, opts.lock_duration).await {
-                    tracing::warn!(job = %id, error = %e, "lock renew failed");
+                match backend.extend_lock(&queue, &id, &token, opts.lock_duration).await {
+                    Ok(()) => tracing::trace!("lock extended"),
+                    Err(e) => tracing::warn!(job = %id, error = %e, "lock renew failed"),
                 }
             }
             r = &mut handler_fut => break r,
         }
     };
+    span.record("outcome", outcome_label(&outcome));
+    tracing::debug!(outcome = outcome_label(&outcome), "handler finished");
 
     match outcome {
         Ok(ret) => {
             let json = serde_json::to_string(&ret).ok();
-            if let Err(e) = backend
+            span.record("transition", "completed");
+            let r = backend
                 .complete(&queue, &id, &token, json, remove_on_complete)
-                .await
-            {
+                .await;
+            log_transition("completed", &r);
+            if let Err(e) = r {
                 tracing::error!(job = %id, error = %e, "complete failed");
             }
         }
         Err(Error::Delayed { delay_ms }) => {
             let retry_at = chrono_like_now_ms() + delay_ms as i64;
-            if let Err(e) = backend
+            span.record("transition", "delayed");
+            let r = backend
                 .fail(
                     &queue,
                     &id,
@@ -316,14 +399,16 @@ async fn process_one<D, R>(
                     Some(retry_at),
                     remove_on_fail,
                 )
-                .await
-            {
+                .await;
+            log_transition("delayed", &r);
+            if let Err(e) = r {
                 tracing::error!(job = %id, error = %e, "delay requeue failed");
             }
         }
         Err(Error::RateLimited { delay_ms }) => {
             let retry_at = chrono_like_now_ms() + delay_ms as i64;
-            if let Err(e) = backend
+            span.record("transition", "delayed");
+            let r = backend
                 .fail(
                     &queue,
                     &id,
@@ -332,16 +417,19 @@ async fn process_one<D, R>(
                     Some(retry_at),
                     remove_on_fail,
                 )
-                .await
-            {
+                .await;
+            log_transition("delayed", &r);
+            if let Err(e) = r {
                 tracing::error!(job = %id, error = %e, "rate-limit requeue failed");
             }
         }
         Err(Error::Unrecoverable(msg)) => {
-            if let Err(e) = backend
+            span.record("transition", "failed");
+            let r = backend
                 .fail(&queue, &id, &token, &msg, None, remove_on_fail)
-                .await
-            {
+                .await;
+            log_transition("failed", &r);
+            if let Err(e) = r {
                 tracing::error!(job = %id, error = %e, "fail permanent failed");
             }
         }
@@ -354,7 +442,9 @@ async fn process_one<D, R>(
                     .map(|b| b.compute(attempts_made))
                     .unwrap_or(Duration::ZERO);
                 let retry_at = chrono_like_now_ms() + delay.as_millis() as i64;
-                if let Err(e) = backend
+                span.record("transition", "retry-delayed");
+                tracing::debug!(backoff_ms = delay.as_millis() as u64, error = %err, "scheduling retry");
+                let r = backend
                     .fail(
                         &queue,
                         &id,
@@ -363,17 +453,40 @@ async fn process_one<D, R>(
                         Some(retry_at),
                         remove_on_fail,
                     )
-                    .await
-                {
+                    .await;
+                log_transition("retry-delayed", &r);
+                if let Err(e) = r {
                     tracing::error!(job = %id, error = %e, "retry requeue failed");
                 }
-            } else if let Err(e) = backend
-                .fail(&queue, &id, &token, &err.to_string(), None, remove_on_fail)
-                .await
-            {
-                tracing::error!(job = %id, error = %e, "final fail failed");
+            } else {
+                span.record("transition", "failed");
+                let r = backend
+                    .fail(&queue, &id, &token, &err.to_string(), None, remove_on_fail)
+                    .await;
+                log_transition("failed", &r);
+                if let Err(e) = r {
+                    tracing::error!(job = %id, error = %e, "final fail failed");
+                }
             }
         }
+    }
+}
+
+fn outcome_label<R>(r: &Result<R>) -> &'static str {
+    match r {
+        Ok(_) => "ok",
+        Err(Error::Delayed { .. }) => "delayed",
+        Err(Error::RateLimited { .. }) => "rate-limited",
+        Err(Error::Unrecoverable(_)) => "unrecoverable",
+        Err(Error::Closed) => "cancelled",
+        Err(_) => "error",
+    }
+}
+
+fn log_transition(to: &'static str, r: &Result<()>) {
+    match r {
+        Ok(()) => tracing::debug!(to, "transition applied"),
+        Err(e) => tracing::debug!(to, error = %e, "transition rejected"),
     }
 }
 

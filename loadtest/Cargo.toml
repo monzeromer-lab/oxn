@@ -1,0 +1,10 @@
+[package]
+name = "oxn-load"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Load, soak and chaos harness for oxn."
+
+[dependencies]
+oxn = { path = "..", features = ["redis-backend"] }
+oxn-testkit = { path = "../testkit" }

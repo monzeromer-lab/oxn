@@ -21,23 +21,24 @@ use redis::Script;
 
 use crate::error::Result;
 
-/// Source-of-truth array of every Lua script body we ship.
+/// Source-of-truth table of every Lua script we ship, as `(name, body)`.
 ///
 /// Indexes line up with the field declarations in [`Scripts`]. Anything
-/// added here must be added to `Scripts::new` in the same position.
-const ALL_SCRIPTS: &[&str] = &[
-    include_str!("lua/add_job.lua"),
-    include_str!("lua/move_to_active.lua"),
-    include_str!("lua/move_to_finished.lua"),
-    include_str!("lua/move_to_delayed.lua"),
-    include_str!("lua/extend_lock.lua"),
-    include_str!("lua/scan_stalled.lua"),
-    include_str!("lua/pause.lua"),
-    include_str!("lua/promote.lua"),
-    include_str!("lua/retry.lua"),
-    include_str!("lua/remove.lua"),
-    include_str!("lua/clean.lua"),
-    include_str!("lua/promote_all.lua"),
+/// added here must be added to `Scripts::new` in the same position. The
+/// name is what tracing spans and test tooling report instead of the SHA.
+pub(super) const ALL_SCRIPTS: &[(&str, &str)] = &[
+    ("add_job", include_str!("lua/add_job.lua")),
+    ("move_to_active", include_str!("lua/move_to_active.lua")),
+    ("move_to_finished", include_str!("lua/move_to_finished.lua")),
+    ("move_to_delayed", include_str!("lua/move_to_delayed.lua")),
+    ("extend_lock", include_str!("lua/extend_lock.lua")),
+    ("scan_stalled", include_str!("lua/scan_stalled.lua")),
+    ("pause", include_str!("lua/pause.lua")),
+    ("promote", include_str!("lua/promote.lua")),
+    ("retry", include_str!("lua/retry.lua")),
+    ("remove", include_str!("lua/remove.lua")),
+    ("clean", include_str!("lua/clean.lua")),
+    ("promote_all", include_str!("lua/promote_all.lua")),
 ];
 
 pub(super) struct Scripts {
@@ -57,19 +58,20 @@ pub(super) struct Scripts {
 
 impl Scripts {
     pub fn new() -> Self {
+        let s = |i: usize| Script::new(ALL_SCRIPTS[i].1);
         Self {
-            add_job: Script::new(ALL_SCRIPTS[0]),
-            move_to_active: Script::new(ALL_SCRIPTS[1]),
-            move_to_finished: Script::new(ALL_SCRIPTS[2]),
-            move_to_delayed: Script::new(ALL_SCRIPTS[3]),
-            extend_lock: Script::new(ALL_SCRIPTS[4]),
-            scan_stalled: Script::new(ALL_SCRIPTS[5]),
-            pause: Script::new(ALL_SCRIPTS[6]),
-            promote: Script::new(ALL_SCRIPTS[7]),
-            retry: Script::new(ALL_SCRIPTS[8]),
-            remove: Script::new(ALL_SCRIPTS[9]),
-            clean: Script::new(ALL_SCRIPTS[10]),
-            promote_all: Script::new(ALL_SCRIPTS[11]),
+            add_job: s(0),
+            move_to_active: s(1),
+            move_to_finished: s(2),
+            move_to_delayed: s(3),
+            extend_lock: s(4),
+            scan_stalled: s(5),
+            pause: s(6),
+            promote: s(7),
+            retry: s(8),
+            remove: s(9),
+            clean: s(10),
+            promote_all: s(11),
         }
     }
 
@@ -82,7 +84,7 @@ impl Scripts {
     where
         C: redis::aio::ConnectionLike + Send,
     {
-        for body in ALL_SCRIPTS {
+        for (_, body) in ALL_SCRIPTS {
             let _: String = redis::cmd("SCRIPT")
                 .arg("LOAD")
                 .arg(*body)
@@ -90,5 +92,34 @@ impl Scripts {
                 .await?;
         }
         Ok(())
+    }
+}
+
+/// `(name, sha1)` for every embedded Lua script.
+///
+/// Lets tooling that watches Redis (`MONITOR`, slowlog, the test kit's
+/// command tap) translate `EVALSHA <sha>` back into a readable script name.
+pub fn script_hashes() -> Vec<(&'static str, String)> {
+    ALL_SCRIPTS
+        .iter()
+        .map(|(name, body)| (*name, Script::new(body).get_hash().to_string()))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn script_names_are_unique_and_hashes_stable() {
+        let hashes = script_hashes();
+        assert_eq!(hashes.len(), ALL_SCRIPTS.len());
+        let mut names: Vec<_> = hashes.iter().map(|(n, _)| *n).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), ALL_SCRIPTS.len(), "duplicate script name");
+        for (_, sha) in &hashes {
+            assert_eq!(sha.len(), 40);
+        }
     }
 }

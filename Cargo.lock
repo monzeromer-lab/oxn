@@ -1343,6 +1343,7 @@ dependencies = [
  "deadpool-redis",
  "futures",
  "metrics",
+ "oxn-testkit",
  "parking_lot",
  "pin-project-lite",
  "redis",
@@ -1354,6 +1355,30 @@ dependencies = [
  "tokio-util",
  "tower",
  "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "oxn-load"
+version = "0.0.0"
+dependencies = [
+ "oxn",
+ "oxn-testkit",
+]
+
+[[package]]
+name = "oxn-testkit"
+version = "0.0.0"
+dependencies = [
+ "oxn",
+ "parking_lot",
+ "redis",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",

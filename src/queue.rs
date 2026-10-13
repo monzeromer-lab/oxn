@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use tracing::Instrument;
 
 use crate::backend::{Backend, JobInsert, JobRange, RawJob, StateCounts};
 use crate::error::{Error, Result};
@@ -136,7 +137,10 @@ where
             opts,
             timestamp_ms: now_ms(),
         };
-        self.backend.add(&self.name, insert).await
+        let span = tracing::debug_span!("oxn.add", queue = %self.name, job_id = tracing::field::Empty);
+        let id = self.backend.add(&self.name, insert).instrument(span.clone()).await?;
+        span.record("job_id", id.as_str());
+        Ok(id)
     }
 
     /// Bulk submission. For the Redis backend this is pipelined when the
