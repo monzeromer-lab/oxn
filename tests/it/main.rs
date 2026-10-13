@@ -26,6 +26,7 @@ mod event_stream;
 mod events;
 mod explicit_ids;
 mod flow;
+mod handler_panics;
 mod job_defaults;
 mod pause_resume;
 mod pickup_latency;

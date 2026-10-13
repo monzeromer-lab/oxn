@@ -275,6 +275,9 @@ pub fn build_worker(
                 run_us: end - start,
                 due_us,
             });
+            if kind == DoneKind::Err && d.panic {
+                panic!("planned panic on attempt {attempt}");
+            }
             match kind {
                 DoneKind::Ok => Ok(d.seq),
                 DoneKind::Err => Err(Error::handler(Transient(attempt))),
@@ -403,6 +406,7 @@ pub fn plan(cfg: &Config, seq: u64, seed: u64) -> (LoadJob, JobOptions) {
         fatal,
         work_us,
         postpone_ms,
+        panic: fail_attempts > 0 && rng.gen_bool(cfg.panic_rate.clamp(0.0, 1.0)),
     };
     let mut opts = if cfg.options_at_queue {
         JobOptions::new()

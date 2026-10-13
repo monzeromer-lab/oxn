@@ -394,7 +394,20 @@ async fn process_one_inner<D, R>(
     renew.tick().await; // consume the zero-tick
 
     tracing::trace!("handler started");
-    let mut handler_fut: BoxFuture<'static, Result<R>> = (handler)(job).boxed();
+    // A panic — while building the future or while polling it — becomes
+    // `Error::Panicked`, handled like any returned error. Uncaught, it would
+    // unwind this task and leave the job locked until its lock expired.
+    let mut handler_fut: BoxFuture<'static, Result<R>> =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (handler)(job))) {
+            Ok(fut) => std::panic::AssertUnwindSafe(fut)
+                .catch_unwind()
+                .map(|r| r.unwrap_or_else(|p| Err(Error::Panicked(panic_message(p.as_ref())))))
+                .boxed(),
+            Err(p) => {
+                let msg = panic_message(p.as_ref());
+                futures::future::ready(Err(Error::Panicked(msg))).boxed()
+            }
+        };
     let outcome: Result<R> = loop {
         tokio::select! {
             biased;
@@ -478,8 +491,20 @@ async fn process_one_inner<D, R>(
     }
 }
 
+/// The message a panic carried, as `panic!` formats it.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "(non-string panic payload)".to_string()
+    }
+}
+
 fn outcome_label<R>(r: &Result<R>) -> &'static str {
     match r {
+        Err(Error::Panicked(_)) => "panicked",
         Ok(_) => "ok",
         Err(Error::Delayed { .. }) => "delayed",
         Err(Error::RateLimited { .. }) => "rate-limited",
@@ -669,5 +694,35 @@ where
             cancel: self.cancel.unwrap_or_default(),
             _data: PhantomData,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panic_messages_are_extracted_like_panic_formats_them() {
+        let msg = |f: fn()| {
+            let p = std::panic::catch_unwind(f).unwrap_err();
+            panic_message(p.as_ref())
+        };
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // keep test output quiet
+        assert_eq!(msg(|| panic!("static")), "static");
+        assert_eq!(msg(|| panic!("formatted {}", 7)), "formatted 7");
+        assert_eq!(
+            msg(|| std::panic::panic_any(1u8)),
+            "(non-string panic payload)"
+        );
+        std::panic::set_hook(prev);
+        assert_eq!(
+            Error::Panicked("x".into()).to_string(),
+            "handler panicked: x"
+        );
+        assert_eq!(
+            outcome_label::<()>(&Err(Error::Panicked("x".into()))),
+            "panicked"
+        );
     }
 }

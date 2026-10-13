@@ -75,6 +75,12 @@ pub enum Error {
     #[error("handler error: {0}")]
     Handler(#[source] Box<dyn std::error::Error + Send + Sync>),
 
+    /// The handler panicked. The worker catches the panic and treats it
+    /// like a returned error (retry per the job's policy, else fail), with
+    /// the panic message as the failure reason.
+    #[error("handler panicked: {0}")]
+    Panicked(String),
+
     /// I/O error from the runtime or network.
     #[error(transparent)]
     Io(#[from] io::Error),

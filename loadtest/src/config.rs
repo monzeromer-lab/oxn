@@ -94,6 +94,9 @@ pub struct RunArgs {
     /// Attempts per job.
     #[arg(long)]
     pub attempts: Option<u32>,
+    /// Fraction of transiently-failing jobs whose failures are panics.
+    #[arg(long)]
+    pub panic_rate: Option<f64>,
     /// Fraction of jobs whose first pickup returns `Error::Delayed`
     /// (50–300ms) — a postponement that must not cost an attempt.
     #[arg(long)]
@@ -176,6 +179,7 @@ pub struct Config {
     pub fail_rate: f64,
     pub fatal_rate: f64,
     pub postpone_rate: f64,
+    pub panic_rate: f64,
     pub attempts: u32,
     pub delay_rate: f64,
     pub priority_rate: f64,
@@ -237,6 +241,7 @@ impl Config {
             fail_rate: 0.05,
             fatal_rate: 0.01,
             postpone_rate: 0.0,
+            panic_rate: 0.0,
             attempts: 3,
             delay_rate: 0.05,
             priority_rate: 0.1,
@@ -362,6 +367,7 @@ impl Config {
             fail_rate,
             fatal_rate,
             postpone_rate,
+            panic_rate,
             attempts,
             delay_rate,
             priority_rate,

@@ -59,6 +59,14 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Planned handler panics (`--panic-rate`) would flood stderr; oxn
+    // catches them and the ledger checks their outcome.
+    std::panic::set_hook(Box::new(|info| {
+        let msg = info.to_string();
+        if !msg.contains("planned panic") {
+            eprintln!("{msg}");
+        }
+    }));
     if let Ok(f) = std::env::var("OXN_LOG") {
         tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::new(f))

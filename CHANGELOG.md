@@ -105,6 +105,14 @@ It contains breaking changes; see the migration notes below.
   immediately and its pool slot is detached instead of being returned with
   a block still pending; the stalled scanner is joined before `run()`
   returns.
+- **A panicking handler is a failure, not a stuck job (B16).** A panic
+  unwound the task processing the job: no outcome was recorded and the
+  job stayed locked in `active` until its lock expired (30s by default)
+  and the stalled scanner picked it up. The worker now catches panics
+  (while building or polling the handler's future) and handles them like
+  a returned error — retried or failed right away per the job's policy —
+  with failure reason `handler panicked: <message>`. New
+  `Error::Panicked(String)`.
 - **Priority and pause survive every path back to ready (B9).** Delayed
   jobs coming due (including retry backoffs), `promote`, `promote_all` and
   `retry` pushed jobs straight onto `wait`: a prioritized job lost its

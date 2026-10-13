@@ -33,6 +33,9 @@ pub struct LoadJob {
     /// postponement that must not cost an attempt.
     #[serde(default)]
     pub postpone_ms: u64,
+    /// Planned transient failures panic instead of returning `Err`.
+    #[serde(default)]
+    pub panic: bool,
 }
 
 /// Terminal state the plan predicts.
@@ -536,6 +539,7 @@ mod tests {
             fatal,
             work_us: 0,
             postpone_ms: 0,
+            panic: false,
         }
     }
 
