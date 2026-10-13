@@ -86,6 +86,26 @@ It contains breaking changes; see the migration notes below.
   immediately and its pool slot is detached instead of being returned with
   a block still pending; the stalled scanner is joined before `run()`
   returns.
+- **Nothing leaks any more (B5).** Every deletion path now goes through one
+  Lua helper that removes a job's hash, every auxiliary key (`:lock`,
+  `:logs`, `:dependencies`, `:processed`, …) and its dedup pointer:
+  - `KeepLast(n)` / `KeepFor(d)` used to trim only the zset, leaving the
+    trimmed jobs' hashes forever (baseline: 3,877 orphaned hashes out of
+    5,000 jobs). Trims are capped at 1,000 jobs per finish, so switching a
+    huge set to a tight policy converges over a few finishes instead of
+    blocking Redis in one call.
+  - `Removal::Remove` now also deletes `:logs`.
+  - `drain()` deleted the lists but left every job hash; it now deletes
+    the jobs, works in batches of 1,000, and emits one `drained` event.
+  - `clean()` works in batches of 1,000 (no single huge script for
+    `limit = 0`) and emits one `cleaned` event with the total.
+  - A dedup pointer is cleared when its job is removed, so a later add with
+    the same dedup id creates a new job instead of returning a dead id.
+  - The `stalled` set was written and never read; it is no longer used.
+  - A job requeued by the stalled scanner no longer keeps the dead
+    worker's `lockToken`.
+  A 3-minute mixed-retention soak keeps keys and memory flat (memory growth
+  in long runs is the events stream filling up to `max_stream_length`).
 - The worker no longer logs "transition applied" when the backend
   rejected the transition. A lost lock is logged as a warning ("lock
   lost, outcome discarded"); any other rejection as an error.

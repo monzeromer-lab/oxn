@@ -444,6 +444,10 @@ enum Moved {
     Empty { next_due: Option<Duration> },
 }
 
+/// Job deletions per script call for batched operations; must match
+/// `OXN_BATCH` in `lua/includes/common.lua`.
+const SCRIPT_BATCH: u64 = 1000;
+
 /// Smallest block time handed to `BZPOPMIN`. A timeout of `0` means
 /// "block forever" in Redis, so a configured `drain_delay` of zero (or a
 /// delayed job due right now) must never reach the server as 0.
@@ -655,6 +659,7 @@ impl Backend for RedisBackend {
             .key(keys.job_hash(id.as_str()))
             .key(keys.job_lock(id.as_str()))
             .key(keys.events())
+            .key(keys.job_hash_prefix())
             .arg(id.as_str())
             .arg(token)
             .arg("completed")
@@ -712,6 +717,7 @@ impl Backend for RedisBackend {
             .key(keys.job_hash(id.as_str()))
             .key(keys.job_lock(id.as_str()))
             .key(keys.events())
+            .key(keys.job_hash_prefix())
             .arg(id.as_str())
             .arg(token)
             .arg("failed")
@@ -786,19 +792,32 @@ impl Backend for RedisBackend {
     }
 
     async fn drain(&self, queue: &str, include_delayed: bool) -> Result<()> {
-        let span = tracing::debug_span!("oxn.drain", queue, include_delayed);
+        // One batch per script call so a huge backlog never blocks Redis;
+        // each batch deletes the jobs' hashes and keys, not just the ids.
         let keys = self.keys(queue);
-        let mut conn = self.conn().await?;
-        let mut pipe = redis::pipe();
-        pipe.atomic()
-            .del(keys.wait())
-            .del(keys.paused())
-            .del(keys.prioritized());
-        if include_delayed {
-            pipe.del(keys.delayed());
+        let mut inv = self.scripts.drain.prepare_invoke();
+        inv.key(keys.wait())
+            .key(keys.paused())
+            .key(keys.prioritized())
+            .key(keys.delayed())
+            .key(keys.marker())
+            .key(keys.job_hash_prefix())
+            .arg(if include_delayed { 1 } else { 0 });
+        let mut total = 0u64;
+        loop {
+            let mut conn = self.conn().await?;
+            let reply = self.eval(&mut conn, "drain", queue, None, &inv).await?;
+            let n: u64 = redis::from_redis_value(&reply)?;
+            total += n;
+            if n < SCRIPT_BATCH {
+                break;
+            }
         }
-        let _: () = pipe.query_async(&mut *conn).instrument(span).await?;
-        Ok(())
+        self.emit(
+            queue,
+            &[("event", "drained"), ("count", &total.to_string())],
+        )
+        .await
     }
 
     async fn obliterate(&self, queue: &str, force: bool) -> Result<()> {
@@ -897,16 +916,39 @@ impl Backend for RedisBackend {
                 )));
             }
         };
-        let mut inv = self.scripts.clean.prepare_invoke();
-        inv.key(zset)
-            .key(keys.events())
-            .key(keys.job_hash_prefix())
-            .arg(limit as i64)
-            .arg(self.max_stream_length as i64);
-        let mut conn = self.conn().await?;
-        let reply = self.eval(&mut conn, "clean", queue, None, &inv).await?;
-        let removed: i64 = redis::from_redis_value(&reply)?;
-        Ok(removed.max(0) as u64)
+        // `limit == 0` means everything; either way work in batches of at
+        // most SCRIPT_BATCH so no single script call runs long.
+        let mut removed = 0u64;
+        loop {
+            let want = if limit == 0 {
+                SCRIPT_BATCH
+            } else {
+                (limit - removed).min(SCRIPT_BATCH)
+            };
+            if want == 0 {
+                break;
+            }
+            let mut inv = self.scripts.clean.prepare_invoke();
+            inv.key(&zset)
+                .key(keys.events())
+                .key(keys.job_hash_prefix())
+                .arg(want);
+            let mut conn = self.conn().await?;
+            let reply = self.eval(&mut conn, "clean", queue, None, &inv).await?;
+            let n: u64 = redis::from_redis_value(&reply)?;
+            removed += n;
+            if n < want {
+                break;
+            }
+        }
+        if removed > 0 {
+            self.emit(
+                queue,
+                &[("event", "cleaned"), ("count", &removed.to_string())],
+            )
+            .await?;
+        }
+        Ok(removed)
     }
 
     async fn retry(&self, queue: &str, id: &JobId) -> Result<()> {
@@ -939,6 +981,8 @@ impl Backend for RedisBackend {
             .key(keys.job_lock(id.as_str()))
             .key(keys.job_logs(id.as_str()))
             .key(keys.events())
+            .key(keys.waiting_children())
+            .key(keys.job_hash_prefix())
             .arg(id.as_str())
             .arg(self.max_stream_length as i64);
         let mut conn = self.conn().await?;
@@ -1084,6 +1128,23 @@ impl Backend for RedisBackend {
 }
 
 impl RedisBackend {
+    /// Append one event to the queue's stream from Rust (for operations
+    /// that span several script calls and report once at the end).
+    async fn emit(&self, queue: &str, fields: &[(&str, &str)]) -> Result<()> {
+        let mut cmd = redis::cmd("XADD");
+        cmd.arg(self.keys(queue).events())
+            .arg("MAXLEN")
+            .arg("~")
+            .arg(self.max_stream_length)
+            .arg("*");
+        for (k, v) in fields {
+            cmd.arg(*k).arg(*v);
+        }
+        let mut conn = self.conn().await?;
+        let _: String = cmd.query_async(&mut *conn).await?;
+        Ok(())
+    }
+
     async fn pause_or_resume(&self, queue: &str, action: &'static str) -> Result<()> {
         let keys = self.keys(queue);
         let mut inv = self.scripts.pause.prepare_invoke();
@@ -1358,6 +1419,15 @@ fn parse_stream_entry(map: &std::collections::HashMap<String, redis::Value>) -> 
 mod tests {
     use super::*;
     use crate::error::ScriptError;
+
+    #[test]
+    fn batch_size_matches_the_lua_prelude() {
+        let prelude = include_str!("lua/includes/common.lua");
+        assert!(
+            prelude.contains(&format!("local OXN_BATCH = {SCRIPT_BATCH}")),
+            "SCRIPT_BATCH and OXN_BATCH diverged"
+        );
+    }
 
     #[test]
     fn block_time_waits_for_the_next_due_job_but_never_forever() {

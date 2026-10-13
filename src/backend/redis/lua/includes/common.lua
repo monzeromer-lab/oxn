@@ -67,3 +67,24 @@ local function oxnPushReady(k, id, hashKey, front)
   end
   return 'paused'
 end
+
+-- Most job deletions a single script call performs. Retention trims and
+-- bulk removals larger than this are spread over several calls so no one
+-- script blocks Redis for long.
+local OXN_BATCH = 1000
+
+-- Delete a job's hash and every key hanging off it, plus its dedup pointer
+-- if that pointer still names this job. Does not touch containers.
+local function oxnRemoveJobKeys(hashPrefix, id)
+  local hashKey = hashPrefix .. id
+  local d = oxnJobOpts(hashKey)['deduplication']
+  if type(d) == 'table' and type(d['id']) == 'string' then
+    local dedupKey = hashPrefix .. 'de:' .. d['id']
+    if redis.call('GET', dedupKey) == id then
+      redis.call('DEL', dedupKey)
+    end
+  end
+  redis.call('DEL', hashKey, hashKey .. ':lock', hashKey .. ':logs',
+    hashKey .. ':dependencies', hashKey .. ':processed',
+    hashKey .. ':unsuccessful', hashKey .. ':failed')
+end

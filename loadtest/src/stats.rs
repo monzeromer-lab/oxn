@@ -133,6 +133,7 @@ pub struct Row {
     pub prioritized: u64,
     pub completed: u64,
     pub failed: u64,
+    pub stream_len: u64,
     pub pickup_p50_ms: f64,
     pub pickup_p99_ms: f64,
     pub run_p99_ms: f64,
@@ -176,10 +177,10 @@ pub async fn redis_health(conn: &mut ConnectionManager) -> RedisHealth {
     }
 }
 
-/// Container sizes, read directly with LLEN/ZCARD:
-/// `[wait, active, delayed, prioritized, completed, failed]`.
-pub async fn queue_sizes(conn: &mut ConnectionManager, base: &str) -> redis::RedisResult<[u64; 6]> {
-    let (a, b, c, d, e, f): (u64, u64, u64, u64, u64, u64) = redis::pipe()
+/// Container sizes, read directly with LLEN/ZCARD/XLEN:
+/// `[wait, active, delayed, prioritized, completed, failed, events stream]`.
+pub async fn queue_sizes(conn: &mut ConnectionManager, base: &str) -> redis::RedisResult<[u64; 7]> {
+    let (a, b, c, d, e, f, g): (u64, u64, u64, u64, u64, u64, u64) = redis::pipe()
         .cmd("LLEN")
         .arg(format!("{base}wait"))
         .cmd("LLEN")
@@ -192,9 +193,11 @@ pub async fn queue_sizes(conn: &mut ConnectionManager, base: &str) -> redis::Red
         .arg(format!("{base}completed"))
         .cmd("ZCARD")
         .arg(format!("{base}failed"))
+        .cmd("XLEN")
+        .arg(format!("{base}events"))
         .query_async(conn)
         .await?;
-    Ok([a, b, c, d, e, f])
+    Ok([a, b, c, d, e, f, g])
 }
 
 /// Print a row per second and collect it; stops when `stop` fires.
@@ -250,7 +253,7 @@ pub async fn monitor(
             Ok(s) => s,
             Err(e) => {
                 stats.note(format!("monitor: cannot read queue sizes: {e}"));
-                [0; 6]
+                [0; 7]
             }
         };
         let h = redis_health(&mut conn).await;
@@ -267,6 +270,7 @@ pub async fn monitor(
             prioritized: sizes[3],
             completed: sizes[4],
             failed: sizes[5],
+            stream_len: sizes[6],
             pickup_p50_ms: p50,
             pickup_p99_ms: p99,
             run_p99_ms: run99,

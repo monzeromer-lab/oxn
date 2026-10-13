@@ -13,6 +13,8 @@
 -- KEYS[9] job lock
 -- KEYS[10] job logs
 -- KEYS[11] events
+-- KEYS[12] waiting-children
+-- KEYS[13] job-hash prefix (trailing ':')
 -- ARGV[1] id
 -- ARGV[2] max stream len
 
@@ -33,9 +35,8 @@ redis.call('ZREM', KEYS[4], id)
 redis.call('ZREM', KEYS[5], id)
 redis.call('ZREM', KEYS[6], id)
 redis.call('ZREM', KEYS[7], id)
-redis.call('DEL', KEYS[8])
-redis.call('DEL', KEYS[9])
-redis.call('DEL', KEYS[10])
+redis.call('ZREM', KEYS[12], id)
+oxnRemoveJobKeys(KEYS[13], id)
 
 redis.call('XADD', KEYS[11], 'MAXLEN', '~', maxStream, '*',
   'event', 'removed', 'jobId', id)

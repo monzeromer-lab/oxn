@@ -77,6 +77,7 @@ pub struct LeakReport {
 }
 
 pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
+    workload::MAX_STREAM_LEN.store(cfg.max_stream_len, std::sync::atomic::Ordering::Relaxed);
     let cfg = Arc::new(cfg);
     let client = redis::Client::open(cfg.redis.as_str())?;
     // Auto-reconnecting: the harness must keep observing across Redis
@@ -311,6 +312,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
         "prioritized",
         "completed",
         "failed",
+        "events-stream",
     ]
     .iter()
     .zip(sizes)

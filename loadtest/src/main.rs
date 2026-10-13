@@ -50,6 +50,8 @@ enum Cmd {
         lock_ms: u64,
         #[arg(long)]
         drain_delay_ms: Option<u64>,
+        #[arg(long, default_value_t = 200_000)]
+        max_stream_len: u64,
     },
 }
 
@@ -69,7 +71,9 @@ async fn main() -> anyhow::Result<()> {
             concurrency,
             lock_ms,
             drain_delay_ms,
+            max_stream_len,
         } => {
+            workload::MAX_STREAM_LEN.store(max_stream_len, std::sync::atomic::Ordering::Relaxed);
             workload::child_worker_main(redis, queue, index, concurrency, lock_ms, drain_delay_ms)
                 .await
         }

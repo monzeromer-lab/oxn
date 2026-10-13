@@ -55,6 +55,7 @@ pub(super) const ALL_SCRIPTS: &[(&str, &str)] = &[
     script!("clean"),
     script!("promote_all"),
     script!("release"),
+    script!("drain"),
 ];
 
 pub(super) struct Scripts {
@@ -71,6 +72,7 @@ pub(super) struct Scripts {
     pub clean: Script,
     pub promote_all: Script,
     pub release: Script,
+    pub drain: Script,
 }
 
 impl Scripts {
@@ -90,6 +92,7 @@ impl Scripts {
             clean: s(10),
             promote_all: s(11),
             release: s(12),
+            drain: s(13),
         }
     }
 

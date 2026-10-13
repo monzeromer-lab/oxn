@@ -172,14 +172,14 @@ pub fn render(o: &Outcome) -> String {
     let _ = writeln!(s, "## Timeline (per second)\n");
     let _ = writeln!(
         s,
-        "| t | add/s | start/s | ok/s | err/s | wait | active | delayed | prio | completed | failed | pickup p50 | pickup p99 | run p99 | add p99 | redis ops/s | mem MB | keys | clients | notes |"
+        "| t | add/s | start/s | ok/s | err/s | wait | active | delayed | prio | completed | failed | stream | pickup p50 | pickup p99 | run p99 | add p99 | redis ops/s | mem MB | keys | clients | notes |"
     );
-    let _ = writeln!(s, "|{}", "---|".repeat(20));
+    let _ = writeln!(s, "|{}", "---|".repeat(21));
     let step = (o.rows.len() / 300).max(1);
     for r in o.rows.iter().step_by(step) {
         let _ = writeln!(
             s,
-            "| {:.0} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {} | {:.1} | {} | {} | {} |",
+            "| {:.0} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {} | {:.1} | {} | {} | {} |",
             r.t_s,
             r.added_ps,
             r.started_ps,
@@ -191,6 +191,7 @@ pub fn render(o: &Outcome) -> String {
             r.prioritized,
             r.completed,
             r.failed,
+            r.stream_len,
             r.pickup_p50_ms,
             r.pickup_p99_ms,
             r.run_p99_ms,

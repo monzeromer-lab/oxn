@@ -282,11 +282,15 @@ pub fn build_worker(
     b.build()
 }
 
+/// Events-stream cap every backend in this process uses (set once from the
+/// run config; child workers receive it on the command line).
+pub static MAX_STREAM_LEN: AtomicU64 = AtomicU64::new(200_000);
+
 pub async fn connect(url: &str, pool: usize) -> anyhow::Result<Arc<dyn Backend>> {
     let cfg = RedisConfig::new(url)
         .prefix(PREFIX)
         .pool_size(pool)
-        .max_stream_length(200_000);
+        .max_stream_length(MAX_STREAM_LEN.load(Ordering::Relaxed) as usize);
     Ok(Arc::new(RedisBackend::connect(cfg).await?))
 }
 
@@ -600,7 +604,9 @@ impl ProcPool {
             .arg("--concurrency")
             .arg(self.cfg.concurrency.to_string())
             .arg("--lock-ms")
-            .arg(self.cfg.lock_ms.to_string());
+            .arg(self.cfg.lock_ms.to_string())
+            .arg("--max-stream-len")
+            .arg(self.cfg.max_stream_len.to_string());
         if let Some(d) = self.cfg.drain_delay_ms {
             cmd.arg("--drain-delay-ms").arg(d.to_string());
         }

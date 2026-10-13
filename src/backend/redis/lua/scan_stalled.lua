@@ -33,6 +33,9 @@ if not acquired then
   return {}
 end
 
+-- The legacy `stalled` set was write-only; nothing ever read it. Drop it.
+redis.call('DEL', stalledKey)
+
 local moved = {}
 local active = redis.call('LRANGE', activeKey, 0, -1)
 for i = 1, #active do
@@ -51,7 +54,8 @@ for i = 1, #active do
       redis.call('XADD', eventsKey, 'MAXLEN', '~', maxStream, '*',
         'event', 'failed', 'jobId', id, 'failedReason', 'stalled')
     else
-      redis.call('SADD', stalledKey, id)
+      -- the lock is gone; so is ownership
+      redis.call('HDEL', hashKey, 'lockToken', 'processedOn')
       redis.call('LPUSH', waitKey, id)
       redis.call('XADD', eventsKey, 'MAXLEN', '~', maxStream, '*',
         'event', 'stalled', 'jobId', id)

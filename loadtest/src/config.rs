@@ -131,6 +131,10 @@ pub struct RunArgs {
     /// Label appended to the report file name.
     #[arg(long)]
     pub label: Option<String>,
+    /// Cap on the queue's events stream (`XADD MAXLEN ~`). The stream is
+    /// the main bounded-but-growing memory consumer in long runs.
+    #[arg(long)]
+    pub max_stream_len: Option<u64>,
     /// Worker `shutdown_timeout` in ms (in-process workers).
     #[arg(long)]
     pub shutdown_timeout_ms: Option<u64>,
@@ -181,6 +185,8 @@ pub struct Config {
     pub options_at_queue: bool,
     /// Worker shutdown_timeout, ms.
     pub shutdown_timeout_ms: u64,
+    /// Events stream cap.
+    pub max_stream_len: u64,
 }
 
 fn ser_dur<S: serde::Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
@@ -230,6 +236,7 @@ impl Config {
             slo_pickup_p99_ms: None,
             options_at_queue: a.options_at_queue,
             shutdown_timeout_ms: 10_000,
+            max_stream_len: 200_000,
         };
         match a.scenario {
             Smoke => {}
@@ -323,6 +330,7 @@ impl Config {
         }
         ovr!(
             shutdown_timeout_ms,
+            max_stream_len,
             jobs,
             rate,
             producers,
