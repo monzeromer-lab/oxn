@@ -546,7 +546,6 @@ impl Backend for RedisBackend {
             .key(keys.priority_counter())
             .key(keys.events())
             .key(keys.marker())
-            .key(keys.dedup(&dedup_id))
             .key(keys.job_hash_prefix())
             .arg(insert.name.as_str())
             .arg(insert.data.as_str())
@@ -566,6 +565,56 @@ impl Backend for RedisBackend {
             .await?;
         let id: String = redis::from_redis_value(&reply)?;
         Ok(JobId::new(id))
+    }
+
+    async fn add_bulk(&self, queue: &str, inserts: Vec<JobInsert>) -> Result<Vec<JobId>> {
+        if inserts.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.register_queue(queue).await?;
+        let keys = self.keys(queue);
+        let mut ids = Vec::with_capacity(inserts.len());
+        // One script call per chunk of SCRIPT_BATCH jobs (0.2 made one
+        // call per job). Inputs were validated by the caller, since a
+        // script is not rolled back on a runtime error.
+        for chunk in inserts.chunks(SCRIPT_BATCH as usize) {
+            let jobs = chunk
+                .iter()
+                .map(|i| {
+                    let dedup = i.opts.deduplication.as_ref();
+                    Ok(serde_json::json!({
+                        "name": i.name,
+                        "data": i.data,
+                        "opts": opts_to_json(&i.opts)?,
+                        "ts": i.timestamp_ms,
+                        "delay": i.opts.delay.map(|d| d.as_millis() as i64).unwrap_or(0),
+                        "priority": i.opts.priority,
+                        "dedupId": dedup.map(|d| d.id.as_str()).unwrap_or(""),
+                        "dedupTtl": dedup.map(|d| d.ttl.as_millis() as i64).unwrap_or(0),
+                        "id": i.opts.id.as_deref().unwrap_or(""),
+                        "lifo": if i.opts.lifo { 1 } else { 0 },
+                    }))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut inv = self.scripts.add_bulk.prepare_invoke();
+            inv.key(keys.meta())
+                .key(keys.id_counter())
+                .key(keys.wait())
+                .key(keys.paused())
+                .key(keys.delayed())
+                .key(keys.prioritized())
+                .key(keys.priority_counter())
+                .key(keys.events())
+                .key(keys.marker())
+                .key(keys.job_hash_prefix())
+                .arg(self.max_stream_length as i64)
+                .arg(serde_json::to_string(&jobs)?);
+            let mut conn = self.conn().await?;
+            let reply = self.eval(&mut conn, "add_bulk", queue, None, &inv).await?;
+            let chunk_ids: Vec<String> = redis::from_redis_value(&reply)?;
+            ids.extend(chunk_ids.into_iter().map(JobId::new));
+        }
+        Ok(ids)
     }
 
     async fn fetch_next(

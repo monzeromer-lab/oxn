@@ -105,6 +105,15 @@ It contains breaking changes; see the migration notes below.
   immediately and its pool slot is detached instead of being returned with
   a block still pending; the stalled scanner is joined before `run()`
   returns.
+- **`add_bulk` is real (B12a).** The Redis backend had no override, so
+  `add_bulk` looped `add()`: one round trip and one script call per job,
+  interleavable with other clients (the docs promised a pipelined call).
+  It now sends one `add_bulk.lua` call per chunk of up to 1,000 jobs, each
+  chunk applied without interleaving; ids come back in submission order.
+  Single and bulk adds share one Lua implementation (`oxnAddJob`), so
+  every option (delay, priority, LIFO, explicit-id duplicates, dedup)
+  behaves identically. 200,000 jobs: ~0.06ms per job in bulks of 500 vs
+  0.61ms per single add.
 - **`obliterate` deletes exactly one queue, safely (B11).** It deleted
   every key matching the unescaped glob `{prefix}:{queue}:*`; queue names
   may contain `*`, `?` and `[`, so obliterating a queue named `x*`

@@ -138,3 +138,85 @@ local function oxnPolicyFromOpts(r)
   end
   return 'keep'
 end
+
+-- Add one job. Shared by add_job.lua and add_bulk.lua so single and bulk
+-- adds behave identically.
+--
+-- k = { meta=, id=, wait=, paused=, delayed=, prio=, pc=, events=,
+--       marker=, prefix= }   (prefix = job-hash prefix with trailing ':')
+-- j = { name=, data=, opts=, ts=, delay=, priority=, dedupId=,
+--       dedupTtl=, id=, lifo= }   (opts = ResolvedJobOptions JSON)
+--
+-- Returns the job id: a new one, or the existing job's when the explicit
+-- id already exists ('duplicated') or the dedup id is live
+-- ('deduplicated').
+local function oxnAddJob(k, j, maxStream)
+  local dedupId = j.dedupId or ''
+  local dedupKey = k.prefix .. 'de:' .. dedupId
+  if dedupId ~= '' then
+    local existing = redis.call('GET', dedupKey)
+    if existing then
+      oxnEmit(k.events, maxStream, 'event', 'deduplicated', 'jobId', existing, 'dedupId', dedupId)
+      return existing
+    end
+  end
+
+  local id
+  if (j.id or '') ~= '' then
+    id = j.id
+    -- An explicit id that already names a job returns that job untouched:
+    -- re-submitting is idempotent, never an overwrite or a second enqueue.
+    if redis.call('EXISTS', k.prefix .. id) == 1 then
+      oxnEmit(k.events, maxStream, 'event', 'duplicated', 'jobId', id)
+      return id
+    end
+  else
+    id = tostring(redis.call('INCR', k.id))
+  end
+
+  local ts = tonumber(j.ts)
+  redis.call('HSET', k.prefix .. id,
+    'name', j.name,
+    'data', j.data,
+    'opts', j.opts,
+    'timestamp', ts,
+    'attemptsMade', 0)
+
+  local ttl = tonumber(j.dedupTtl) or 0
+  if dedupId ~= '' and ttl > 0 then
+    redis.call('SET', dedupKey, id, 'PX', ttl)
+  end
+
+  local delay = tonumber(j.delay) or 0
+  local priority = tonumber(j.priority) or 0
+  if delay > 0 then
+    local due = ts + delay
+    redis.call('ZADD', k.delayed, due, id)
+    -- Wake a blocked worker so it re-computes how long to block: it may be
+    -- sleeping for a full drain_delay that ends after this job is due.
+    oxnWake(k.marker)
+    oxnEmit(k.events, maxStream, 'event', 'delayed', 'jobId', id, 'delay', due)
+  elseif priority > 0 then
+    local counter = redis.call('INCR', k.pc)
+    -- priority in the high bits, a counter below for FIFO within a tier
+    redis.call('ZADD', k.prio, priority * 0x100000000 + counter, id)
+    oxnWake(k.marker)
+  else
+    local target = k.wait
+    if redis.call('HGET', k.meta, 'paused') == '1' then
+      target = k.paused
+    end
+    if tonumber(j.lifo) == 1 then
+      redis.call('RPUSH', target, id)
+    else
+      redis.call('LPUSH', target, id)
+    end
+    if target == k.wait then
+      oxnWake(k.marker)
+    end
+    oxnEmit(k.events, maxStream, 'event', 'waiting', 'jobId', id)
+  end
+
+  oxnEmit(k.events, maxStream, 'event', 'added', 'jobId', id, 'name', j.name)
+  return id
+end

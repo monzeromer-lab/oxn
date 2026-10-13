@@ -153,9 +153,11 @@ where
         Ok(id)
     }
 
-    /// Bulk submission. For the Redis backend this is pipelined when the
-    /// backend provides a pipelined override; otherwise it falls back to
-    /// sequential `add`s.
+    /// Bulk submission. Every job is validated first; then the Redis
+    /// backend adds them with one script call per chunk of up to 1,000
+    /// jobs. Each chunk is applied without other clients interleaving
+    /// (Redis scripts are isolated, not rolled back); ids come back in
+    /// submission order. Other backends may fall back to sequential `add`s.
     ///
     /// # Examples
     ///

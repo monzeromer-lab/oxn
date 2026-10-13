@@ -465,12 +465,19 @@ pub async fn producer(
                 continue;
             }
         }
-        let seq = next.fetch_add(1, Ordering::Relaxed);
-        if cfg.duration.is_none() && seq >= cfg.jobs {
+        // Claim `bulk` consecutive seqs (1 = single adds).
+        let n = cfg.bulk.max(1) as u64;
+        let first = next.fetch_add(n, Ordering::Relaxed);
+        let last = if cfg.duration.is_none() {
+            (first + n).min(cfg.jobs)
+        } else {
+            first + n
+        };
+        if first >= last {
             break;
         }
         if let Some(iv) = interval {
-            next_at += iv;
+            next_at += iv * (last - first) as u32;
             let now = Instant::now();
             if next_at > now {
                 tokio::time::sleep(next_at - now).await;
@@ -478,25 +485,40 @@ pub async fn producer(
                 next_at = now; // fell far behind; don't burst to catch up
             }
         }
-        // Retry the same seq until it lands so the ledger never has holes.
-        // A failed `add` may still have been applied server-side (reply
-        // lost); the ledger would then see an unknown job id in the stream,
-        // which the observer ignores, and this seq gets a second job.
+        // Retry the same seqs until they land so the ledger never has
+        // holes. A failed `add` may still have been applied server-side
+        // (reply lost); the ledger would then see unknown job ids in the
+        // stream, which the observer ignores, and these seqs get new jobs.
         loop {
-            let (mut job, opts) = plan(&cfg, seq, seed);
-            job.enq_us = now_us();
+            let planned: Vec<(LoadJob, JobOptions)> = (first..last)
+                .map(|seq| {
+                    let (mut job, opts) = plan(&cfg, seq, seed);
+                    job.enq_us = now_us();
+                    (job, opts)
+                })
+                .collect();
+            let jobs: Vec<LoadJob> = planned.iter().map(|(j, _)| j.clone()).collect();
             let t0 = Instant::now();
-            match queue.add(job.clone(), opts).await {
-                Ok(id) => {
+            let result = if planned.len() == 1 {
+                let (job, opts) = planned.into_iter().next().expect("one job");
+                queue.add(job, opts).await.map(|id| vec![id])
+            } else {
+                queue.add_bulk(planned).await
+            };
+            match result {
+                Ok(ids) => {
                     stats.add_latency.record(t0.elapsed().as_micros() as u64);
-                    stats.added.fetch_add(1, Ordering::Relaxed);
-                    ledger.added(job, id.to_string(), now_us());
+                    stats.added.fetch_add(ids.len() as u64, Ordering::Relaxed);
+                    let at = now_us();
+                    for (job, id) in jobs.into_iter().zip(ids) {
+                        ledger.added(job, id.to_string(), at);
+                    }
                     break;
                 }
                 Err(e) => {
-                    let n = stats.add_errors.fetch_add(1, Ordering::Relaxed);
-                    if n.is_multiple_of(100) {
-                        stats.note(format!("add failed (#{}): {e}", n + 1));
+                    let k = stats.add_errors.fetch_add(1, Ordering::Relaxed);
+                    if k.is_multiple_of(100) {
+                        stats.note(format!("add failed (#{}): {e}", k + 1));
                     }
                     if stop.is_cancelled() {
                         return;

@@ -166,7 +166,8 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
 
     /// Submit a batch of jobs atomically where the backend supports it.
     async fn add_bulk(&self, queue: &str, inserts: Vec<JobInsert>) -> Result<Vec<JobId>> {
-        // Default: sequential. Redis backend overrides with a pipelined call.
+        // Default: sequential `add`s. The Redis backend overrides this with
+        // one script call per chunk of up to 1,000 jobs.
         let mut ids = Vec::with_capacity(inserts.len());
         for i in inserts {
             ids.push(self.add(queue, i).await?);

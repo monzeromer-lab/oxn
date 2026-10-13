@@ -70,6 +70,9 @@ pub struct RunArgs {
     /// Target enqueue rate across all producers (jobs/s); 0 = unthrottled.
     #[arg(long)]
     pub rate: Option<u64>,
+    /// Jobs per producer call: 1 = `add`, N > 1 = `add_bulk` of N.
+    #[arg(long)]
+    pub bulk: Option<usize>,
     /// Producer tasks.
     #[arg(long)]
     pub producers: Option<usize>,
@@ -172,6 +175,7 @@ pub struct Config {
     pub duration: Option<Duration>,
     pub rate: u64,
     pub producers: usize,
+    pub bulk: usize,
     pub workers: usize,
     pub concurrency: usize,
     pub processes: bool,
@@ -234,6 +238,7 @@ impl Config {
             duration: None,
             rate: 0,
             producers: 2,
+            bulk: 1,
             workers: 2,
             concurrency: 4,
             processes: false,
@@ -360,6 +365,7 @@ impl Config {
             jobs,
             rate,
             producers,
+            bulk,
             workers,
             concurrency,
             processes,
