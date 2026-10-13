@@ -76,17 +76,22 @@ where
     ///
     /// Use this when you want to share a single backend (and its pool)
     /// across multiple queues, or when plugging in a custom backend.
+    ///
+    /// Fails with [`Error::Config`] if `name` is not a valid queue name
+    /// (see [`crate::validate::queue_name`]).
     pub fn from_backend(
         name: impl Into<String>,
         backend: Arc<dyn Backend>,
         opts: QueueOptions,
-    ) -> Self {
-        Self {
-            name: name.into(),
+    ) -> Result<Self> {
+        let name = name.into();
+        crate::validate::queue_name(&name)?;
+        Ok(Self {
+            name,
             opts,
             backend,
             _data: PhantomData,
-        }
+        })
     }
 
     /// Name the queue was constructed with.
@@ -128,6 +133,9 @@ where
     /// ```
     pub async fn add(&self, data: D, opts: JobOptions) -> Result<JobId> {
         let opts = opts.resolve_with(&self.opts.default_job_options);
+        if let Some(id) = &opts.id {
+            crate::validate::job_id(id)?;
+        }
         let insert = JobInsert {
             name: opts.name.clone().unwrap_or_else(|| self.name.clone()),
             data: serde_json::to_string(&data)?,
@@ -168,6 +176,9 @@ where
             .into_iter()
             .map(|(d, opts)| {
                 let opts = opts.resolve_with(&self.opts.default_job_options);
+                if let Some(id) = &opts.id {
+                    crate::validate::job_id(id)?;
+                }
                 let name = opts.name.clone().unwrap_or_else(|| self.name.clone());
                 Ok(JobInsert {
                     name,
@@ -406,6 +417,7 @@ where
     /// Build the queue. Establishes the backend connection if needed.
     #[allow(clippy::redundant_closure_for_method_calls)]
     pub async fn build(self) -> Result<Queue<D>> {
+        crate::validate::queue_name(&self.name)?;
         let backend = match self.backend {
             Some(b) => b,
             None => {
@@ -428,6 +440,6 @@ where
                 }
             }
         };
-        Ok(Queue::from_backend(self.name, backend, self.opts))
+        Queue::from_backend(self.name, backend, self.opts)
     }
 }

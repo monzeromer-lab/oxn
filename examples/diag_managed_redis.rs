@@ -50,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
         "diag-q",
         backend.clone() as Arc<dyn Backend>,
         QueueOptions::default().prefix("oxn-diag"),
-    );
+    )?;
 
     // Force any lingering pool slots open so we measure script cost only.
     let probe_t = Instant::now();
@@ -133,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
         "diag-q",
         backend2.clone() as Arc<dyn Backend>,
         QueueOptions::default().prefix("oxn-diag"),
-    );
+    )?;
 
     let t = Instant::now();
     let id = q2

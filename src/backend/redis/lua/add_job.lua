@@ -62,6 +62,12 @@ end
 local id
 if explicit ~= '' then
   id = explicit
+  -- An explicit id that already names a job returns that job untouched:
+  -- re-submitting is idempotent, never an overwrite or a second enqueue.
+  if redis.call('EXISTS', hashPrefix .. id) == 1 then
+    oxnEmit(eventsKey, maxStream, 'event', 'duplicated', 'jobId', id)
+    return id
+  end
 else
   id = tostring(redis.call('INCR', idCounterKey))
 end

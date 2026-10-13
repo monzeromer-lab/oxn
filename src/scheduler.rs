@@ -99,7 +99,7 @@ where
         let delay = self.repeat.next_delay();
         let mut opts = self.opts.clone();
         opts.delay = Some(delay);
-        opts.id = Some(format!("sched:{}:{}", self.id, chrono_now_ms()));
+        opts.id = Some(format!("sched-{}-{}", self.id, chrono_now_ms()));
         self.queue.add(self.template.clone(), opts).await
     }
 
@@ -111,7 +111,7 @@ where
                 _ = cancel.cancelled() => return Ok(()),
                 _ = tokio::time::sleep(delay) => {
                     let mut opts = self.opts.clone();
-                    opts.id = Some(format!("sched:{}:{}", self.id, chrono_now_ms()));
+                    opts.id = Some(format!("sched-{}-{}", self.id, chrono_now_ms()));
                     if let Err(e) = self.queue.add(self.template.clone(), opts).await {
                         tracing::error!(scheduler = %self.id, error = %e, "enqueue failed");
                     }

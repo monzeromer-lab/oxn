@@ -1400,10 +1400,7 @@ fn parse_stream_entry(map: &std::collections::HashMap<String, redis::Value>) -> 
         "resumed" => Event::Resumed,
         "drained" => Event::Drained,
         "removed" => Event::Removed { id },
-        "duplicated" => Event::Duplicated {
-            id,
-            dedup_id: s(map, "dedupId").unwrap_or_default(),
-        },
+        "duplicated" => Event::Duplicated { id },
         "deduplicated" => Event::Deduplicated {
             id,
             dedup_id: s(map, "dedupId").unwrap_or_default(),

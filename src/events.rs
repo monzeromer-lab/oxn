@@ -106,15 +106,14 @@ pub enum Event {
         /// The affected job id.
         id: JobId,
     },
-    /// A second add for an existing dedup id was rejected.
+    /// An add with an explicit job id that already exists returned the
+    /// existing job instead of creating or overwriting one.
     Duplicated {
-        /// The affected (existing) job id.
+        /// The existing job id.
         id: JobId,
-        /// The dedup key that collided.
-        dedup_id: String,
     },
-    /// The backend swallowed a duplicate submission (equivalent to
-    /// [`Event::Duplicated`] but emitted before a job is materialized).
+    /// An add carrying a deduplication id that is still live collapsed
+    /// into the job that holds it (see `JobOptions::deduplicate`).
     Deduplicated {
         /// The existing job id the new submission collapsed into.
         id: JobId,

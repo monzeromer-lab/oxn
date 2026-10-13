@@ -46,6 +46,17 @@ It contains breaking changes; see the migration notes below.
     code that read fields off a `JobOptions` value it built must handle
     `Option`s; code constructing `JobInsert` for a custom backend call
     must resolve first (`opts.resolve()`).
+- **Queue names and explicit job ids are validated (B6).** Both become parts
+  of Redis keys, so a `:` in either, or a job id equal to a queue-level key
+  (`wait`, `meta`, `events`, …), silently aliased another key. Queue names
+  must be non-empty with no `:`, whitespace or control characters; explicit
+  job ids additionally must not be all digits (reserved for auto ids) or a
+  reserved key name. Violations return `Error::Config` before anything is
+  written. `Queue::from_backend` now returns `Result<Queue<D>>`.
+  Scheduler job ids change from `sched:{id}:{ts}` to `sched-{id}-{ts}`.
+- `Event::Duplicated` loses its meaningless `dedup_id` field: it is emitted
+  when an explicit job id already exists (see below), while
+  `Event::Deduplicated` covers dedup-id collisions.
 - **`Backend` trait (custom backends):** `fetch_next` takes a
   `&CancellationToken` and must honor it only while *waiting* (B4); new
   required method `release(queue, id, token)` hands an active job back
@@ -86,6 +97,12 @@ It contains breaking changes; see the migration notes below.
   immediately and its pool slot is detached instead of being returned with
   a block still pending; the stalled scanner is joined before `run()`
   returns.
+- **Re-adding an explicit job id is idempotent (B6).** It used to
+  overwrite the existing job's hash in place (keeping stale fields such as
+  the old return value) and push the id into `wait` again — a completed job
+  reappeared in two containers, and 20 concurrent adds of one id queued it
+  20 times. An existing id now returns the original job untouched and emits
+  `duplicated`; the id is reusable once its job is removed.
 - **Nothing leaks any more (B5).** Every deletion path now goes through one
   Lua helper that removes a job's hash, every auxiliary key (`:lock`,
   `:logs`, `:dependencies`, `:processed`, …) and its dedup pointer:

@@ -165,7 +165,8 @@ async fn first_add_after_connect_does_not_pay_script_load_cost() {
         common::unique_queue_name("preload-timing"),
         backend.clone() as std::sync::Arc<dyn oxn::backend::Backend>,
         QueueOptions::default().prefix(common::TEST_PREFIX),
-    );
+    )
+    .unwrap();
 
     let t1 = Instant::now();
     let id1 = q

@@ -96,6 +96,7 @@ where
         backend.clone() as Arc<dyn Backend>,
         QueueOptions::default().prefix(TEST_PREFIX),
     )
+    .expect("valid test queue name")
 }
 
 /// Fully dispose of a queue's Redis footprint, including the `queues` index.

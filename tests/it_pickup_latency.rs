@@ -132,7 +132,8 @@ async fn burst_wakes_every_blocked_worker() {
             q.name(),
             backend,
             QueueOptions::default().prefix(common::TEST_PREFIX),
-        );
+        )
+        .unwrap();
         hs.push(spawn_worker(&wq, &starts, ms(400), 1, &cancel));
     }
     let_workers_block().await;

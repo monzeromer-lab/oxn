@@ -168,6 +168,7 @@ pub mod events;
 pub mod job;
 pub mod options;
 pub mod queue;
+pub mod validate;
 pub mod worker;
 
 #[cfg(feature = "flow")]

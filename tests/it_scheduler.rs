@@ -25,7 +25,7 @@ async fn enqueue_next_inserts_a_delayed_job() {
         Tick(0),
     );
     let id = sched.enqueue_next().await.unwrap();
-    assert!(id.as_str().starts_with("sched:heartbeat:"));
+    assert!(id.as_str().starts_with("sched-heartbeat-"), "{id}");
 
     let c = q.counts().await.unwrap();
     assert_eq!(c.delayed, 1);

@@ -302,6 +302,7 @@ pub fn queue_on(backend: Arc<dyn Backend>, name: &str, defaults: JobOptions) -> 
             .prefix(PREFIX)
             .default_job_options(defaults),
     )
+    .expect("harness queue names are valid")
 }
 
 fn removal_for(r: Retention) -> Removal {

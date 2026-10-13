@@ -27,6 +27,7 @@ fn queue_with(backend: Arc<dyn Backend>, name: &str, defaults: JobOptions) -> Qu
             .prefix(common::TEST_PREFIX)
             .default_job_options(defaults),
     )
+    .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -112,7 +113,8 @@ async fn queue_level_remove_on_complete_deletes_finished_jobs() {
         QueueOptions::default()
             .prefix(common::TEST_PREFIX)
             .remove_on_complete(Removal::Remove),
-    );
+    )
+    .unwrap();
     let mut rec = Recorder::new("b2_queue_remove_on_complete", q.name()).await;
     let dropped = rec
         .step("add (inherits Remove)", q.add(T(1), JobOptions::new()))
@@ -163,7 +165,8 @@ async fn queue_default_attempts_drive_retries() {
         QueueOptions::default()
             .prefix(common::TEST_PREFIX)
             .default_job_options(JobOptions::new().attempts(3)),
-    );
+    )
+    .unwrap();
     let mut rec = Recorder::new("b2_default_attempts_retry", q.name()).await;
     let id = rec
         .step("add", q.add(T(1), JobOptions::new()))
