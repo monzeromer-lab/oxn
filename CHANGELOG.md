@@ -68,7 +68,8 @@ It contains breaking changes; see the migration notes below.
   required method `release(queue, id, token)` hands an active job back
   without an outcome (B4); `subscribe` takes a `StreamStart` and returns
   `EventRecord`s (B8); new required `delay(queue, id, token, until_ms)`
-  for postponements (B9).
+  for postponements (B9); `fail` takes a trailing `trace: Option<&str>`
+  (B12b).
 - Dashboard (axum and actix) maps `NotFound` → **404** and state/lock
   conflicts → **409**, with `{"error": "..."}` bodies, instead of `204`.
 - New `Error::is_conflict()` and `Error::is_lock_lost()` helpers.
@@ -105,6 +106,13 @@ It contains breaking changes; see the migration notes below.
   immediately and its pool slot is detached instead of being returned with
   a block still pending; the stalled scanner is joined before `run()`
   returns.
+- **Failed attempts leave a stack trace (B12b).** `Job::stacktrace` (and
+  the dashboard's "Stack trace" section) was never written. Each real
+  failure — returned error, panic, unrecoverable, decode error, stall
+  limit — now appends `attempt N: <error>` with one `caused by:` line per
+  `source()`, capped at 4KB per entry and the 10 most recent entries.
+  Postponements add nothing; a later success keeps the history; a manual
+  `retry` clears it.
 - **`add_bulk` is real (B12a).** The Redis backend had no override, so
   `add_bulk` looped `add()`: one round trip and one script call per job,
   interleavable with other clients (the docs promised a pipelined call).

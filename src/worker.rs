@@ -374,14 +374,17 @@ async fn process_one_inner<D, R>(
             span.record("outcome", "decode-error");
             span.record("transition", "failed");
             tracing::warn!(error = %e, "payload decode failed");
+            let reason = format!("decode error: {e}");
+            let trace = format!("attempt {attempts_made}: {reason}");
             let r = backend
                 .fail(
                     &queue,
                     &id,
                     &token,
-                    &format!("decode error: {e}"),
+                    &reason,
                     None,
                     remove_on_fail,
+                    Some(&trace),
                 )
                 .await;
             log_transition("failed", &r);
@@ -433,6 +436,11 @@ async fn process_one_inner<D, R>(
     };
     span.record("outcome", outcome_label(&outcome));
     tracing::debug!(outcome = outcome_label(&outcome), "handler finished");
+    let trace = outcome
+        .as_ref()
+        .err()
+        .map(|e| failure_trace(attempts_made, e));
+    let trace = trace.as_deref();
 
     match outcome {
         Ok(ret) => {
@@ -454,7 +462,7 @@ async fn process_one_inner<D, R>(
         Err(Error::Unrecoverable(msg)) => {
             span.record("transition", "failed");
             let r = backend
-                .fail(&queue, &id, &token, &msg, None, remove_on_fail)
+                .fail(&queue, &id, &token, &msg, None, remove_on_fail, trace)
                 .await;
             log_transition("failed", &r);
         }
@@ -477,18 +485,55 @@ async fn process_one_inner<D, R>(
                         &err.to_string(),
                         Some(retry_at),
                         remove_on_fail,
+                        trace,
                     )
                     .await;
                 log_transition("retry-delayed", &r);
             } else {
                 span.record("transition", "failed");
                 let r = backend
-                    .fail(&queue, &id, &token, &err.to_string(), None, remove_on_fail)
+                    .fail(
+                        &queue,
+                        &id,
+                        &token,
+                        &err.to_string(),
+                        None,
+                        remove_on_fail,
+                        trace,
+                    )
                     .await;
                 log_transition("failed", &r);
             }
         }
     }
+}
+
+/// Longest stack-trace entry stored for one attempt.
+const MAX_TRACE_BYTES: usize = 4096;
+
+/// `attempt N: <error>` plus one `  caused by: …` line per source, capped
+/// at [`MAX_TRACE_BYTES`].
+fn failure_trace(attempt: u32, err: &Error) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!("attempt {attempt}: {err}");
+    let mut src = std::error::Error::source(err);
+    // `Error::Handler` displays its inner error already; start below it.
+    if let (Error::Handler(_), Some(s)) = (err, src) {
+        src = s.source();
+    }
+    while let Some(s) = src {
+        let _ = write!(out, "\n  caused by: {s}");
+        src = s.source();
+    }
+    if out.len() > MAX_TRACE_BYTES {
+        let mut cut = MAX_TRACE_BYTES;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push('…');
+    }
+    out
 }
 
 /// The message a panic carried, as `panic!` formats it.
@@ -724,5 +769,36 @@ mod tests {
             outcome_label::<()>(&Err(Error::Panicked("x".into()))),
             "panicked"
         );
+    }
+
+    #[test]
+    fn failure_traces_follow_the_source_chain_and_are_bounded() {
+        #[derive(Debug)]
+        struct E(&'static str, Option<Box<E>>);
+        impl std::fmt::Display for E {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for E {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|e| e as _)
+            }
+        }
+        let err = Error::handler(E(
+            "outer",
+            Some(Box::new(E("middle", Some(Box::new(E("root", None)))))),
+        ));
+        assert_eq!(
+            failure_trace(2, &err),
+            "attempt 2: handler error: outer\n  caused by: middle\n  caused by: root"
+        );
+        assert_eq!(
+            failure_trace(1, &Error::unrecoverable("x")),
+            "attempt 1: unrecoverable: x"
+        );
+        let long = failure_trace(1, &Error::unrecoverable("é".repeat(5000)));
+        assert!(long.len() <= MAX_TRACE_BYTES + '…'.len_utf8());
+        assert!(long.ends_with('…'));
     }
 }

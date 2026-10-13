@@ -39,7 +39,7 @@ async fn finish(
             .await
             .unwrap();
     } else {
-        b.fail(q, &f.job.id, "tok", "boom", None, removal)
+        b.fail(q, &f.job.id, "tok", "boom", None, removal, None)
             .await
             .unwrap();
     }

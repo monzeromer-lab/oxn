@@ -706,7 +706,8 @@ impl Backend for RedisBackend {
             .arg(until_ms)
             .arg("")
             .arg(self.max_stream_length as i64)
-            .arg(1);
+            .arg(1)
+            .arg("");
         let mut conn = self.conn().await?;
         self.eval(&mut conn, "move_to_delayed", queue, Some(id.as_str()), &inv)
             .await?;
@@ -759,7 +760,8 @@ impl Backend for RedisBackend {
             .arg("")
             .arg(now_ms())
             .arg(remove)
-            .arg(self.max_stream_length as i64);
+            .arg(self.max_stream_length as i64)
+            .arg("");
         let mut conn = self.conn().await?;
         self.eval(
             &mut conn,
@@ -780,6 +782,7 @@ impl Backend for RedisBackend {
         reason: &str,
         retry_at_ms: Option<i64>,
         removal: crate::options::Removal,
+        trace: Option<&str>,
     ) -> Result<()> {
         let keys = self.keys(queue);
         let mut conn = self.conn().await?;
@@ -797,7 +800,8 @@ impl Backend for RedisBackend {
                 .arg(ts)
                 .arg(reason)
                 .arg(self.max_stream_length as i64)
-                .arg(0);
+                .arg(0)
+                .arg(trace.unwrap_or(""));
             self.eval(&mut conn, "move_to_delayed", queue, Some(id.as_str()), &inv)
                 .await?;
             return Ok(());
@@ -818,7 +822,8 @@ impl Backend for RedisBackend {
             .arg(reason)
             .arg(now_ms())
             .arg(remove)
-            .arg(self.max_stream_length as i64);
+            .arg(self.max_stream_length as i64)
+            .arg(trace.unwrap_or(""));
         self.eval(
             &mut conn,
             "move_to_finished",

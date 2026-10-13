@@ -15,6 +15,7 @@
 -- ARGV[6] now (ms)
 -- ARGV[7] remove policy ("keep" | "remove" | "last:N" | "for:MS")
 -- ARGV[8] max stream len
+-- ARGV[9] stack-trace entry for this failed attempt (may be empty)
 --
 -- Returns 1, or -1 (job hash gone) / -2 (lock missing) / -6 (lock held by
 -- another token).
@@ -67,6 +68,7 @@ else
   if reason and reason ~= '' then
     redis.call('HSET', hashKey, 'failedReason', reason)
   end
+  oxnPushStack(hashKey, ARGV[9])
 end
 redis.call('HDEL', hashKey, 'lockToken')
 

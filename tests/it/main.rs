@@ -39,6 +39,7 @@ mod scheduler;
 mod script_errors;
 mod script_preload;
 mod shutdown;
+mod stacktraces;
 mod stalled;
 mod stalled_lifecycle;
 mod state_machine;

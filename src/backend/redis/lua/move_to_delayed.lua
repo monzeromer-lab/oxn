@@ -14,6 +14,7 @@
 -- ARGV[5] max stream len
 -- ARGV[6] postpone (1 = Error::Delayed / RateLimited: refund the attempt
 --         and record no failure; 0 = retry backoff after a real failure)
+-- ARGV[7] stack-trace entry for this failed attempt (may be empty)
 --
 -- Returns 1, or -2 (lock missing) / -6 (lock held by another token).
 
@@ -44,8 +45,11 @@ if postpone then
   if tonumber(redis.call('HGET', hashKey, 'attemptsMade') or '0') > 0 then
     redis.call('HINCRBY', hashKey, 'attemptsMade', -1)
   end
-elseif reason and reason ~= '' then
-  redis.call('HSET', hashKey, 'failedReason', reason)
+else
+  if reason and reason ~= '' then
+    redis.call('HSET', hashKey, 'failedReason', reason)
+  end
+  oxnPushStack(hashKey, ARGV[7])
 end
 redis.call('ZADD', delayedKey, retryAt, id)
 -- Wake a blocked worker so it re-computes its block time against this

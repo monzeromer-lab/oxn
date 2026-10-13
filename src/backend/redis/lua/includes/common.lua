@@ -73,6 +73,9 @@ end
 -- script blocks Redis for long.
 local OXN_BATCH = 1000
 
+-- Failed-attempt entries kept in a job's `stacktrace` (newest last).
+local OXN_STACK_LIMIT = 10
+
 -- Delete a job's hash and every key hanging off it, plus its dedup pointer
 -- if that pointer still names this job. Does not touch containers.
 local function oxnRemoveJobKeys(hashPrefix, id)
@@ -219,4 +222,19 @@ local function oxnAddJob(k, j, maxStream)
 
   oxnEmit(k.events, maxStream, 'event', 'added', 'jobId', id, 'name', j.name)
   return id
+end
+
+-- Append one failed attempt's trace to the job's `stacktrace` JSON array,
+-- keeping the OXN_STACK_LIMIT most recent. No-op for an empty entry.
+local function oxnPushStack(hashKey, entry)
+  if entry == nil or entry == '' then return end
+  local arr = {}
+  local raw = redis.call('HGET', hashKey, 'stacktrace')
+  if raw then
+    local ok, v = pcall(cjson.decode, raw)
+    if ok and type(v) == 'table' then arr = v end
+  end
+  table.insert(arr, entry)
+  while #arr > OXN_STACK_LIMIT do table.remove(arr, 1) end
+  redis.call('HSET', hashKey, 'stacktrace', cjson.encode(arr))
 end

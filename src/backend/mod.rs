@@ -214,6 +214,9 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
     /// `delayed` for re-execution at that timestamp; otherwise it's moved
     /// to `failed` with `removal` applied.
     ///
+    /// `trace`, when given, is appended to the job's `stacktrace` (the 10
+    /// most recent entries are kept).
+    ///
     /// Same lock errors as [`Self::complete`].
     async fn fail(
         &self,
@@ -223,6 +226,7 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
         reason: &str,
         retry_at_ms: Option<i64>,
         removal: crate::options::Removal,
+        trace: Option<&str>,
     ) -> Result<()>;
 
     /// Postpone an active job until `until_ms` without counting it as a

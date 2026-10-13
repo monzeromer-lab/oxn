@@ -216,7 +216,7 @@ async fn a_stall_does_not_consume_an_attempt() {
     assert_eq!(f.job.attempts_made, 1);
     rec.step(
         "fail attempt 1 (retry)",
-        b.fail(q.name(), &id, "w", "boom", Some(0), Removal::Keep),
+        b.fail(q.name(), &id, "w", "boom", Some(0), Removal::Keep, None),
     )
     .await
     .unwrap();

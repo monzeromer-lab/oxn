@@ -103,14 +103,14 @@ async fn finishing_with_a_foreign_or_expired_lock_is_rejected() {
     let r = rec
         .step(
             "retry-fail with token B",
-            b.fail(q.name(), &id, "B", "x", Some(0), Removal::Keep),
+            b.fail(q.name(), &id, "B", "x", Some(0), Removal::Keep, None),
         )
         .await;
     assert!(is_script(&r, ScriptError::LockMismatch), "{r:?}");
     let r = rec
         .step(
             "final-fail with token B",
-            b.fail(q.name(), &id, "B", "x", None, Removal::Keep),
+            b.fail(q.name(), &id, "B", "x", None, Removal::Keep, None),
         )
         .await;
     assert!(is_script(&r, ScriptError::LockMismatch), "{r:?}");

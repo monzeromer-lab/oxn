@@ -64,6 +64,8 @@ for i = 1, #active do
     if stalled > maxStalled then
       redis.call('HSET', hashKey, 'failedReason', reason, 'finishedOn', nowMs)
       local attemptsMade = redis.call('HGET', hashKey, 'attemptsMade') or '0'
+      oxnPushStack(hashKey, 'attempt ' .. attemptsMade .. ': ' .. reason
+        .. ' (stalled ' .. stalled .. ' times)')
       local policy = oxnPolicyFromOpts(oxnJobOpts(hashKey)['remove_on_fail'])
       oxnRetain(failedKey, hashPrefix, id, policy, nowMs)
       oxnEmit(eventsKey, maxStream, 'event', 'failed', 'jobId', id,

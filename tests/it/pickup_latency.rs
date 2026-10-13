@@ -223,6 +223,7 @@ async fn resume_promote_and_retry_wake_blocked_workers() {
             "boom",
             None,
             oxn::options::Removal::Keep,
+            None,
         ),
     )
     .await
