@@ -216,6 +216,23 @@ while let Some(Ok(event)) = stream.next().await {
 }
 ```
 
+The cursor is pinned when `stream()` returns, so nothing emitted in
+between is missed. Each subscriber uses its own connection (named
+`oxn-events:{queue}` in `CLIENT LIST`, never a pool slot) and reconnects
+with backoff after a dropped connection, surfacing one `Err` item and then
+continuing from where it left off. For a durable consumer, use
+`records()` and persist the last id:
+
+```rust
+use oxn::StreamStart;
+
+let mut records = queue.events().records(StreamStart::After(saved_id)).await?;
+while let Some(Ok(rec)) = records.next().await {
+    handle(rec.event);
+    save(&rec.id); // resume point
+}
+```
+
 ### Graceful shutdown
 
 ```rust

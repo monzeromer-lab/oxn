@@ -186,7 +186,7 @@ pub mod dashboard;
 pub mod prelude;
 
 pub use crate::error::{Error, Result};
-pub use crate::events::{Event, QueueEvents};
+pub use crate::events::{Event, EventRecord, QueueEvents, StreamStart};
 pub use crate::job::{Backoff, Job, JobId, JobState, Progress};
 pub use crate::options::{JobOptions, QueueOptions, ResolvedJobOptions, WorkerOptions};
 pub use crate::queue::Queue;

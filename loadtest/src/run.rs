@@ -51,6 +51,11 @@ pub struct Outcome {
     pub leak: LeakReport,
     pub violations: Vec<(f64, Violation)>,
     pub chaos_log: Vec<(f64, String)>,
+    /// oxn subscriber cross-check (`--oxn-subscriber`): its counts, the
+    /// transport errors it surfaced, and any mismatch with the observer.
+    pub oxn_subscriber_events: Option<BTreeMap<String, u64>>,
+    pub oxn_subscriber_errors: u64,
+    pub oxn_subscriber_mismatch: Vec<String>,
     pub health_before: RedisHealth,
     pub health_after_drain: RedisHealth,
     pub health_after_cleanup: Option<RedisHealth>,
@@ -205,6 +210,24 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
         })
     });
 
+    // oxn's own subscriber, pinned before the first add.
+    let sub_counts = Arc::new(Mutex::new(BTreeMap::new()));
+    let sub_errors = Arc::new(AtomicU64::new(0));
+    let stop_sub = CancellationToken::new();
+    let sub_task = if cfg.oxn_subscriber {
+        let sb = workload::connect(&oxn_url, 2).await?;
+        let sq = workload::queue_on(sb, &queue, oxn::JobOptions::new());
+        let records = sq.events().records(oxn::StreamStart::Now).await?;
+        Some(tokio::spawn(workload::oxn_subscriber(
+            records,
+            sub_counts.clone(),
+            sub_errors.clone(),
+            stop_sub.clone(),
+        )))
+    } else {
+        None
+    };
+
     // Producers.
     let backend = workload::connect(&oxn_url, cfg.producers * 2 + 2).await?;
     let pq = workload::queue_on(backend.clone(), &queue, workload::queue_defaults(&cfg));
@@ -282,6 +305,44 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
     };
     stop_observer.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(10), observer).await;
+    // Normalize the observer's names the way oxn's Event enum sees them,
+    // then give the subscriber time to catch up and compare.
+    let observed: BTreeMap<String, u64> = {
+        let mut m = BTreeMap::new();
+        for (k, v) in stream_counts.lock().iter() {
+            let k = if k == "stall-failed" {
+                "failed"
+            } else {
+                k.as_str()
+            };
+            *m.entry(k.to_string()).or_insert(0) += *v;
+        }
+        m
+    };
+    let mut sub_mismatch = Vec::new();
+    if let Some(t) = sub_task {
+        let want: u64 = observed.values().sum();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while sub_counts.lock().values().sum::<u64>() < want && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        stop_sub.cancel();
+        let _ = t.await;
+        let got = sub_counts.lock().clone();
+        for k in observed.keys().chain(got.keys()) {
+            let (a, b) = (
+                observed.get(k).copied().unwrap_or(0),
+                got.get(k).copied().unwrap_or(0),
+            );
+            if a != b
+                && !sub_mismatch
+                    .iter()
+                    .any(|m: &String| m.starts_with(&format!("{k}:")))
+            {
+                sub_mismatch.push(format!("{k}: observer {a}, oxn subscriber {b}"));
+            }
+        }
+    }
     stop_monitor.cancel();
     let _ = monitor.await;
     if let Some(c) = checker {
@@ -378,6 +439,12 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
     if errs > 0 {
         failures.push(format!("{errs} invariant violation(s) (errors)"));
     }
+    if !sub_mismatch.is_empty() {
+        failures.push(format!(
+            "oxn subscriber disagreed with the raw stream: {}",
+            sub_mismatch.join("; ")
+        ));
+    }
     failures.extend(
         retention_findings
             .iter()
@@ -421,6 +488,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
         leak,
         violations: violations.lock().clone(),
         chaos_log,
+        oxn_subscriber_events: cfg.oxn_subscriber.then(|| sub_counts.lock().clone()),
+        oxn_subscriber_errors: sub_errors.load(std::sync::atomic::Ordering::Relaxed),
+        oxn_subscriber_mismatch: sub_mismatch,
         health_before,
         health_after_drain,
         health_after_cleanup,

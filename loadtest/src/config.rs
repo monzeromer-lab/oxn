@@ -135,6 +135,11 @@ pub struct RunArgs {
     /// the main bounded-but-growing memory consumer in long runs.
     #[arg(long)]
     pub max_stream_len: Option<u64>,
+    /// Also consume the queue through oxn's own `QueueEvents::records`
+    /// subscriber (through the chaos proxy, if any) and require it to see
+    /// exactly what the raw observer saw.
+    #[arg(long)]
+    pub oxn_subscriber: bool,
     /// Worker `max_stalled` (stalls a job may survive before it fails).
     #[arg(long)]
     pub max_stalled: Option<u32>,
@@ -192,6 +197,8 @@ pub struct Config {
     pub max_stream_len: u64,
     /// Worker max_stalled.
     pub max_stalled: u32,
+    /// Cross-check oxn's subscriber against the raw observer.
+    pub oxn_subscriber: bool,
 }
 
 fn ser_dur<S: serde::Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
@@ -243,6 +250,7 @@ impl Config {
             shutdown_timeout_ms: 10_000,
             max_stream_len: 200_000,
             max_stalled: 1,
+            oxn_subscriber: a.oxn_subscriber,
         };
         match a.scenario {
             Smoke => {}

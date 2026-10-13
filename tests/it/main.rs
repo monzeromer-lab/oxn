@@ -22,6 +22,7 @@ mod dashboard_actix;
 mod dedup;
 mod delayed;
 mod drain_obliterate;
+mod event_stream;
 mod events;
 mod explicit_ids;
 mod flow;

@@ -57,10 +57,17 @@ It contains breaking changes; see the migration notes below.
 - `Event::Duplicated` loses its meaningless `dedup_id` field: it is emitted
   when an explicit job id already exists (see below), while
   `Event::Deduplicated` covers dedup-id collisions.
+- **Events:** new `QueueEvents::records(StreamStart)` yields
+  `EventRecord { id, at_ms, event }` for resumable consumers
+  (`StreamStart::{Now, Beginning, After(id)}`). `Event::Delayed`'s
+  `delay_ms` (which always held an absolute timestamp) is renamed
+  `due_at_ms`; `Event::Waiting` gains `prev` (`Some("active")` for a job
+  released by a shutting-down worker).
 - **`Backend` trait (custom backends):** `fetch_next` takes a
   `&CancellationToken` and must honor it only while *waiting* (B4); new
   required method `release(queue, id, token)` hands an active job back
-  without an outcome (B4).
+  without an outcome (B4); `subscribe` takes a `StreamStart` and returns
+  `EventRecord`s (B8).
 - Dashboard (axum and actix) maps `NotFound` → **404** and state/lock
   conflicts → **409**, with `{"error": "..."}` bodies, instead of `204`.
 - New `Error::is_conflict()` and `Error::is_lock_lost()` helpers.
@@ -97,6 +104,18 @@ It contains breaking changes; see the migration notes below.
   immediately and its pool slot is detached instead of being returned with
   a block still pending; the stalled scanner is joined before `run()`
   returns.
+- **The event stream loses nothing (B8).** `QueueEvents::stream()` read
+  from `$` lazily on the first poll, so everything emitted between
+  `stream()` and that poll was lost (the 0.2 probe saw 0 of 40 events);
+  each `XREAD` kept only its first entry; every subscriber held a pool slot
+  blocked in `XREAD` (a pool of one was unusable with one subscriber); and
+  connection errors were retried in a tight loop. Now the cursor is pinned
+  when `stream()` returns, whole batches (500) are consumed per read, each
+  subscriber has its own connection (`CLIENT SETNAME oxn-events:{queue}`)
+  that reconnects with exponential backoff (100ms–5s) and resumes from the
+  same cursor, and dropping the stream closes the connection. Under
+  network and `CLIENT KILL` chaos the subscriber matched the raw stream
+  event-for-event.
 - **Stalled jobs follow a real lifecycle (B7).** A job that stalled more
   than `max_stalled` times was removed from `active` but never added to
   `failed`: it lived in no container, could not be listed or retried, and

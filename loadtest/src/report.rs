@@ -155,6 +155,24 @@ pub fn render(o: &Outcome) -> String {
         .collect();
     let _ = writeln!(s, "{}\n", ev.join(" · "));
 
+    if let Some(sub) = &o.oxn_subscriber_events {
+        let _ = writeln!(s, "## oxn subscriber cross-check\n");
+        let ev: Vec<String> = sub.iter().map(|(k, n)| format!("{k}={n}")).collect();
+        let _ = writeln!(
+            s,
+            "{} · transport errors surfaced: {}\n",
+            ev.join(" · "),
+            o.oxn_subscriber_errors
+        );
+        if o.oxn_subscriber_mismatch.is_empty() {
+            let _ = writeln!(s, "Matches the raw stream exactly.\n");
+        } else {
+            for m in &o.oxn_subscriber_mismatch {
+                let _ = writeln!(s, "- ❌ {m}");
+            }
+            let _ = writeln!(s);
+        }
+    }
     if !o.violations.is_empty() {
         let _ = writeln!(s, "## Invariant violations\n");
         for (t, v) in o.violations.iter().take(50) {

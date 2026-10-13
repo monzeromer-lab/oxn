@@ -788,6 +788,39 @@ pub async fn observe_stream(
     }
 }
 
+/// Consume the queue through oxn's own subscriber, counting events by the
+/// same names the raw observer uses (`released` for waiting-after-active).
+pub async fn oxn_subscriber(
+    mut records: oxn::events::RecordStream,
+    counts: Arc<Mutex<std::collections::BTreeMap<String, u64>>>,
+    errors: Arc<AtomicU64>,
+    stop: CancellationToken,
+) {
+    use futures::StreamExt;
+    loop {
+        let next = tokio::select! {
+            _ = stop.cancelled() => break,
+            n = records.next() => n,
+        };
+        match next {
+            None => break,
+            Some(Err(_)) => {
+                errors.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(Ok(r)) => {
+                let name = match &r.event {
+                    Event::Waiting { prev: Some(p), .. } if p == "active" => "released".to_string(),
+                    e => serde_json::to_value(e)
+                        .ok()
+                        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
+                        .unwrap_or_else(|| "unknown".into()),
+                };
+                *counts.lock().entry(name).or_default() += 1;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

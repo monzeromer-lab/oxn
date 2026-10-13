@@ -12,15 +12,12 @@
 //! and [`Worker`](crate::Worker) via `serde_json`.
 
 use std::fmt;
-use std::pin::Pin;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::events::Event;
 use crate::job::{JobId, JobState};
 use crate::options::ResolvedJobOptions;
 
@@ -148,7 +145,7 @@ impl JobRange {
 }
 
 /// Event stream type alias to avoid `Pin<Box<...>>` noise at call sites.
-pub type EventStream = Pin<Box<dyn Stream<Item = Result<Event>> + Send + 'static>>;
+pub use crate::events::{EventRecord, EventStream, RecordStream, StreamStart};
 
 /// Pluggable storage backend.
 ///
@@ -320,9 +317,15 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
     /// Update in-progress progress value.
     async fn update_progress(&self, queue: &str, id: &JobId, progress_json: &str) -> Result<()>;
 
-    /// Subscribe to the queue's event stream. Each call yields an
-    /// independent cursor; backpressure-friendly.
-    async fn subscribe(&self, queue: &str) -> Result<EventStream>;
+    /// Subscribe to the queue's event stream from `from`. Each call yields
+    /// an independent cursor; backpressure-friendly.
+    ///
+    /// Implementations must resolve [`StreamStart::Now`] to a concrete
+    /// position **before returning** (events emitted between this call and
+    /// the first poll must be delivered), must not lose or duplicate
+    /// entries across reconnects, and should surface transport errors as
+    /// `Err` items rather than ending the stream.
+    async fn subscribe(&self, queue: &str, from: StreamStart) -> Result<RecordStream>;
 
     /// List queues known to this backend (used by the dashboard).
     async fn list_queues(&self) -> Result<Vec<String>>;

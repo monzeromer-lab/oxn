@@ -19,11 +19,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use deadpool_redis::{Config as PoolConfig, Connection as PooledConn, Pool, Runtime};
-use futures::stream::{Stream, StreamExt};
+use futures::stream::Stream;
 use redis::AsyncCommands;
 use tracing::Instrument;
 
-use crate::backend::{Backend, EventStream, Fetched, JobInsert, JobRange, RawJob, StateCounts};
+use crate::backend::{
+    Backend, EventRecord, Fetched, JobInsert, JobRange, RawJob, RecordStream, StateCounts,
+    StreamStart,
+};
 use crate::error::{Error, Result};
 use crate::events::Event;
 use crate::job::{JobId, JobState};
@@ -112,6 +115,9 @@ impl RedisConfig {
 #[derive(Clone)]
 pub struct RedisBackend {
     pool: Pool,
+    /// For connections that must not come from the pool: each event
+    /// subscriber blocks in `XREAD` on its own connection.
+    client: redis::Client,
     prefix: String,
     max_stream_length: usize,
     scripts: Arc<scripts::Scripts>,
@@ -184,8 +190,10 @@ impl RedisBackend {
             Arc::new(KeepaliveGuard { cancel })
         });
 
+        let client = redis::Client::open(cfg.url.as_str())?;
         let backend = Self {
             pool,
+            client,
             prefix: cfg.prefix,
             max_stream_length: cfg.max_stream_length,
             scripts: Arc::new(scripts::Scripts::new()),
@@ -1121,8 +1129,37 @@ impl Backend for RedisBackend {
         Ok(())
     }
 
-    async fn subscribe(&self, queue: &str) -> Result<EventStream> {
-        Ok(self.subscribe_impl(queue.to_string()).boxed())
+    async fn subscribe(&self, queue: &str, from: StreamStart) -> Result<RecordStream> {
+        let key = self.keys(queue).events();
+        // Resolve `Now` to a concrete id *here*, so events emitted between
+        // this call and the first poll are not lost (0.2 read from `$`
+        // lazily on every XREAD).
+        let cursor = match from {
+            StreamStart::Beginning => "0-0".to_string(),
+            StreamStart::After(id) => id,
+            StreamStart::Now => {
+                let mut conn = self.conn().await?;
+                let last: redis::streams::StreamRangeReply = redis::cmd("XREVRANGE")
+                    .arg(&key)
+                    .arg("+")
+                    .arg("-")
+                    .arg("COUNT")
+                    .arg(1)
+                    .query_async(&mut *conn)
+                    .await?;
+                last.ids
+                    .into_iter()
+                    .next()
+                    .map(|e| e.id)
+                    .unwrap_or_else(|| "0-0".to_string())
+            }
+        };
+        Ok(Box::pin(subscription(
+            self.client.clone(),
+            queue.to_string(),
+            key,
+            cursor,
+        )))
     }
 
     async fn list_queues(&self) -> Result<Vec<String>> {
@@ -1313,49 +1350,129 @@ fn parse_fetched(reply: redis::Value, token: &str) -> Result<Moved> {
     })))
 }
 
-impl RedisBackend {
-    fn subscribe_impl(&self, queue: String) -> impl Stream<Item = Result<Event>> + Send + 'static {
-        use futures::stream;
-        let backend = self.clone();
-        let keys = self.keys(&queue);
-        let events_key = keys.events();
-        stream::unfold(
-            (backend, events_key, "$".to_string()),
-            move |(backend, key, last_id)| async move {
-                let mut conn = match backend.conn().await {
-                    Ok(c) => c,
-                    Err(e) => return Some((Err(e), (backend, key, last_id))),
-                };
-                let reply: redis::streams::StreamReadReply = match redis::cmd("XREAD")
-                    .arg("BLOCK")
-                    .arg(5000)
-                    .arg("COUNT")
-                    .arg(100)
-                    .arg("STREAMS")
-                    .arg(&key)
-                    .arg(&last_id)
-                    .query_async(&mut *conn)
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => return Some((Err(e.into()), (backend, key, last_id))),
-                };
-                let mut last = last_id.clone();
-                if let Some(s) = reply.keys.first() {
-                    if let Some(e) = s.ids.first() {
-                        last = e.id.clone();
-                        let evt = parse_stream_entry(&e.map);
-                        return Some((Ok(evt), (backend, key, last)));
+/// Entries per `XREAD`; a burst is consumed in batches, not one per trip.
+const XREAD_COUNT: usize = 500;
+/// How long one `XREAD` blocks before looping (keeps dead peers detectable).
+const XREAD_BLOCK_MS: u64 = 5_000;
+/// Reconnect backoff bounds after a subscriber connection fails.
+const BACKOFF_MIN: Duration = Duration::from_millis(100);
+const BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+struct Sub {
+    client: redis::Client,
+    queue: String,
+    key: String,
+    cursor: String,
+    conn: Option<redis::aio::MultiplexedConnection>,
+    buf: std::collections::VecDeque<EventRecord>,
+    backoff: Duration,
+    failed: bool,
+}
+
+/// The event subscription: a dedicated connection (named
+/// `oxn-events:{queue}` in `CLIENT LIST`) blocked in `XREAD` from `cursor`.
+/// Reads whole batches; on a connection error yields one `Err`, waits with
+/// exponential backoff, reconnects and continues from the same cursor, so
+/// nothing is lost or repeated. Dropping the stream closes the connection.
+fn subscription(
+    client: redis::Client,
+    queue: String,
+    key: String,
+    cursor: String,
+) -> impl Stream<Item = Result<EventRecord>> + Send + 'static {
+    let sub = Sub {
+        client,
+        queue,
+        key,
+        cursor,
+        conn: None,
+        buf: std::collections::VecDeque::new(),
+        backoff: BACKOFF_MIN,
+        failed: false,
+    };
+    futures::stream::unfold(sub, |mut sub| async move {
+        loop {
+            if let Some(rec) = sub.buf.pop_front() {
+                return Some((Ok(rec), sub));
+            }
+            if sub.failed {
+                tokio::time::sleep(sub.backoff).await;
+                sub.backoff = (sub.backoff * 2).min(BACKOFF_MAX);
+                sub.failed = false;
+            }
+            if sub.conn.is_none() {
+                match connect_subscriber(&sub.client, &sub.queue).await {
+                    Ok(c) => sub.conn = Some(c),
+                    Err(e) => {
+                        sub.failed = true;
+                        return Some((Err(e), sub));
                     }
                 }
-                Some((Ok(Event::Unknown), (backend, key, last)))
-            },
-        )
-        .filter(|r| {
-            let keep = !matches!(r, Ok(Event::Unknown));
-            futures::future::ready(keep)
-        })
-    }
+            }
+            let Some(conn) = sub.conn.as_mut() else {
+                continue; // unreachable: connected just above
+            };
+            let reply: redis::RedisResult<Option<redis::streams::StreamReadReply>> =
+                redis::cmd("XREAD")
+                    .arg("BLOCK")
+                    .arg(XREAD_BLOCK_MS)
+                    .arg("COUNT")
+                    .arg(XREAD_COUNT)
+                    .arg("STREAMS")
+                    .arg(&sub.key)
+                    .arg(&sub.cursor)
+                    .query_async(conn)
+                    .await;
+            match reply {
+                Err(e) => {
+                    tracing::warn!(queue = %sub.queue, error = %e, cursor = %sub.cursor,
+                        "event subscription lost its connection; reconnecting");
+                    sub.conn = None;
+                    sub.failed = true;
+                    return Some((Err(e.into()), sub));
+                }
+                Ok(None) => continue, // BLOCK timed out with nothing new
+                Ok(Some(r)) => {
+                    sub.backoff = BACKOFF_MIN;
+                    for entry in r.keys.into_iter().flat_map(|k| k.ids) {
+                        sub.cursor = entry.id.clone();
+                        let event = parse_stream_entry(&entry.map);
+                        if matches!(event, Event::Unknown) {
+                            continue;
+                        }
+                        let at_ms = entry
+                            .id
+                            .split('-')
+                            .next()
+                            .and_then(|ms| ms.parse().ok())
+                            .unwrap_or(0);
+                        sub.buf.push_back(EventRecord {
+                            id: entry.id,
+                            at_ms,
+                            event,
+                        });
+                    }
+                }
+            }
+        }
+    })
+}
+
+async fn connect_subscriber(
+    client: &redis::Client,
+    queue: &str,
+) -> Result<redis::aio::MultiplexedConnection> {
+    let mut conn = client.get_multiplexed_async_connection().await?;
+    let name: String = format!("oxn-events:{queue}")
+        .chars()
+        .map(|c| if c.is_ascii_graphic() { c } else { '_' })
+        .collect();
+    let _: () = redis::cmd("CLIENT")
+        .arg("SETNAME")
+        .arg(name)
+        .query_async(&mut conn)
+        .await?;
+    Ok(conn)
 }
 
 fn parse_stream_entry(map: &std::collections::HashMap<String, redis::Value>) -> Event {
@@ -1376,7 +1493,10 @@ fn parse_stream_entry(map: &std::collections::HashMap<String, redis::Value>) -> 
             id,
             name: s(map, "name").unwrap_or_default(),
         },
-        "waiting" => Event::Waiting { id },
+        "waiting" => Event::Waiting {
+            id,
+            prev: s(map, "prev"),
+        },
         "active" => Event::Active {
             id,
             prev: s(map, "prev"),
@@ -1394,7 +1514,7 @@ fn parse_stream_entry(map: &std::collections::HashMap<String, redis::Value>) -> 
         },
         "delayed" => Event::Delayed {
             id,
-            delay_ms: s(map, "delay").and_then(|x| x.parse().ok()).unwrap_or(0),
+            due_at_ms: s(map, "delay").and_then(|x| x.parse().ok()).unwrap_or(0),
         },
         "progress" => Event::Progress {
             id,
