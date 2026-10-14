@@ -24,6 +24,9 @@
 -- ARGV[2] lock duration (ms)
 -- ARGV[3] now (ms)
 -- ARGV[4] max stream len
+-- ARGV[5] rate-limit max (0 = none)   ARGV[6] rate-limit window (ms)
+-- ARGV[7] retry (1 = an earlier call with this token may have taken a job
+--         whose reply was lost: return that job instead of another)
 
 local waitKey    = KEYS[1]
 local pausedKey  = KEYS[2]
@@ -41,6 +44,21 @@ local nowMs    = tonumber(ARGV[3])
 local maxStream = tonumber(ARGV[4])
 local limitMax  = tonumber(ARGV[5]) or 0   -- 0 = no rate limit
 local limitMs   = tonumber(ARGV[6]) or 0
+
+-- A retried fetch: hand back the job an earlier call with this token took
+-- (its reply was lost), re-arming its lock, rather than take a second one
+-- and leave the first locked until it stalls. Scans `active` only on a
+-- retry. A job the stalled scanner already reclaimed no longer carries
+-- the token, so it is never handed out twice.
+if ARGV[7] == '1' then
+  for _, held in ipairs(redis.call('LRANGE', activeKey, 0, -1)) do
+    local h = hashPrefix .. held
+    if redis.call('HGET', h, 'lockToken') == token then
+      redis.call('SET', h .. ':lock', token, 'PX', lockMs)
+      return { held, redis.call('HGETALL', h) }
+    end
+  end
+end
 
 -- short-circuit if paused (resume wakes workers)
 if redis.call('HGET', metaKey, 'paused') == '1' then

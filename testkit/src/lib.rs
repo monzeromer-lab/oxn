@@ -28,6 +28,7 @@
 
 pub mod capture;
 pub mod env;
+pub mod fault;
 pub mod invariants;
 pub mod metrics;
 pub mod monitor;

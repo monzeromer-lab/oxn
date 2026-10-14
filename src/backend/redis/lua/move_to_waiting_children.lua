@@ -13,6 +13,7 @@
 -- ARGV[1] id
 -- ARGV[2] token
 -- ARGV[3] max stream len
+-- ARGV[4] retry (idempotent per token, see move_to_finished.lua)
 --
 -- Returns 1 (waiting), 0 (no pending children: ready again), or -1 / -2 /
 -- -6 like move_to_finished.
@@ -24,17 +25,22 @@ local token     = ARGV[2]
 local maxStream = tonumber(ARGV[3])
 
 if redis.call('EXISTS', hashKey) == 0 then
+  if ARGV[4] == '1' then return 1 end
   redis.call('LREM', KEYS[1], 0, id)
   redis.call('DEL', lockKey)
   return -1
 end
 local held = redis.call('GET', lockKey)
-if not held then return -2 end
-if held ~= token then return -6 end
+if held ~= token then
+  if redis.call('HGET', hashKey, 'doneToken') == token then return 1 end
+  if not held then return -2 end
+  return -6
+end
 
 redis.call('LREM', KEYS[1], 1, id)
 redis.call('DEL', lockKey)
 redis.call('HDEL', hashKey, 'lockToken', 'processedOn')
+redis.call('HSET', hashKey, 'doneToken', token)
 if tonumber(redis.call('HGET', hashKey, 'attemptsMade') or '0') > 0 then
   redis.call('HINCRBY', hashKey, 'attemptsMade', -1)
 end

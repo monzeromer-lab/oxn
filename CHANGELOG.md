@@ -120,6 +120,23 @@ It contains breaking changes; see the migration notes below.
   immediately and its pool slot is detached instead of being returned with
   a block still pending; the stalled scanner is joined before `run()`
   returns.
+- **A dropped connection no longer loses a job's outcome (B15).**
+  `complete` / `fail` / `delay` / `release` / `wait_for_children` failing
+  on a connection error were logged and never retried: if the call never
+  reached Redis the job stayed active until its lock expired and then ran
+  **again**; if Redis ran it but the reply was lost, the outcome was
+  reported as failed although it was recorded. These transitions now retry
+  connection-level failures (I/O, dropped or refused connection, timeout,
+  pool errors, `LOADING`) for up to `RedisConfig::transition_retry_for`
+  (default 30s, keep it ≤ `lock_duration`), and every lock-consuming
+  script is idempotent per lock token (`doneToken` in the job hash): a
+  retry of a transition that already applied succeeds without applying it
+  twice (attempt refunds and stack-trace entries happen once). A fetch
+  whose reply was lost is retried with the same token and hands back the
+  job it took, instead of leaving it locked until it stalls. New metric
+  `oxn_transition_retries_total{script}`. Under chaos (6 rounds of
+  `CLIENT KILL`, a Redis restart): 0 transition errors, 0 stalls, 0 lost
+  or duplicated jobs.
 - **Delayed jobs start on time on a quiet Redis (B3b).** A worker waiting
   for a delayed job blocked in `BZPOPMIN` with a timeout of exactly the
   time until it was due, but Redis fires blocking timeouts on its own

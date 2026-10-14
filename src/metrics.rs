@@ -18,6 +18,7 @@
 //! | `oxn_jobs_stalled_total` | counter | | stalled jobs found by the scanner (requeued or failed) |
 //! | `oxn_lock_lost_total` | counter | | outcomes discarded because another owner held the job |
 //! | `oxn_transition_errors_total` | counter | `to` | outcomes Redis did not record for another reason |
+//! | `oxn_transition_retries_total` | counter | `script` | outcome transitions retried after a connection failure (each retry is idempotent) |
 //! | `oxn_fetch_errors_total` | counter | | failed fetches |
 //! | `oxn_rate_limited_total` | counter | | fetches refused by the queue's rate limit |
 //! | `oxn_job_duration_seconds` | histogram | `outcome` | handler run time; `outcome` is `ok`, `error`, `panicked`, `unrecoverable`, `delayed`, `rate-limited`, `waiting-children`, `cancelled` (`Error::Closed`) or `aborted` (by `shutdown_timeout`) |
@@ -47,6 +48,8 @@ pub const STALLED: &str = "oxn_jobs_stalled_total";
 pub const LOCK_LOST: &str = "oxn_lock_lost_total";
 /// `oxn_transition_errors_total`
 pub const TRANSITION_ERRORS: &str = "oxn_transition_errors_total";
+/// `oxn_transition_retries_total`
+pub const TRANSITION_RETRIES: &str = "oxn_transition_retries_total";
 /// `oxn_fetch_errors_total`
 pub const FETCH_ERRORS: &str = "oxn_fetch_errors_total";
 /// `oxn_rate_limited_total`
@@ -94,6 +97,11 @@ pub fn describe() {
         TRANSITION_ERRORS,
         Unit::Count,
         "Outcomes Redis did not record (other than a lost lock)."
+    );
+    describe_counter!(
+        TRANSITION_RETRIES,
+        Unit::Count,
+        "Outcome transitions retried after a connection failure."
     );
     describe_counter!(FETCH_ERRORS, Unit::Count, "Failed fetches.");
     describe_counter!(

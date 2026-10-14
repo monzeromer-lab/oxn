@@ -27,6 +27,7 @@ mod drain_obliterate;
 mod event_stream;
 mod events;
 mod explicit_ids;
+mod finalize_retry;
 mod flow;
 mod handler_panics;
 mod job_context;

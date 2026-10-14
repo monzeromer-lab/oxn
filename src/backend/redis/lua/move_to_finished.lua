@@ -16,6 +16,12 @@
 -- ARGV[7] remove policy ("keep" | "remove" | "last:N" | "for:MS")
 -- ARGV[8] max stream len
 -- ARGV[9] stack-trace entry for this failed attempt (may be empty)
+-- ARGV[10] retry (1 = an earlier call with this token may already have
+--          applied: the connection dropped before its reply arrived)
+--
+-- Idempotent per token: a call whose lock is gone but whose token already
+-- finished the job (`doneToken`) returns 1 without applying twice; on a
+-- retry, so does a job already deleted by its own retention.
 --
 -- Returns 1, or -1 (job hash gone) / -2 (lock missing) / -6 (lock held by
 -- another token) / -4 (completing a parent whose children are still
@@ -43,6 +49,7 @@ local maxStream = tonumber(ARGV[8])
 -- the job hash vanished while the job was active: clean up the dangling
 -- active entry and lock, and report it.
 if redis.call('EXISTS', hashKey) == 0 then
+  if ARGV[10] == '1' then return 1 end
   redis.call('LREM', activeKey, 0, id)
   redis.call('DEL', lockKey)
   return -1
@@ -50,10 +57,9 @@ end
 
 -- verify lock ownership
 local held = redis.call('GET', lockKey)
-if held == false or held == nil then
-  return -2
-end
 if held ~= token then
+  if redis.call('HGET', hashKey, 'doneToken') == token then return 1 end
+  if not held then return -2 end
   return -6
 end
 if event == 'completed' and redis.call('SCARD', hashKey .. ':dependencies') > 0 then
@@ -78,6 +84,7 @@ else
   oxnPushStack(hashKey, ARGV[9])
 end
 redis.call('HDEL', hashKey, 'lockToken')
+redis.call('HSET', hashKey, 'doneToken', token)
 
 -- event payload read before retention may delete the hash
 local attemptsMade = redis.call('HGET', hashKey, 'attemptsMade') or '0'

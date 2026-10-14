@@ -81,6 +81,12 @@ pub(crate) fn stalled(queue: &str, n: usize) {
     }
 }
 
+pub(crate) fn transition_retried(queue: &str, script: &'static str) {
+    #[cfg(feature = "metrics")]
+    ::metrics::counter!(m::TRANSITION_RETRIES, "queue" => queue.to_string(), "script" => script)
+        .increment(1);
+}
+
 pub(crate) fn fetch_error(queue: &str) {
     #[cfg(feature = "metrics")]
     count(m::FETCH_ERRORS, queue, 1);

@@ -518,6 +518,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
             oxn::metrics::STALLED,
             oxn::metrics::LOCK_LOST,
             oxn::metrics::TRANSITION_ERRORS,
+            oxn::metrics::TRANSITION_RETRIES,
             oxn::metrics::FETCH_ERRORS,
             oxn::metrics::RATE_LIMITED,
         ] {

@@ -15,6 +15,8 @@
 -- ARGV[6] postpone (1 = Error::Delayed / RateLimited: refund the attempt
 --         and record no failure; 0 = retry backoff after a real failure)
 -- ARGV[7] stack-trace entry for this failed attempt (may be empty)
+-- ARGV[8] retry (1 = an earlier call with this token may already have
+--         applied; idempotent per token, see move_to_finished.lua)
 --
 -- Returns 1, or -2 (lock missing) / -6 (lock held by another token).
 
@@ -32,14 +34,19 @@ local reason   = ARGV[4]
 local maxStream = tonumber(ARGV[5])
 local postpone = ARGV[6] == '1'
 
+if ARGV[8] == '1' and redis.call('EXISTS', hashKey) == 0 then return 1 end
 -- verify lock
 local held = redis.call('GET', lockKey)
-if held == false or held == nil then return -2 end
-if held ~= token then return -6 end
+if held ~= token then
+  if redis.call('HGET', hashKey, 'doneToken') == token then return 1 end
+  if not held then return -2 end
+  return -6
+end
 
 redis.call('LREM', activeKey, 1, id)
 redis.call('DEL', lockKey)
 redis.call('HDEL', hashKey, 'lockToken', 'processedOn')
+redis.call('HSET', hashKey, 'doneToken', token)
 if postpone then
   -- not a failure: the handler asked to run later
   if tonumber(redis.call('HGET', hashKey, 'attemptsMade') or '0') > 0 then

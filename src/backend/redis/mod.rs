@@ -55,6 +55,12 @@ pub struct RedisConfig {
     /// detects the dead socket and a fresh TLS handshake is paid. Set
     /// to `None` to disable. Default: `Some(Duration::from_secs(25))`.
     pub keepalive_interval: Option<Duration>,
+    /// How long a lock-consuming transition (complete, fail, delay,
+    /// release) keeps retrying after a connection failure before giving
+    /// up. Keep it at or below the workers' `lock_duration`: past that the
+    /// stalled scanner may hand the job to another worker anyway.
+    /// Default 30s.
+    pub transition_retry_for: Duration,
     /// Per-checkout health-check timeout for [`Self::keepalive_interval`].
     /// If a slot's PING does not return within this window, the connection
     /// is detached from the pool and a fresh one is minted. Default 2s.
@@ -72,7 +78,15 @@ impl RedisConfig {
             max_stream_length: 10_000,
             keepalive_interval: Some(Duration::from_secs(25)),
             health_check_timeout: Duration::from_secs(2),
+            transition_retry_for: Duration::from_secs(30),
         }
+    }
+
+    /// Override [`Self::transition_retry_for`].
+    #[must_use]
+    pub fn transition_retry_for(mut self, d: Duration) -> Self {
+        self.transition_retry_for = d;
+        self
     }
 
     /// Override the Redis key prefix.
@@ -120,6 +134,7 @@ pub struct RedisBackend {
     client: redis::Client,
     prefix: String,
     max_stream_length: usize,
+    transition_retry_for: Duration,
     scripts: Arc<scripts::Scripts>,
     /// Process-local set of queue names we've already SADD'd into the
     /// `{prefix}:queues` registry. Eliminates an unconditional `SADD` round
@@ -196,6 +211,7 @@ impl RedisBackend {
             client,
             prefix: cfg.prefix,
             max_stream_length: cfg.max_stream_length,
+            transition_retry_for: cfg.transition_retry_for,
             scripts: Arc::new(scripts::Scripts::new()),
             registered_queues: Arc::new(dashmap::DashSet::new()),
             _keepalive: keepalive,
@@ -384,6 +400,58 @@ impl RedisBackend {
         }
     }
 
+    /// Run a lock-consuming transition (complete, fail, delay, release,
+    /// wait for children), retrying a connection-level failure for up to
+    /// [`RedisConfig::transition_retry_for`].
+    ///
+    /// A dropped connection is ambiguous: the call may never have reached
+    /// Redis, or Redis ran it and only the reply was lost. Retries pass
+    /// the script's `retry` flag, and every such script is idempotent per
+    /// lock token (`doneToken`), so a transition that already applied
+    /// reports success instead of "lock lost" and is never applied twice.
+    async fn eval_transition<'s>(
+        &'s self,
+        script: &'static str,
+        queue: &str,
+        job_id: &str,
+        build: impl Fn(bool) -> redis::ScriptInvocation<'s> + Send,
+    ) -> Result<redis::Value> {
+        let deadline = std::time::Instant::now() + self.transition_retry_for;
+        let mut backoff = Duration::from_millis(25);
+        let mut attempt: u32 = 0;
+        loop {
+            let inv = build(attempt > 0);
+            let r = match self.conn().await {
+                Ok(mut conn) => {
+                    self.eval(&mut conn, script, queue, Some(job_id), &inv)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            match r {
+                Err(e) if is_transient(&e) && std::time::Instant::now() + backoff < deadline => {
+                    tracing::warn!(script, queue, job_id, attempt, error = %e, "transition interrupted by the connection; retrying");
+                    crate::telemetry::transition_retried(queue, script);
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(1));
+                    attempt += 1;
+                }
+                r => {
+                    if attempt > 0 && r.is_ok() {
+                        tracing::info!(
+                            script,
+                            queue,
+                            job_id,
+                            attempt,
+                            "transition applied after retrying"
+                        );
+                    }
+                    return r;
+                }
+            }
+        }
+    }
+
     /// Run one Lua script inside an `oxn.script` tracing span.
     ///
     /// Every state transition funnels through here, so a single
@@ -442,31 +510,35 @@ impl RedisBackend {
         rate_limit: Option<crate::options::RateLimit>,
     ) -> Result<Moved> {
         let keys = self.keys(queue);
-        let mut inv = self.scripts.move_to_active.prepare_invoke();
-        inv.key(keys.wait())
-            .key(keys.paused())
-            .key(keys.active())
-            .key(keys.prioritized())
-            .key(keys.delayed())
-            .key(keys.events())
-            .key(keys.meta())
-            .key(keys.marker())
-            .key(keys.job_hash_prefix())
-            .key(keys.priority_counter())
-            .key(keys.limiter())
-            .arg(worker_token)
-            .arg(lock_duration.as_millis() as i64)
-            .arg(now_ms())
-            .arg(self.max_stream_length as i64)
-            .arg(rate_limit.map(|r| r.max).unwrap_or(0))
-            .arg(
-                rate_limit
-                    .map(|r| r.per.as_millis().max(1) as i64)
-                    .unwrap_or(0),
-            );
-        let mut conn = self.conn().await?;
+        // Retried like a transition: a lost reply may hide a job this
+        // token already took (the script hands it back on a retry).
         let reply = self
-            .eval(&mut conn, "move_to_active", queue, None, &inv)
+            .eval_transition("move_to_active", queue, "", |retry| {
+                let mut inv = self.scripts.move_to_active.prepare_invoke();
+                inv.key(keys.wait())
+                    .key(keys.paused())
+                    .key(keys.active())
+                    .key(keys.prioritized())
+                    .key(keys.delayed())
+                    .key(keys.events())
+                    .key(keys.meta())
+                    .key(keys.marker())
+                    .key(keys.job_hash_prefix())
+                    .key(keys.priority_counter())
+                    .key(keys.limiter())
+                    .arg(worker_token)
+                    .arg(lock_duration.as_millis() as i64)
+                    .arg(now_ms())
+                    .arg(self.max_stream_length as i64)
+                    .arg(rate_limit.map(|r| r.max).unwrap_or(0))
+                    .arg(
+                        rate_limit
+                            .map(|r| r.per.as_millis().max(1) as i64)
+                            .unwrap_or(0),
+                    )
+                    .arg(i32::from(retry));
+                inv
+            })
             .await?;
         parse_fetched(reply, worker_token)
     }
@@ -508,6 +580,27 @@ const MIN_BLOCK: Duration = Duration::from_millis(1);
 
 /// How long a worker that found nothing to do should block: until the
 /// next delayed job is due, but never longer than `drain_delay`.
+/// A failure of the connection rather than an answer from Redis: the
+/// call may or may not have run, and trying again may succeed.
+fn is_transient(e: &Error) -> bool {
+    match e {
+        Error::Pool(_) => true,
+        Error::Redis(r) => {
+            r.is_io_error()
+                || r.is_connection_dropped()
+                || r.is_connection_refusal()
+                || r.is_timeout()
+                || matches!(
+                    r.kind(),
+                    redis::ErrorKind::BusyLoadingError
+                        | redis::ErrorKind::TryAgain
+                        | redis::ErrorKind::MasterDown
+                )
+        }
+        _ => false,
+    }
+}
+
 /// Sleep until `at`; never resolves for `None`.
 async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
     match at {
@@ -766,45 +859,49 @@ impl Backend for RedisBackend {
 
     async fn delay(&self, queue: &str, id: &JobId, token: &str, until_ms: i64) -> Result<()> {
         let keys = self.keys(queue);
-        let mut inv = self.scripts.move_to_delayed.prepare_invoke();
-        inv.key(keys.active())
-            .key(keys.delayed())
-            .key(keys.job_hash(id.as_str()))
-            .key(keys.job_lock(id.as_str()))
-            .key(keys.events())
-            .key(keys.marker())
-            .arg(id.as_str())
-            .arg(token)
-            .arg(until_ms)
-            .arg("")
-            .arg(self.max_stream_length as i64)
-            .arg(1)
-            .arg("");
-        let mut conn = self.conn().await?;
-        self.eval(&mut conn, "move_to_delayed", queue, Some(id.as_str()), &inv)
-            .await?;
+        self.eval_transition("move_to_delayed", queue, id.as_str(), |retry| {
+            let mut inv = self.scripts.move_to_delayed.prepare_invoke();
+            inv.key(keys.active())
+                .key(keys.delayed())
+                .key(keys.job_hash(id.as_str()))
+                .key(keys.job_lock(id.as_str()))
+                .key(keys.events())
+                .key(keys.marker())
+                .arg(id.as_str())
+                .arg(token)
+                .arg(until_ms)
+                .arg("")
+                .arg(self.max_stream_length as i64)
+                .arg(1)
+                .arg("")
+                .arg(i32::from(retry));
+            inv
+        })
+        .await?;
         Ok(())
     }
 
     async fn release(&self, queue: &str, id: &JobId, token: &str) -> Result<()> {
         let keys = self.keys(queue);
-        let mut inv = self.scripts.release.prepare_invoke();
-        inv.key(keys.active())
-            .key(keys.wait())
-            .key(keys.paused())
-            .key(keys.prioritized())
-            .key(keys.priority_counter())
-            .key(keys.meta())
-            .key(keys.marker())
-            .key(keys.events())
-            .key(keys.job_hash(id.as_str()))
-            .key(keys.job_lock(id.as_str()))
-            .arg(id.as_str())
-            .arg(token)
-            .arg(self.max_stream_length as i64);
-        let mut conn = self.conn().await?;
-        self.eval(&mut conn, "release", queue, Some(id.as_str()), &inv)
-            .await?;
+        self.eval_transition("release", queue, id.as_str(), |retry| {
+            let mut inv = self.scripts.release.prepare_invoke();
+            inv.key(keys.active())
+                .key(keys.wait())
+                .key(keys.paused())
+                .key(keys.prioritized())
+                .key(keys.priority_counter())
+                .key(keys.meta())
+                .key(keys.marker())
+                .key(keys.events())
+                .key(keys.job_hash(id.as_str()))
+                .key(keys.job_lock(id.as_str()))
+                .arg(id.as_str())
+                .arg(token)
+                .arg(self.max_stream_length as i64)
+                .arg(i32::from(retry));
+            inv
+        })
+        .await?;
         Ok(())
     }
 
@@ -818,30 +915,27 @@ impl Backend for RedisBackend {
     ) -> Result<()> {
         let keys = self.keys(queue);
         let remove = encode_removal(&removal);
-        let mut inv = self.scripts.move_to_finished.prepare_invoke();
-        inv.key(keys.active())
-            .key(keys.completed())
-            .key(keys.job_hash(id.as_str()))
-            .key(keys.job_lock(id.as_str()))
-            .key(keys.events())
-            .key(keys.job_hash_prefix())
-            .arg(id.as_str())
-            .arg(token)
-            .arg("completed")
-            .arg(return_value_json.unwrap_or_default())
-            .arg("")
-            .arg(now_ms())
-            .arg(remove)
-            .arg(self.max_stream_length as i64)
-            .arg("");
-        let mut conn = self.conn().await?;
-        self.eval(
-            &mut conn,
-            "move_to_finished",
-            queue,
-            Some(id.as_str()),
-            &inv,
-        )
+        let ret = return_value_json.unwrap_or_default();
+        self.eval_transition("move_to_finished", queue, id.as_str(), |retry| {
+            let mut inv = self.scripts.move_to_finished.prepare_invoke();
+            inv.key(keys.active())
+                .key(keys.completed())
+                .key(keys.job_hash(id.as_str()))
+                .key(keys.job_lock(id.as_str()))
+                .key(keys.events())
+                .key(keys.job_hash_prefix())
+                .arg(id.as_str())
+                .arg(token)
+                .arg("completed")
+                .arg(ret.as_str())
+                .arg("")
+                .arg(now_ms())
+                .arg(remove.as_str())
+                .arg(self.max_stream_length as i64)
+                .arg("")
+                .arg(i32::from(retry));
+            inv
+        })
         .await?;
         Ok(())
     }
@@ -854,52 +948,51 @@ impl Backend for RedisBackend {
             trace,
         } = failure;
         let keys = self.keys(queue);
-        let mut conn = self.conn().await?;
 
         if let Some(ts) = retry_at_ms {
-            let mut inv = self.scripts.move_to_delayed.prepare_invoke();
-            inv.key(keys.active())
-                .key(keys.delayed())
-                .key(keys.job_hash(id.as_str()))
-                .key(keys.job_lock(id.as_str()))
-                .key(keys.events())
-                .key(keys.marker())
-                .arg(id.as_str())
-                .arg(token)
-                .arg(ts)
-                .arg(reason)
-                .arg(self.max_stream_length as i64)
-                .arg(0)
-                .arg(trace.unwrap_or(""));
-            self.eval(&mut conn, "move_to_delayed", queue, Some(id.as_str()), &inv)
-                .await?;
+            self.eval_transition("move_to_delayed", queue, id.as_str(), |retry| {
+                let mut inv = self.scripts.move_to_delayed.prepare_invoke();
+                inv.key(keys.active())
+                    .key(keys.delayed())
+                    .key(keys.job_hash(id.as_str()))
+                    .key(keys.job_lock(id.as_str()))
+                    .key(keys.events())
+                    .key(keys.marker())
+                    .arg(id.as_str())
+                    .arg(token)
+                    .arg(ts)
+                    .arg(reason)
+                    .arg(self.max_stream_length as i64)
+                    .arg(0)
+                    .arg(trace.unwrap_or(""))
+                    .arg(i32::from(retry));
+                inv
+            })
+            .await?;
             return Ok(());
         }
 
         let remove = encode_removal(&removal);
-        let mut inv = self.scripts.move_to_finished.prepare_invoke();
-        inv.key(keys.active())
-            .key(keys.failed())
-            .key(keys.job_hash(id.as_str()))
-            .key(keys.job_lock(id.as_str()))
-            .key(keys.events())
-            .key(keys.job_hash_prefix())
-            .arg(id.as_str())
-            .arg(token)
-            .arg("failed")
-            .arg("")
-            .arg(reason)
-            .arg(now_ms())
-            .arg(remove)
-            .arg(self.max_stream_length as i64)
-            .arg(trace.unwrap_or(""));
-        self.eval(
-            &mut conn,
-            "move_to_finished",
-            queue,
-            Some(id.as_str()),
-            &inv,
-        )
+        self.eval_transition("move_to_finished", queue, id.as_str(), |retry| {
+            let mut inv = self.scripts.move_to_finished.prepare_invoke();
+            inv.key(keys.active())
+                .key(keys.failed())
+                .key(keys.job_hash(id.as_str()))
+                .key(keys.job_lock(id.as_str()))
+                .key(keys.events())
+                .key(keys.job_hash_prefix())
+                .arg(id.as_str())
+                .arg(token)
+                .arg("failed")
+                .arg("")
+                .arg(reason)
+                .arg(now_ms())
+                .arg(remove.as_str())
+                .arg(self.max_stream_length as i64)
+                .arg(trace.unwrap_or(""))
+                .arg(i32::from(retry));
+            inv
+        })
         .await?;
         Ok(())
     }
@@ -1237,23 +1330,19 @@ impl Backend for RedisBackend {
 
     async fn wait_for_children(&self, queue: &str, id: &JobId, token: &str) -> Result<bool> {
         let keys = self.keys(queue);
-        let mut inv = self.scripts.move_to_waiting_children.prepare_invoke();
-        inv.key(keys.active())
-            .key(keys.job_hash(id.as_str()))
-            .key(keys.job_lock(id.as_str()))
-            .key(keys.waiting_children())
-            .arg(id.as_str())
-            .arg(token)
-            .arg(self.max_stream_length as i64);
-        let mut conn = self.conn().await?;
         let reply = self
-            .eval(
-                &mut conn,
-                "move_to_waiting_children",
-                queue,
-                Some(id.as_str()),
-                &inv,
-            )
+            .eval_transition("move_to_waiting_children", queue, id.as_str(), |retry| {
+                let mut inv = self.scripts.move_to_waiting_children.prepare_invoke();
+                inv.key(keys.active())
+                    .key(keys.job_hash(id.as_str()))
+                    .key(keys.job_lock(id.as_str()))
+                    .key(keys.waiting_children())
+                    .arg(id.as_str())
+                    .arg(token)
+                    .arg(self.max_stream_length as i64)
+                    .arg(i32::from(retry));
+                inv
+            })
             .await?;
         Ok(redis::from_redis_value::<i64>(&reply)? == 1)
     }
