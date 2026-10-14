@@ -178,13 +178,13 @@ impl FlowProducer {
         flatten(node, None, &mut flat, &mut shape)?;
         let mut explicit = BTreeSet::new();
         for n in &flat {
-            if let Some(id) = &n.insert.opts.id
-                && !explicit.insert((n.queue.clone(), id.clone()))
-            {
-                return Err(Error::Config(format!(
-                    "flow uses job id `{id}` twice in queue `{}`",
-                    n.queue
-                )));
+            if let Some(id) = &n.insert.opts.id {
+                if !explicit.insert((n.queue.clone(), id.clone())) {
+                    return Err(Error::Config(format!(
+                        "flow uses job id `{id}` twice in queue `{}`",
+                        n.queue
+                    )));
+                }
             }
         }
         let ids = self.backend.add_flow(flat, parent).await?;

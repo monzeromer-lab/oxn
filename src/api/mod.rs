@@ -462,10 +462,13 @@ impl Api {
 
 /// The 0.2 dashboard's error body: `{"error": "<message>"}`.
 fn legacy_error(mut r: ApiResponse) -> ApiResponse {
-    if let ApiBody::Bytes(b) = &r.body
-        && let Ok(v) = serde_json::from_slice::<serde_json::Value>(b)
-        && let Some(msg) = v.pointer("/error/message").and_then(|m| m.as_str())
-    {
+    let msg = match &r.body {
+        ApiBody::Bytes(b) => serde_json::from_slice::<serde_json::Value>(b)
+            .ok()
+            .and_then(|v| v.pointer("/error/message")?.as_str().map(str::to_owned)),
+        _ => None,
+    };
+    if let Some(msg) = msg {
         r.body = ApiBody::Bytes(
             serde_json::to_vec(&serde_json::json!({ "error": msg })).unwrap_or_default(),
         );

@@ -106,10 +106,11 @@ fn main() {
         let mut needed: BTreeSet<&str> = BTreeSet::new();
         let mut frontier: Vec<&str> = identifiers(&body).into_iter().collect();
         while let Some(id) = frontier.pop() {
-            if let Some(item) = items.iter().find(|i| i.name == id)
-                && needed.insert(item.name.as_str())
-            {
-                frontier.extend(identifiers(&item.text));
+            // (Nested rather than a `let` chain: MSRV 1.85.)
+            if let Some(item) = items.iter().find(|i| i.name == id) {
+                if needed.insert(item.name.as_str()) {
+                    frontier.extend(identifiers(&item.text));
+                }
             }
         }
         let mut assembled = header.clone();

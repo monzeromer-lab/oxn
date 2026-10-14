@@ -89,9 +89,7 @@ impl RepeatOptions {
     }
 
     fn validate(&self) -> Result<()> {
-        if let Self::Every(d) = self
-            && d.as_millis() == 0
-        {
+        if matches!(self, Self::Every(d) if d.as_millis() == 0) {
             return Err(Error::Config(
                 "scheduler interval must be at least 1ms".into(),
             ));

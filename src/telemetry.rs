@@ -81,6 +81,7 @@ pub(crate) fn stalled(queue: &str, n: usize) {
     }
 }
 
+#[cfg(feature = "redis-backend")]
 pub(crate) fn transition_retried(queue: &str, script: &'static str) {
     #[cfg(feature = "metrics")]
     ::metrics::counter!(m::TRANSITION_RETRIES, "queue" => queue.to_string(), "script" => script)
@@ -92,6 +93,7 @@ pub(crate) fn fetch_error(queue: &str) {
     count(m::FETCH_ERRORS, queue, 1);
 }
 
+#[cfg(feature = "redis-backend")]
 pub(crate) fn rate_limited(queue: &str) {
     #[cfg(feature = "metrics")]
     count(m::RATE_LIMITED, queue, 1);
