@@ -137,12 +137,13 @@ async fn the_active_gauge_tracks_in_flight_jobs() {
     q.add_bulk((0..3).map(|i| (T(i), JobOptions::new())).collect())
         .await
         .unwrap();
-    let gate = Arc::new(tokio::sync::Notify::new());
-    let g = gate.clone();
+    // A watch channel, not a Notify: a handler that is counted as started
+    // but hasn't reached its wait yet must still see the gate open.
+    let (gate, g) = tokio::sync::watch::channel(false);
     let w = Worker::builder(q.clone(), move |_j: Job<T>| {
-        let g = g.clone();
+        let mut g = g.clone();
         async move {
-            g.notified().await;
+            let _ = g.wait_for(|open| *open).await;
             Ok::<_, Error>(())
         }
     })
@@ -156,7 +157,7 @@ async fn the_active_gauge_tracks_in_flight_jobs() {
         assert!(t.elapsed() < secs(3), "{}", m.dump(&qn));
         tokio::time::sleep(ms(10)).await;
     }
-    gate.notify_waiters();
+    gate.send(true).unwrap();
     let t = std::time::Instant::now();
     while m.counter("oxn_jobs_completed_total", &[("queue", &qn)]) < 3 {
         assert!(t.elapsed() < secs(3), "{}", m.dump(&qn));

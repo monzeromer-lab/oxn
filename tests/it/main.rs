@@ -22,6 +22,7 @@ mod dashboard;
 mod dashboard_actix;
 mod dedup;
 mod delayed;
+mod delayed_precision;
 mod drain_obliterate;
 mod event_stream;
 mod events;

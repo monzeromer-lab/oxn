@@ -238,22 +238,31 @@ async fn the_next_tick_fires_even_if_every_scheduler_stops() {
     let cancel = CancellationToken::new();
     let s = JobScheduler::new(q.clone(), "once", RepeatOptions::every(ms(500)), Tick(2));
     let h = tokio::spawn(s.run(cancel.clone()));
+    // Usually one tick is queued; two when the start fell within a few ms
+    // of a tick boundary (the first was due at once). Either is correct.
     assert!(
-        rec.wait_until("next tick queued", secs(2), |s| s.len("delayed") == 1)
+        rec.wait_until("next tick queued", secs(2), |s| s.len("delayed") >= 1)
             .await
     );
     cancel.cancel();
     h.await.unwrap().unwrap();
-    let id = rec.snapshot().zsets["delayed"][0].0.clone();
+    rec.observe("every scheduler stopped").await;
+    let pending: Vec<String> = rec.snapshot().zsets["delayed"]
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect();
+    assert!((1..=2).contains(&pending.len()), "{pending:?}");
     let ran = Arc::new(Mutex::new(Vec::new()));
     let (wc, wh) = worker(&q, ran.clone());
     assert!(
-        rec.wait_until("it ran", secs(3), |s| s.len("completed") == 1)
+        rec.wait_until("they ran", secs(3), |s| s.len("completed") == pending.len())
             .await
     );
     wc.cancel();
     wh.await.unwrap().unwrap();
-    assert_eq!(ran.lock()[0].0, id);
+    let mut ran: Vec<String> = ran.lock().iter().map(|(id, _)| id.clone()).collect();
+    ran.sort();
+    assert_eq!(ran, pending, "the queued ticks ran with no scheduler alive");
     rec.assert_clean();
     common::teardown(&q).await;
 }

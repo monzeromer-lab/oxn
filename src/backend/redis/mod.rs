@@ -363,6 +363,27 @@ fn opts_from_json(s: &str) -> Result<ResolvedJobOptions> {
 }
 
 impl RedisBackend {
+    /// Wake one worker blocked on the queue's marker, on a second pool
+    /// slot (the caller's slot is busy blocking). Best effort: if no slot
+    /// frees up quickly, the BZPOPMIN timeout still wakes everyone.
+    async fn wake_queue(&self, keys: &KeyBuilder) {
+        let Ok(Ok(mut conn)) =
+            tokio::time::timeout(Duration::from_millis(50), self.pool.get()).await
+        else {
+            tracing::debug!("no pool slot free to wake the queue; relying on the timeout");
+            return;
+        };
+        let r: redis::RedisResult<()> = redis::cmd("ZADD")
+            .arg(keys.marker())
+            .arg(0)
+            .arg("0")
+            .query_async(&mut *conn)
+            .await;
+        if let Err(e) = r {
+            tracing::debug!(error = %e, "waking the queue failed; relying on the timeout");
+        }
+    }
+
     /// Run one Lua script inside an `oxn.script` tracing span.
     ///
     /// Every state transition funnels through here, so a single
@@ -487,6 +508,14 @@ const MIN_BLOCK: Duration = Duration::from_millis(1);
 
 /// How long a worker that found nothing to do should block: until the
 /// next delayed job is due, but never longer than `drain_delay`.
+/// Sleep until `at`; never resolves for `None`.
+async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
 fn block_time(drain_delay: Duration, next_due: Option<Duration>) -> Duration {
     let t = match next_due {
         Some(due) => drain_delay.min(due),
@@ -682,14 +711,33 @@ impl Backend for RedisBackend {
         let mut blocking = self.conn().await?;
         let mut bzpopmin = redis::cmd("BZPOPMIN");
         bzpopmin.arg(keys.marker()).arg(block_for.as_secs_f64());
+        // Redis fires blocking timeouts on its own clock tick (`hz`, 10 by
+        // default: every 100ms), so a BZPOPMIN timing out when a delayed
+        // job falls due returns up to ~100ms late on a quiet server. When
+        // this wait is for a due job, a local timer wakes the queue at the
+        // due time instead (best effort; the timeout stays as a backstop).
+        let wake_at = next_due
+            .filter(|d| *d <= block_for)
+            .map(|d| tokio::time::Instant::now() + d + Duration::from_millis(1));
         // Cancellation is honored here, while only *waiting*: no job has
         // been taken yet, so giving up loses nothing.
-        let popped = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => None,
-            r = bzpopmin
+        let popped = {
+            let pop = bzpopmin
                 .query_async::<Option<(String, String, f64)>>(&mut *blocking)
-                .instrument(span.clone()) => Some(r),
+                .instrument(span.clone());
+            tokio::pin!(pop);
+            let mut woke_queue = false;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break None,
+                    r = &mut pop => break Some(r),
+                    _ = sleep_until_opt(wake_at), if !woke_queue => {
+                        woke_queue = true;
+                        self.wake_queue(&keys).await;
+                    }
+                }
+            }
         };
         span.record("elapsed_us", start.elapsed().as_micros() as u64);
         let Some(popped) = popped else {

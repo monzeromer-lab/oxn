@@ -9,8 +9,9 @@
 //! `sched-{id}-{T}`. Redis keeps each scheduler's latest enqueued tick, so a
 //! tick is never added twice, even after its job was deleted by retention.
 //!
-//! The next tick is always queued ahead as a delayed job, so it fires even
-//! if every scheduler process stops. Ticks missed while no instance ran are
+//! The next tick is always queued ahead as a delayed job (enqueued halfway
+//! through the previous interval), so it fires even if every scheduler
+//! process stops. Ticks missed while no instance ran are
 //! skipped (no burst on restart).
 //!
 //! Schedulers are recorded in Redis: list them with
@@ -174,13 +175,12 @@ where
     /// as many processes as you like.
     pub async fn run(self, cancel: tokio_util::sync::CancellationToken) -> Result<()> {
         self.validate()?;
-        let mut after = now_ms();
         let mut register = true;
+        let Some(mut t) = self.repeat.next_after(now_ms()) else {
+            tracing::info!(scheduler = %self.id, "cron schedule has no further occurrence");
+            return Ok(());
+        };
         loop {
-            let Some(t) = self.repeat.next_after(after) else {
-                tracing::info!(scheduler = %self.id, "cron schedule has no further occurrence");
-                return Ok(());
-            };
             // Enqueue tick t, retrying a transient failure for the same
             // tick: a late tick still runs (at once) rather than vanish.
             loop {
@@ -200,14 +200,31 @@ where
                 }
             }
             register = false;
-            let wait = Duration::from_millis((t - now_ms()).max(0) as u64);
+            let Some(next) = self.repeat.next_after(t) else {
+                tracing::info!(scheduler = %self.id, "cron schedule has no further occurrence");
+                return Ok(());
+            };
+            // Enqueue the next tick halfway between ticks, not at the
+            // instant t fires: many schedulers on one grid (every minute,
+            // on the minute) would otherwise all hit Redis exactly when
+            // their ticks fall due and workers need it most.
+            let mid = t + (next - t) / 2;
+            let wait = Duration::from_millis((mid - now_ms()).max(0) as u64);
             tokio::select! {
                 _ = cancel.cancelled() => return Ok(()),
                 _ = tokio::time::sleep(wait) => {}
             }
-            // The tick after t, or after now if retries made us late
-            // (missed ticks are skipped).
-            after = t.max(now_ms());
+            // Fell behind (retries during an outage)? Skip ticks already
+            // past rather than fire them in a burst.
+            let now = now_ms();
+            t = if next > now {
+                next
+            } else {
+                match self.repeat.next_after(now) {
+                    Some(n) => n,
+                    None => return Ok(()),
+                }
+            };
         }
     }
 

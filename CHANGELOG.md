@@ -120,6 +120,17 @@ It contains breaking changes; see the migration notes below.
   immediately and its pool slot is detached instead of being returned with
   a block still pending; the stalled scanner is joined before `run()`
   returns.
+- **Delayed jobs start on time on a quiet Redis (B3b).** A worker waiting
+  for a delayed job blocked in `BZPOPMIN` with a timeout of exactly the
+  time until it was due, but Redis fires blocking timeouts on its own
+  `hz` tick (every 100ms by default), so on an idle server delayed jobs
+  and scheduler ticks started 10–90ms late. The worker now also keeps a
+  local timer for the due time and wakes the queue itself (a `ZADD` on the
+  marker from a second pool slot) when it fires: 4–6ms. Schedulers now
+  enqueue the next tick halfway between ticks rather than at the instant
+  one fires, so many schedulers on one grid don't hit Redis exactly when
+  their ticks fall due (50 schedulers × 10 instances: tick lateness p50
+  20ms → 9ms).
 - **Schedulers are safe to run in every process (B14).** Each tick's job
   id was the wall-clock time of the enqueue, so N processes running the
   same `JobScheduler` added N jobs per tick (5 instances: 25 jobs for 5

@@ -58,6 +58,8 @@ jobs:
       - run: cargo test -p oxn --lib --no-default-features
       - run: cargo test --workspace --features "scheduler,flow,dashboard-axum"
       - run: cargo test -p oxn --features dashboard-actix --lib
+      - name: timing tests (alone, on an idle Redis)
+        run: cargo test --test it -- --ignored --test-threads=1
       - name: Upload timeline reports
         if: failure()
         uses: actions/upload-artifact@v4
