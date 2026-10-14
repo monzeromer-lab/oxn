@@ -3,9 +3,10 @@
 -- Atomically pop the next ready job and acquire a lock.
 --
 -- Returns { id, hashFields } for a job, { nextDueMs } when nothing is ready
--- but a delayed job will be due in nextDueMs (≥ 1), or {} when there is
--- nothing to wait for (empty or paused). The worker blocks on the marker
--- for at most nextDueMs, so delayed jobs run on time.
+-- but a delayed job will be due in nextDueMs (≥ 1), { 'rl', retryInMs }
+-- when the queue's rate limit is exhausted, or {} when there is nothing to
+-- wait for (empty or paused). The worker blocks on the marker for at most
+-- nextDueMs, so delayed jobs run on time.
 --
 -- KEYS[1] wait
 -- KEYS[2] paused
@@ -17,6 +18,7 @@
 -- KEYS[8] marker
 -- KEYS[9] job-hash prefix (trailing ':')
 -- KEYS[10] priority counter
+-- KEYS[11] limiter (fixed-window counter shared by every worker)
 --
 -- ARGV[1] worker token
 -- ARGV[2] lock duration (ms)
@@ -37,6 +39,8 @@ local token    = ARGV[1]
 local lockMs   = tonumber(ARGV[2])
 local nowMs    = tonumber(ARGV[3])
 local maxStream = tonumber(ARGV[4])
+local limitMax  = tonumber(ARGV[5]) or 0   -- 0 = no rate limit
+local limitMs   = tonumber(ARGV[6]) or 0
 
 -- short-circuit if paused (resume wakes workers)
 if redis.call('HGET', metaKey, 'paused') == '1' then
@@ -54,6 +58,22 @@ if #due > 0 then
   for i = 1, #due do
     redis.call('ZREM', delayedKey, due[i])
     oxnPushReady(ready, due[i], hashPrefix .. due[i], false)
+  end
+end
+
+-- Rate limit: at most limitMax jobs move to active per limitMs window,
+-- counted in one key for every worker on the queue.
+local limiterKey = KEYS[11]
+if limitMax > 0 then
+  local used = tonumber(redis.call('GET', limiterKey) or '0')
+  if used >= limitMax then
+    local ttl = redis.call('PTTL', limiterKey)
+    if ttl < 0 then
+      -- counter without expiry (shouldn't happen): start a fresh window
+      redis.call('PEXPIRE', limiterKey, limitMs)
+      ttl = limitMs
+    end
+    return { 'rl', ttl }
   end
 end
 
@@ -83,6 +103,12 @@ end
 
 -- More ready work left? Wake the next blocked worker (cascade).
 oxnRearm(markerKey, waitKey, prioKey)
+
+if limitMax > 0 then
+  if redis.call('INCR', limiterKey) == 1 then
+    redis.call('PEXPIRE', limiterKey, limitMs)
+  end
+end
 
 if fromPrio then
   -- prioritized path: we popped from zset, now push to active

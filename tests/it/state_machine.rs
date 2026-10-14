@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 struct T(u32);
 
 async fn fetch(b: &Arc<RedisBackend>, q: &str) -> JobId {
-    b.fetch_next(q, "w", secs(30), ms(10), &CancellationToken::new())
+    b.fetch_next(q, "w", secs(30), ms(10), &CancellationToken::new(), None)
         .await
         .unwrap()
         .expect("a job")

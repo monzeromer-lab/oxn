@@ -56,6 +56,8 @@ enum Cmd {
         max_stalled: u32,
         #[arg(long)]
         ctx_ops: bool,
+        #[arg(long, value_parser = config::parse_rate_limit)]
+        rate_limit: Option<(u32, u64)>,
     },
 }
 
@@ -86,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
             max_stream_len,
             max_stalled,
             ctx_ops,
+            rate_limit,
         } => {
             workload::MAX_STREAM_LEN.store(max_stream_len, std::sync::atomic::Ordering::Relaxed);
             let spec = workload::WorkerSpec {
@@ -96,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
                 shutdown_timeout_ms: 10_000,
                 max_stalled,
                 ctx_ops,
+                rate_limit,
             };
             workload::child_worker_main(redis, queue, spec).await
         }

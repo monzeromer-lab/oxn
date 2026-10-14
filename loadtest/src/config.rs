@@ -166,6 +166,10 @@ pub struct RunArgs {
     /// Fail the run if first-attempt pickup p99 exceeds this (ms).
     #[arg(long)]
     pub slo_pickup_p99_ms: Option<f64>,
+    /// Worker rate limit `MAX/MS` (e.g. `200/1000`), shared by every
+    /// worker; the run fails if starts exceed it.
+    #[arg(long, value_parser = parse_rate_limit)]
+    pub rate_limit: Option<(u32, u64)>,
 }
 
 /// Fully-resolved configuration for one run.
@@ -217,6 +221,8 @@ pub struct Config {
     pub oxn_subscriber: bool,
     /// JobContext progress + log on every run.
     pub ctx_ops: bool,
+    /// Queue-wide rate limit (max, per ms).
+    pub rate_limit: Option<(u32, u64)>,
 }
 
 fn ser_dur<S: serde::Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
@@ -273,6 +279,7 @@ impl Config {
             max_stalled: 1,
             oxn_subscriber: a.oxn_subscriber,
             ctx_ops: a.ctx_ops,
+            rate_limit: a.rate_limit,
         };
         match a.scenario {
             Smoke => {}
@@ -423,6 +430,17 @@ impl Config {
             None => s,
         }
     }
+}
+
+/// `200/1000` → (200 jobs, per 1000 ms).
+pub fn parse_rate_limit(s: &str) -> Result<(u32, u64), String> {
+    let (m, p) = s.split_once('/').ok_or("expected MAX/MS, e.g. 200/1000")?;
+    let max: u32 = m.trim().parse().map_err(|e| format!("max: {e}"))?;
+    let per: u64 = p.trim().parse().map_err(|e| format!("ms: {e}"))?;
+    if max == 0 || per == 0 {
+        return Err("max and ms must be > 0".into());
+    }
+    Ok((max, per))
 }
 
 /// `90s`, `250ms`, `2h`, `1m30s` → Duration.

@@ -22,7 +22,7 @@ struct T(u32);
 
 async fn complete_one(b: &Arc<oxn::backend::redis::RedisBackend>, q: &str, removal: Removal) {
     let f = b
-        .fetch_next(q, "tok", secs(30), ms(10), &CancellationToken::new())
+        .fetch_next(q, "tok", secs(30), ms(10), &CancellationToken::new(), None)
         .await
         .unwrap()
         .unwrap();

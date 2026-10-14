@@ -283,7 +283,7 @@ async fn delayed_and_released_events_carry_their_fields() {
     let id = q.add(T(2), JobOptions::new()).await.unwrap();
     take(&mut s, 2, secs(5)).await;
     let none = tokio_util::sync::CancellationToken::new();
-    b.fetch_next(q.name(), "w", secs(30), ms(10), &none)
+    b.fetch_next(q.name(), "w", secs(30), ms(10), &none, None)
         .await
         .unwrap()
         .unwrap();

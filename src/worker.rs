@@ -342,6 +342,7 @@ where
                     opts.lock_duration,
                     opts.drain_delay,
                     &cancel,
+                    opts.rate_limit,
                 )
                 .instrument(fetch_span.clone())
                 .await;

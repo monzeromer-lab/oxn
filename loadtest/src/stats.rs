@@ -110,6 +110,8 @@ pub struct Stats {
     pub add_latency: Hist,
     /// Notes (chaos fired, phase changes) waiting for the next row.
     pub notes: Mutex<Vec<String>>,
+    /// Every handler start (µs), for the rate-limit check.
+    pub start_times: Mutex<Vec<u64>>,
 }
 
 impl Stats {

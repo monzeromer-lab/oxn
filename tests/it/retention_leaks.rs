@@ -30,7 +30,7 @@ async fn finish(
     removal: Removal,
 ) -> JobId {
     let f = b
-        .fetch_next(q, "tok", secs(30), ms(10), &CancellationToken::new())
+        .fetch_next(q, "tok", secs(30), ms(10), &CancellationToken::new(), None)
         .await
         .unwrap()
         .expect("a job to finish");
@@ -296,7 +296,7 @@ async fn stall_recovery_leaves_no_stalled_set_behind() {
     let none = CancellationToken::new();
     rec.step(
         "fetch with a 50ms lock",
-        b.fetch_next(q.name(), "x", ms(50), ms(10), &none),
+        b.fetch_next(q.name(), "x", ms(50), ms(10), &none, None),
     )
     .await
     .unwrap()

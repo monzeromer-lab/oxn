@@ -89,10 +89,17 @@ async fn non_force_obliterate_refuses_with_active_jobs_and_changes_nothing() {
     let (q, b) = common::fresh_queue::<T>("b11-active").await;
     q.add(T(1), JobOptions::new()).await.unwrap();
     q.add(T(2), JobOptions::new()).await.unwrap();
-    b.fetch_next(q.name(), "w", secs(30), ms(10), &CancellationToken::new())
-        .await
-        .unwrap()
-        .unwrap();
+    b.fetch_next(
+        q.name(),
+        "w",
+        secs(30),
+        ms(10),
+        &CancellationToken::new(),
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let before = keys_of(q.name()).await;
     let r = q.obliterate(false).await;
     assert!(matches!(r, Err(Error::Config(_))), "{r:?}");

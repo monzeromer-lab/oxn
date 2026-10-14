@@ -473,10 +473,14 @@ impl WorkerOptions {
         self
     }
 
-    /// Apply a rate limit to this worker's fetches.
+    /// Limit job starts to `max` per `per` across the queue (see
+    /// [`RateLimit`]). `max` is floored at 1.
     #[must_use]
     pub fn rate_limit(mut self, max: u32, per: Duration) -> Self {
-        self.rate_limit = Some(RateLimit { max, per });
+        self.rate_limit = Some(RateLimit {
+            max: max.max(1),
+            per,
+        });
         self
     }
 
@@ -490,8 +494,10 @@ impl WorkerOptions {
 
 /// Rate-limit configuration.
 ///
-/// Applied per worker via [`WorkerOptions::rate_limit`]. The worker blocks
-/// for up to `per` after issuing `max` jobs in a window.
+/// Set through [`WorkerOptions::rate_limit`]. The limit is **queue-wide**:
+/// it is counted in Redis, so at most `max` jobs start per `per` window
+/// across every worker that sets it (give them all the same value). It is
+/// a fixed window, so up to `2 × max` can start across a window boundary.
 #[derive(Debug, Clone, Copy)]
 pub struct RateLimit {
     /// Max tokens issued per `per` window.

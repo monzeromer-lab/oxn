@@ -70,7 +70,8 @@ It contains breaking changes; see the migration notes below.
   `EventRecord`s (B8); new required `delay(queue, id, token, until_ms)`
   for postponements (B9); `fail(queue, id, token, Failure)` takes a
   `Failure { reason, retry_at_ms, removal, trace }` (builder:
-  `Failure::new(reason).retry_at(ms).removal(r).trace(t)`) (B12b).
+  `Failure::new(reason).retry_at(ms).removal(r).trace(t)`) (B12b);
+  `fetch_next` takes a trailing `Option<RateLimit>` (B12d).
 - Dashboard (axum and actix) maps `NotFound` → **404** and state/lock
   conflicts → **409**, with `{"error": "..."}` bodies, instead of `204`.
 - New `Error::is_conflict()` and `Error::is_lock_lost()` helpers.
@@ -107,6 +108,13 @@ It contains breaking changes; see the migration notes below.
   immediately and its pool slot is detached instead of being returned with
   a block still pending; the stalled scanner is joined before `run()`
   returns.
+- **`rate_limit(max, per)` limits (B12d).** It was stored and never
+  read. It is now a queue-wide fixed-window limit counted in Redis
+  (`{prefix}:{queue}:limiter`) inside `move_to_active`: at most `max` jobs
+  start per `per` across every worker that sets it (up to `2 × max` across
+  a window boundary). A limited worker sleeps until the window reopens —
+  shutdown interrupts the wait — instead of polling. Configure the same
+  limit on every worker of the queue; a worker without one is not limited.
 - **Handlers get a `JobContext` (B12c).** New
   `Worker::builder_with_ctx(queue, |job, ctx| …)` (`builder` is
   unchanged): `ctx.progress(p)` / `ctx.log(line)` report progress (with a

@@ -279,7 +279,7 @@ async fn release_api_contract() {
     let f = rec
         .step(
             "fetch with token A",
-            b.fetch_next(q.name(), "A", secs(30), ms(10), &none),
+            b.fetch_next(q.name(), "A", secs(30), ms(10), &none, None),
         )
         .await
         .unwrap()
@@ -329,7 +329,7 @@ async fn release_api_contract() {
     let f = rec
         .step(
             "fetch again",
-            b.fetch_next(q.name(), "C", secs(30), ms(10), &none),
+            b.fetch_next(q.name(), "C", secs(30), ms(10), &none, None),
         )
         .await
         .unwrap()

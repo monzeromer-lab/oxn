@@ -61,6 +61,10 @@ pub struct Outcome {
     pub health_after_cleanup: Option<RedisHealth>,
     pub rows: Vec<Row>,
     pub kills: u32,
+    /// `--rate-limit`: the most starts seen in any sliding window of the
+    /// limit's length, and the mean start rate per window.
+    pub rate_limit_peak: Option<usize>,
+    pub rate_limit_mean_per_window: Option<f64>,
     /// Host `/proc/loadavg` (1/5/15 min) at start and end — throughput and
     /// latency numbers are only comparable between quiet runs.
     pub loadavg_start: Option<String>,
@@ -451,6 +455,42 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
             .filter(|f| f.starts_with("FAIL"))
             .cloned(),
     );
+    let (rate_limit_peak, rate_limit_mean_per_window) = match cfg.rate_limit {
+        Some((max, per_ms)) => {
+            let mut t = stats.start_times.lock().clone();
+            t.sort_unstable();
+            let per_us = per_ms * 1000;
+            let mut peak = 0usize;
+            let mut lo = 0usize;
+            for hi in 0..t.len() {
+                while t[hi] - t[lo] >= per_us {
+                    lo += 1;
+                }
+                peak = peak.max(hi - lo + 1);
+            }
+            let span_us = match (t.first(), t.last()) {
+                (Some(a), Some(b)) if b > a => b - a,
+                _ => per_us,
+            };
+            // n starts over the span fill ceil(span/per) windows at least.
+            let windows = (span_us as f64 / per_us as f64).ceil().max(1.0);
+            let mean = t.len() as f64 / windows;
+            // A fixed window admits up to 2×max across a boundary.
+            if peak > 2 * max as usize {
+                failures.push(format!(
+                    "{peak} starts within {per_ms}ms (rate limit {max}/{per_ms}ms allows ≤ {})",
+                    2 * max
+                ));
+            }
+            if mean > max as f64 * 1.05 {
+                failures.push(format!(
+                    "mean {mean:.1} starts per {per_ms}ms window exceeds the {max} limit"
+                ));
+            }
+            (Some(peak), Some(mean))
+        }
+        None => (None, None),
+    };
     let pickup = stats.pickup.summary();
     if let Some(slo) = cfg.slo_pickup_p99_ms
         && pickup.p99_ms > slo
@@ -482,6 +522,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
         e2e: stats.e2e.summary(),
         add_latency: stats.add_latency.summary(),
         verdict,
+        rate_limit_peak,
+        rate_limit_mean_per_window,
         stream_events: stream_counts.lock().clone(),
         final_sizes,
         retention_findings,

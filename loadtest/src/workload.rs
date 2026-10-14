@@ -141,6 +141,7 @@ pub fn apply(ledger: &Ledger, stats: &Stats, ev: WEvent) {
             due_us,
         } => {
             stats.started.fetch_add(1, Ordering::Relaxed);
+            stats.start_times.lock().push(at_us);
             if attempt <= 1 {
                 stats.pickup.record(at_us.saturating_sub(due_us));
             }
@@ -223,6 +224,8 @@ pub struct WorkerSpec {
     pub max_stalled: u32,
     /// Report progress and a log line through `JobContext` on every run.
     pub ctx_ops: bool,
+    /// Worker `rate_limit` as (max, per ms).
+    pub rate_limit: Option<(u32, u64)>,
 }
 
 pub fn build_worker(
@@ -239,6 +242,7 @@ pub fn build_worker(
         shutdown_timeout_ms,
         max_stalled,
         ctx_ops,
+        rate_limit,
     } = spec;
     let mut b = Worker::builder_with_ctx(queue, move |job: Job<LoadJob>, ctx: oxn::JobContext| {
         let sink = sink.clone();
@@ -305,6 +309,9 @@ pub fn build_worker(
     .cancellation_token(cancel);
     if let Some(d) = drain_delay_ms {
         b = b.drain_delay(Duration::from_millis(d));
+    }
+    if let Some((max, per_ms)) = rate_limit {
+        b = b.rate_limit(max, Duration::from_millis(per_ms));
     }
     b.build()
 }
@@ -581,6 +588,7 @@ impl InProcPool {
                 shutdown_timeout_ms: self.cfg.shutdown_timeout_ms,
                 max_stalled: self.cfg.max_stalled,
                 ctx_ops: self.cfg.ctx_ops,
+                rate_limit: self.cfg.rate_limit,
             };
             let w = build_worker(
                 q,
@@ -670,6 +678,9 @@ impl ProcPool {
             .arg(self.cfg.max_stalled.to_string());
         if self.cfg.ctx_ops {
             cmd.arg("--ctx-ops");
+        }
+        if let Some((max, per_ms)) = self.cfg.rate_limit {
+            cmd.arg("--rate-limit").arg(format!("{max}/{per_ms}"));
         }
         if let Some(d) = self.cfg.drain_delay_ms {
             cmd.arg("--drain-delay-ms").arg(d.to_string());

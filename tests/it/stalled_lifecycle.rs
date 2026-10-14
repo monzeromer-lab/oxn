@@ -26,7 +26,14 @@ struct T(u32);
 /// Fetch with a 30ms lock and let it lapse: the deterministic way to stall.
 async fn stall(b: &Arc<RedisBackend>, q: &str) -> JobId {
     let f = b
-        .fetch_next(q, "dead-worker", ms(30), ms(10), &CancellationToken::new())
+        .fetch_next(
+            q,
+            "dead-worker",
+            ms(30),
+            ms(10),
+            &CancellationToken::new(),
+            None,
+        )
         .await
         .unwrap()
         .expect("a job to stall");
@@ -210,7 +217,7 @@ async fn a_stall_does_not_consume_an_attempt() {
     // Two real failures are still allowed: the stall didn't eat one.
     let none = CancellationToken::new();
     let f = b
-        .fetch_next(q.name(), "w", secs(30), ms(10), &none)
+        .fetch_next(q.name(), "w", secs(30), ms(10), &none, None)
         .await
         .unwrap()
         .unwrap();
@@ -222,7 +229,7 @@ async fn a_stall_does_not_consume_an_attempt() {
     .await
     .unwrap();
     let f = b
-        .fetch_next(q.name(), "w", secs(30), ms(10), &none)
+        .fetch_next(q.name(), "w", secs(30), ms(10), &none, None)
         .await
         .unwrap()
         .unwrap();

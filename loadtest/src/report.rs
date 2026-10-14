@@ -189,6 +189,17 @@ pub fn render(o: &Outcome) -> String {
         }
         let _ = writeln!(s, "- worker processes killed: {}\n", o.kills);
     }
+    if let (Some((max, per)), Some(peak), Some(mean)) = (
+        o.config.rate_limit,
+        o.rate_limit_peak,
+        o.rate_limit_mean_per_window,
+    ) {
+        let _ = writeln!(
+            s,
+            "- rate limit {max}/{per}ms: peak {peak} starts in any {per}ms span (≤ {} allowed), mean {mean:.1} per window\n",
+            2 * max
+        );
+    }
 
     let _ = writeln!(s, "## Timeline (per second)\n");
     let _ = writeln!(

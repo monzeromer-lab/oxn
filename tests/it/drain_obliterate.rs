@@ -46,6 +46,7 @@ async fn obliterate_refuses_while_active_unless_forced() {
             Duration::from_secs(30),
             Duration::from_millis(100),
             &tokio_util::sync::CancellationToken::new(),
+            None,
         )
         .await
         .unwrap();

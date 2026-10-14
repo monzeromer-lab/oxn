@@ -211,6 +211,7 @@ async fn resume_promote_and_retry_wake_blocked_workers() {
             secs(30),
             ms(10),
             &tokio_util::sync::CancellationToken::new(),
+            None,
         )
         .await
         .unwrap()

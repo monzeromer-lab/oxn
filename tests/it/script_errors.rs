@@ -87,6 +87,7 @@ async fn finishing_with_a_foreign_or_expired_lock_is_rejected() {
                 secs(30),
                 ms(10),
                 &tokio_util::sync::CancellationToken::new(),
+                None,
             ),
         )
         .await
@@ -167,6 +168,7 @@ async fn complete_reports_job_deleted_while_active() {
             secs(30),
             ms(10),
             &tokio_util::sync::CancellationToken::new(),
+            None,
         )
         .await
         .unwrap()
@@ -214,6 +216,7 @@ async fn remove_refuses_locked_jobs_and_reports_missing_ones() {
                 secs(30),
                 ms(10),
                 &tokio_util::sync::CancellationToken::new(),
+                None,
             ),
         )
         .await

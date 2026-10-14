@@ -34,6 +34,7 @@ mod obliterate_scope;
 mod pause_resume;
 mod pickup_latency;
 mod priority;
+mod rate_limit;
 mod retention_leaks;
 mod retry;
 mod scheduler;

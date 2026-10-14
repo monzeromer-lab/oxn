@@ -418,6 +418,7 @@ impl RedisBackend {
         queue: &str,
         worker_token: &str,
         lock_duration: Duration,
+        rate_limit: Option<crate::options::RateLimit>,
     ) -> Result<Moved> {
         let keys = self.keys(queue);
         let mut inv = self.scripts.move_to_active.prepare_invoke();
@@ -431,10 +432,17 @@ impl RedisBackend {
             .key(keys.marker())
             .key(keys.job_hash_prefix())
             .key(keys.priority_counter())
+            .key(keys.limiter())
             .arg(worker_token)
             .arg(lock_duration.as_millis() as i64)
             .arg(now_ms())
-            .arg(self.max_stream_length as i64);
+            .arg(self.max_stream_length as i64)
+            .arg(rate_limit.map(|r| r.max).unwrap_or(0))
+            .arg(
+                rate_limit
+                    .map(|r| r.per.as_millis().max(1) as i64)
+                    .unwrap_or(0),
+            );
         let mut conn = self.conn().await?;
         let reply = self
             .eval(&mut conn, "move_to_active", queue, None, &inv)
@@ -451,6 +459,8 @@ enum Moved {
     /// Nothing ready. `next_due` is how long until the earliest delayed
     /// job becomes eligible, if there is one.
     Empty { next_due: Option<Duration> },
+    /// The queue's rate limit is exhausted for another `retry_in`.
+    RateLimited { retry_in: Duration },
 }
 
 /// Escape Redis glob metacharacters so a `SCAN MATCH` pattern built from a
@@ -624,17 +634,30 @@ impl Backend for RedisBackend {
         lock_duration: Duration,
         block_for: Duration,
         cancel: &tokio_util::sync::CancellationToken,
+        rate_limit: Option<crate::options::RateLimit>,
     ) -> Result<Option<Fetched>> {
         if cancel.is_cancelled() {
             return Ok(None);
         }
         // First: try non-blocking move-to-active via Lua.
         let next_due = match self
-            .move_to_active(queue, worker_token, lock_duration)
+            .move_to_active(queue, worker_token, lock_duration, rate_limit)
             .await?
         {
             Moved::Job(f) => return Ok(Some(*f)),
             Moved::Empty { next_due } => next_due,
+            Moved::RateLimited { retry_in } => {
+                // Sleep until the window reopens (shutdown interrupts it)
+                // rather than polling every `block_for`: nothing can start
+                // before then, whatever the marker says.
+                let wait = retry_in.max(MIN_BLOCK);
+                tracing::debug!(queue, wait_ms = wait.as_millis() as u64, "rate limited");
+                tokio::select! {
+                    _ = cancel.cancelled() => {}
+                    _ = tokio::time::sleep(wait) => {}
+                }
+                return Ok(None);
+            }
         };
         let block_for = block_time(block_for, next_due);
 
@@ -684,11 +707,11 @@ impl Backend for RedisBackend {
         // Not cancellable: if this takes a job we must hand it to the
         // caller, who releases it if shutdown began meanwhile.
         match self
-            .move_to_active(queue, worker_token, lock_duration)
+            .move_to_active(queue, worker_token, lock_duration, rate_limit)
             .await?
         {
             Moved::Job(f) => Ok(Some(*f)),
-            Moved::Empty { .. } => Ok(None),
+            Moved::Empty { .. } | Moved::RateLimited { .. } => Ok(None),
         }
     }
 
@@ -1443,6 +1466,13 @@ fn parse_fetched(reply: redis::Value, token: &str) -> Result<Moved> {
     let arr = match reply {
         Value::Nil => return Ok(Moved::Empty { next_due: None }),
         Value::Array(a) if a.is_empty() => return Ok(Moved::Empty { next_due: None }),
+        // [ 'rl', retryInMs ] — the queue's rate limit is exhausted.
+        Value::Array(a) if a.len() == 2 && matches!(a[1], Value::Int(_)) => {
+            let ms: u64 = redis::from_redis_value(&a[1])?;
+            return Ok(Moved::RateLimited {
+                retry_in: Duration::from_millis(ms),
+            });
+        }
         // [ nextDueMs ] — nothing ready, a delayed job is due in that long.
         Value::Array(a) if a.len() == 1 => {
             let ms: u64 = redis::from_redis_value(&a[0])?;
@@ -1712,6 +1742,10 @@ mod tests {
     #[test]
     fn parse_fetched_shapes() {
         use redis::Value;
+        assert!(matches!(
+            parse_fetched(Value::Array(vec![Value::BulkString(b"rl".to_vec()), Value::Int(420)]), "t").unwrap(),
+            Moved::RateLimited { retry_in } if retry_in == Duration::from_millis(420)
+        ));
         assert!(matches!(
             parse_fetched(Value::Array(vec![]), "t").unwrap(),
             Moved::Empty { next_due: None }

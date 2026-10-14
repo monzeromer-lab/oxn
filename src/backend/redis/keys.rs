@@ -126,7 +126,7 @@ impl KeyBuilder {
         self.q("pc")
     }
 
-    /// `{prefix}:{queue}:limiter` — global token bucket.
+    /// `{prefix}:{queue}:limiter` — the queue-wide fixed-window rate-limit counter.
     pub fn limiter(&self) -> String {
         self.q("limiter")
     }

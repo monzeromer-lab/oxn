@@ -234,6 +234,10 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
     /// job is being moved to `active`: a fetch that already took a job
     /// returns it even if `cancel` fired meanwhile, so the caller can
     /// [`Self::release`] it instead of leaving it locked until it stalls.
+    ///
+    /// `rate_limit`, when set, caps how many jobs move to active per window
+    /// across every worker on the queue; a limited fetch waits for the
+    /// window to reopen (interrupted by `cancel`) and returns `None`.
     async fn fetch_next(
         &self,
         queue: &str,
@@ -241,6 +245,7 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
         lock_duration: Duration,
         block_for: Duration,
         cancel: &tokio_util::sync::CancellationToken,
+        rate_limit: Option<crate::options::RateLimit>,
     ) -> Result<Option<Fetched>>;
 
     /// Mark a job completed and record `return_value_json`.
