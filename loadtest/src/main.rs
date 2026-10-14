@@ -20,6 +20,7 @@ mod flow;
 mod ledger;
 mod report;
 mod run;
+mod sched;
 mod stats;
 mod workload;
 
@@ -38,6 +39,8 @@ enum Cmd {
     Run(Box<config::RunArgs>),
     /// Flow fan-out: parents × children with per-flow verification.
     Flow(Box<flow::FlowArgs>),
+    /// Many instances of many schedulers: one run per tick, no gaps.
+    Schedule(Box<sched::SchedArgs>),
     /// Internal: a worker child process (used by `--processes true`).
     #[command(hide = true)]
     Worker {
@@ -105,6 +108,27 @@ async fn main() -> anyhow::Result<()> {
                 rate_limit,
             };
             workload::child_worker_main(redis, queue, spec).await
+        }
+        Cmd::Schedule(args) => {
+            let o = sched::run(*args).await?;
+            let path = sched::write(&o)?;
+            println!();
+            println!(
+                "{} schedule — {} ticks, {} duplicate runs, {} missing, lateness p99 {:.1}ms",
+                if o.passed { "PASS" } else { "FAIL" },
+                o.ticks_run,
+                o.duplicate_runs,
+                o.missing_ticks,
+                o.lateness.p99_ms
+            );
+            for f in &o.failures {
+                println!("  - {f}");
+            }
+            println!("report: {}", path.display());
+            if !o.passed {
+                std::process::exit(1);
+            }
+            Ok(())
         }
         Cmd::Flow(args) => {
             let outcome = flow::run(*args).await?;

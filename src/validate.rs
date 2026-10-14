@@ -25,6 +25,7 @@ pub(crate) const RESERVED_JOB_IDS: &[&str] = &[
     "id",
     "pc",
     "limiter",
+    "schedulers",
 ];
 
 /// Longest queue name / explicit job id accepted.
@@ -140,6 +141,7 @@ mod tests {
                 k.id_counter(),
                 k.priority_counter(),
                 k.limiter(),
+                k.schedulers(),
             ] {
                 let suffix = key.strip_prefix("p:q:").unwrap();
                 assert!(RESERVED_JOB_IDS.contains(&suffix), "{suffix} not reserved");

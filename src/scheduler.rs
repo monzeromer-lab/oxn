@@ -1,19 +1,32 @@
-//! Repeatable-job scheduler.
+//! Repeatable jobs: a [`JobScheduler`] adds a job on a cron schedule or a
+//! fixed interval.
 //!
-//! A thin wrapper around a [`Queue`] that re-enqueues a template job on a
-//! schedule (either a cron expression or a fixed interval). Each run
-//! computes the next fire time from the current wall clock and uses
-//! [`JobOptions::delay`](crate::JobOptions::delay) to hand the job off to
-//! the queue — no separate "scheduler process" is required, workers just
-//! pick up delayed jobs as they mature.
+//! Safe to run in every process of a deployment: each tick is added
+//! **once**, however many instances of the same scheduler run. Every
+//! instance computes the same fire times — cron times are absolute, and
+//! [`RepeatOptions::every`] ticks are aligned to the Unix epoch (every hour
+//! fires on the hour, UTC) — and tick `T` of scheduler `id` is the job
+//! `sched-{id}-{T}`. Redis keeps each scheduler's latest enqueued tick, so a
+//! tick is never added twice, even after its job was deleted by retention.
+//!
+//! The next tick is always queued ahead as a delayed job, so it fires even
+//! if every scheduler process stops. Ticks missed while no instance ran are
+//! skipped (no burst on restart).
+//!
+//! Schedulers are recorded in Redis: list them with
+//! [`Queue::schedulers`](crate::Queue::schedulers) and remove one with
+//! [`Queue::remove_scheduler`](crate::Queue::remove_scheduler) or
+//! [`JobScheduler::remove`]. A removed scheduler stops in every running
+//! instance; one started afterwards registers it again.
 
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use cron::Schedule;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::backend::{Repeat, SchedulerTick, TickOutcome};
 use crate::error::{Error, Result};
 use crate::job::JobId;
 use crate::options::JobOptions;
@@ -22,44 +35,78 @@ use crate::queue::Queue;
 /// How often (or when) a scheduled job fires.
 #[derive(Debug, Clone)]
 pub enum RepeatOptions {
-    /// Cron expression. Uses the `cron` crate (extended syntax).
-    Cron(Box<Schedule>),
-    /// Fixed interval between runs.
+    /// A cron expression (`cron` crate syntax: the first field is seconds).
+    Cron {
+        /// The expression as given.
+        expr: String,
+        /// The parsed schedule.
+        schedule: Box<Schedule>,
+    },
+    /// A fixed interval, aligned to the Unix epoch.
     Every(Duration),
 }
 
 impl RepeatOptions {
-    /// Parse a cron expression.
+    /// Parse a cron expression, e.g. `"0 */5 * * * *"` (every 5 minutes).
     pub fn cron(expr: &str) -> Result<Self> {
-        expr.parse::<Schedule>()
-            .map(|s| Self::Cron(Box::new(s)))
-            .map_err(|e| Error::Config(format!("cron: {e}")))
+        let schedule = expr
+            .parse::<Schedule>()
+            .map_err(|e| Error::Config(format!("cron: {e}")))?;
+        Ok(Self::Cron {
+            expr: expr.to_string(),
+            schedule: Box::new(schedule),
+        })
     }
 
-    /// Fixed interval.
+    /// A fixed interval (at least 1ms). Ticks fall on multiples of it since
+    /// the Unix epoch.
     pub fn every(d: Duration) -> Self {
         Self::Every(d)
     }
 
-    /// Compute the delay from `now` until the next fire.
-    pub fn next_delay(&self) -> Duration {
+    /// The first fire time strictly after `after_ms` (epoch-ms), or `None`
+    /// when a cron schedule has no further occurrence.
+    pub fn next_after(&self, after_ms: i64) -> Option<i64> {
         match self {
-            Self::Every(d) => *d,
-            Self::Cron(schedule) => {
-                let now = Utc::now();
-                match schedule.upcoming(Utc).next() {
-                    Some(ts) => ts
-                        .signed_duration_since(now)
-                        .to_std()
-                        .unwrap_or(Duration::ZERO),
-                    None => Duration::from_secs(60),
-                }
+            Self::Every(d) => {
+                let every = d.as_millis().max(1) as i64;
+                Some((after_ms.div_euclid(every) + 1) * every)
             }
+            Self::Cron { schedule, .. } => {
+                let after = Utc.timestamp_millis_opt(after_ms).single()?;
+                schedule.after(&after).next().map(|t| t.timestamp_millis())
+            }
+        }
+    }
+
+    /// Time from now until the next fire.
+    pub fn next_delay(&self) -> Duration {
+        let now = now_ms();
+        self.next_after(now)
+            .map(|t| Duration::from_millis((t - now).max(0) as u64))
+            .unwrap_or(Duration::MAX)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if let Self::Every(d) = self
+            && d.as_millis() == 0
+        {
+            return Err(Error::Config(
+                "scheduler interval must be at least 1ms".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn spec(&self) -> Repeat {
+        match self {
+            Self::Cron { expr, .. } => Repeat::Cron(expr.clone()),
+            Self::Every(d) => Repeat::EveryMs(d.as_millis().max(1) as u64),
         }
     }
 }
 
-/// Job scheduler: re-enqueues `template` jobs on `repeat` cadence.
+/// Adds `template` jobs to a queue on a [`RepeatOptions`] cadence.
 #[derive(Debug)]
 pub struct JobScheduler<D>
 where
@@ -72,11 +119,16 @@ where
     opts: JobOptions,
 }
 
+/// After a failed enqueue, how long to wait before trying the same tick
+/// again.
+const RETRY_AFTER: Duration = Duration::from_millis(200);
+
 impl<D> JobScheduler<D>
 where
     D: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    /// Create a scheduler (does not enqueue anything yet).
+    /// A scheduler (nothing is enqueued yet). Instances in different
+    /// processes with the same `id` on the same queue are one scheduler.
     pub fn new(queue: Queue<D>, id: impl Into<String>, repeat: RepeatOptions, template: D) -> Self {
         Self {
             queue,
@@ -87,40 +139,146 @@ where
         }
     }
 
-    /// Override the default [`JobOptions`] used when enqueueing each tick.
+    /// Options for every tick's job (merged with the queue's defaults). Its
+    /// id, delay and deduplication are set by the scheduler.
     #[must_use]
     pub fn with_options(mut self, opts: JobOptions) -> Self {
         self.opts = opts;
         self
     }
 
-    /// Enqueue a single occurrence (the one due next).
-    pub async fn enqueue_next(&self) -> Result<JobId> {
-        let delay = self.repeat.next_delay();
-        let mut opts = self.opts.clone();
-        opts.delay = Some(delay);
-        opts.id = Some(format!("sched-{}-{}", self.id, chrono_now_ms()));
-        self.queue.add(self.template.clone(), opts).await
+    /// This scheduler's id.
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
-    /// Run forever, enqueueing on each tick. Consume in a `tokio::spawn`.
+    /// Enqueue the next tick (a delayed job, due at the next fire time) and
+    /// return its id. Idempotent: another instance having enqueued it
+    /// already returns the same id.
+    pub async fn enqueue_next(&self) -> Result<JobId> {
+        self.validate()?;
+        let Some(t) = self.repeat.next_after(now_ms()) else {
+            return Err(Error::Config(format!(
+                "scheduler `{}`: the cron schedule has no further occurrence",
+                self.id
+            )));
+        };
+        match self.tick(t, true).await? {
+            TickOutcome::Added(id) | TickOutcome::Exists(id) => Ok(id),
+            TickOutcome::Removed => Err(Error::NotFound(format!("scheduler `{}`", self.id))),
+        }
+    }
+
+    /// Keep the next tick enqueued until `cancel` fires, the scheduler is
+    /// removed, or a cron schedule runs out. Run it in a `tokio::spawn` in
+    /// as many processes as you like.
     pub async fn run(self, cancel: tokio_util::sync::CancellationToken) -> Result<()> {
+        self.validate()?;
+        let mut after = now_ms();
+        let mut register = true;
         loop {
-            let delay = self.repeat.next_delay();
-            tokio::select! {
-                _ = cancel.cancelled() => return Ok(()),
-                _ = tokio::time::sleep(delay) => {
-                    let mut opts = self.opts.clone();
-                    opts.id = Some(format!("sched-{}-{}", self.id, chrono_now_ms()));
-                    if let Err(e) = self.queue.add(self.template.clone(), opts).await {
-                        tracing::error!(scheduler = %self.id, error = %e, "enqueue failed");
+            let Some(t) = self.repeat.next_after(after) else {
+                tracing::info!(scheduler = %self.id, "cron schedule has no further occurrence");
+                return Ok(());
+            };
+            // Enqueue tick t, retrying a transient failure for the same
+            // tick: a late tick still runs (at once) rather than vanish.
+            loop {
+                match self.tick(t, register).await {
+                    Ok(TickOutcome::Removed) => {
+                        tracing::info!(scheduler = %self.id, "scheduler removed; stopping");
+                        return Ok(());
+                    }
+                    Ok(_) => break,
+                    Err(e) => {
+                        tracing::warn!(scheduler = %self.id, fire_at_ms = t, error = %e, "enqueue failed; retrying");
+                        tokio::select! {
+                            _ = cancel.cancelled() => return Ok(()),
+                            _ = tokio::time::sleep(RETRY_AFTER) => {}
+                        }
                     }
                 }
             }
+            register = false;
+            let wait = Duration::from_millis((t - now_ms()).max(0) as u64);
+            tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(wait) => {}
+            }
+            // The tick after t, or after now if retries made us late
+            // (missed ticks are skipped).
+            after = t.max(now_ms());
         }
+    }
+
+    /// Remove this scheduler and its pending tick (see
+    /// [`Queue::remove_scheduler`]).
+    pub async fn remove(&self) -> Result<bool> {
+        self.queue.remove_scheduler(&self.id).await
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.id.is_empty() {
+            return Err(Error::Config("scheduler id must not be empty".into()));
+        }
+        crate::validate::job_id(&format!("sched-{}-0", self.id))
+            .map_err(|e| Error::Config(format!("scheduler id `{}`: {e}", self.id)))?;
+        self.repeat.validate()
+    }
+
+    async fn tick(&self, fire_at_ms: i64, register: bool) -> Result<TickOutcome> {
+        let insert = self.queue.insert(&self.template, self.opts.clone())?;
+        let outcome = self
+            .queue
+            .backend()
+            .schedule_tick(
+                self.queue.name(),
+                SchedulerTick {
+                    scheduler_id: self.id.clone(),
+                    fire_at_ms,
+                    repeat: self.repeat.spec(),
+                    register,
+                    insert,
+                },
+            )
+            .await?;
+        if matches!(outcome, TickOutcome::Added(_)) {
+            crate::telemetry::added(self.queue.name(), 1);
+        }
+        tracing::debug!(scheduler = %self.id, fire_at_ms, ?outcome, "scheduler tick");
+        Ok(outcome)
     }
 }
 
-fn chrono_now_ms() -> i64 {
+fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intervals_are_aligned_to_the_epoch() {
+        let r = RepeatOptions::every(Duration::from_millis(200));
+        assert_eq!(r.next_after(1_000), Some(1_200), "strictly after");
+        assert_eq!(r.next_after(1_199), Some(1_200));
+        assert_eq!(r.next_after(1_200), Some(1_400));
+        let hourly = RepeatOptions::every(Duration::from_secs(3600));
+        let t = hourly.next_after(1_791_939_026_044).unwrap();
+        assert_eq!(t % 3_600_000, 0, "on the hour");
+        assert!(RepeatOptions::every(Duration::ZERO).validate().is_err());
+    }
+
+    #[test]
+    fn cron_ticks_are_absolute_and_strictly_after() {
+        let r = RepeatOptions::cron("*/5 * * * * *").unwrap();
+        let t = r.next_after(1_791_939_026_044).unwrap();
+        assert_eq!(t, 1_791_939_030_000);
+        assert_eq!(r.next_after(t), Some(t + 5_000));
+        assert!(matches!(r.spec(), Repeat::Cron(e) if e == "*/5 * * * * *"));
+        // a schedule that is over
+        let past = RepeatOptions::cron("0 0 0 1 1 * 2001").unwrap();
+        assert_eq!(past.next_after(1_791_939_026_044), None);
+    }
 }

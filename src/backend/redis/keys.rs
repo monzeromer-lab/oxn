@@ -126,6 +126,17 @@ impl KeyBuilder {
         self.q("pc")
     }
 
+    /// `{prefix}:{queue}:schedulers` — hash of scheduler id → record JSON.
+    pub fn schedulers(&self) -> String {
+        self.q("schedulers")
+    }
+
+    /// `{prefix}:{queue}:schedulers:{id}` — zset of a scheduler's
+    /// possibly-pending tick fire times.
+    pub fn scheduler_ticks(&self, id: &str) -> String {
+        self.q(&format!("schedulers:{id}"))
+    }
+
     /// `{prefix}:{queue}:limiter` — the queue-wide fixed-window rate-limit counter.
     pub fn limiter(&self) -> String {
         self.q("limiter")

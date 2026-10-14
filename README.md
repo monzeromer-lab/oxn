@@ -269,7 +269,18 @@ let sched = JobScheduler::new(
 tokio::spawn(sched.run(CancellationToken::new()));
 ```
 
-Fire-and-forget or driven manually with `sched.enqueue_next().await?`.
+Run it in every process of your deployment: each tick is added **once**.
+All instances compute the same fire times (cron times are absolute;
+`RepeatOptions::every` ticks are aligned to the Unix epoch, so every hour
+fires on the hour), tick `T` is the job `sched-{id}-{T}`, and Redis keeps
+each scheduler's latest tick so none is ever added twice. The next tick
+is queued ahead as a delayed job, so it fires even if every scheduler
+process stops; ticks missed while none ran are skipped.
+
+`queue.schedulers()` lists the registered schedulers with their next fire
+time; `queue.remove_scheduler(id)` removes one and its pending ticks, and
+every running instance of it stops. `sched.enqueue_next()` queues just the
+next tick.
 
 ### Flow (feature `flow`)
 

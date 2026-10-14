@@ -25,7 +25,7 @@ use tracing::Instrument;
 
 use crate::backend::{
     Backend, Dependencies, EventRecord, Failure, Fetched, FlowJobInsert, JobInsert, JobRange,
-    RawJob, RecordStream, StateCounts, StreamStart,
+    RawJob, RecordStream, SchedulerInfo, SchedulerTick, StateCounts, StreamStart, TickOutcome,
 };
 use crate::error::{Error, Result};
 use crate::events::Event;
@@ -1208,6 +1208,101 @@ impl Backend for RedisBackend {
             )
             .await?;
         Ok(redis::from_redis_value::<i64>(&reply)? == 1)
+    }
+
+    async fn schedule_tick(&self, queue: &str, tick: SchedulerTick) -> Result<TickOutcome> {
+        self.register_queue(queue).await?;
+        let keys = self.keys(queue);
+        let SchedulerTick {
+            scheduler_id,
+            fire_at_ms,
+            repeat,
+            register,
+            insert,
+        } = tick;
+        let job_id = |t: i64| JobId::new(format!("sched-{scheduler_id}-{t}"));
+        let id = job_id(fire_at_ms);
+        let mut opts = insert.opts;
+        opts.id = Some(id.as_str().to_string());
+        let delay_ms = (fire_at_ms - insert.timestamp_ms).max(0);
+        opts.delay = (delay_ms > 0).then(|| Duration::from_millis(delay_ms as u64));
+        opts.deduplication = None;
+        let record = serde_json::json!({
+            "id": scheduler_id,
+            "repeat": repeat,
+            "name": insert.name,
+        });
+        let mut inv = self.scripts.schedule.prepare_invoke();
+        inv.key(keys.schedulers())
+            .key(keys.meta())
+            .key(keys.id_counter())
+            .key(keys.wait())
+            .key(keys.paused())
+            .key(keys.delayed())
+            .key(keys.prioritized())
+            .key(keys.priority_counter())
+            .key(keys.events())
+            .key(keys.marker())
+            .key(keys.job_hash_prefix())
+            .key(keys.scheduler_ticks(&scheduler_id))
+            .arg(scheduler_id.as_str())
+            .arg(fire_at_ms)
+            .arg(serde_json::to_string(&record)?)
+            .arg(i32::from(register))
+            .arg(id.as_str())
+            .arg(insert.name.as_str())
+            .arg(insert.data.as_str())
+            .arg(opts_to_json(&opts)?)
+            .arg(insert.timestamp_ms)
+            .arg(delay_ms)
+            .arg(opts.priority)
+            .arg(i32::from(opts.lifo))
+            .arg(self.max_stream_length as i64);
+        let mut conn = self.conn().await?;
+        let reply = self
+            .eval(&mut conn, "schedule", queue, Some(id.as_str()), &inv)
+            .await?;
+        let (status, latest): (String, i64) = redis::from_redis_value(&reply)?;
+        Ok(match status.as_str() {
+            "added" => TickOutcome::Added(id),
+            "removed" => TickOutcome::Removed,
+            _ => TickOutcome::Exists(job_id(latest)),
+        })
+    }
+
+    async fn schedulers(&self, queue: &str) -> Result<Vec<SchedulerInfo>> {
+        let keys = self.keys(queue);
+        let mut conn = self.conn().await?;
+        let map: std::collections::HashMap<String, String> =
+            conn.hgetall(keys.schedulers()).await?;
+        let mut out: Vec<SchedulerInfo> = map
+            .values()
+            .filter_map(|json| serde_json::from_str(json).ok())
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    async fn remove_scheduler(&self, queue: &str, id: &str) -> Result<bool> {
+        let keys = self.keys(queue);
+        let mut inv = self.scripts.remove_scheduler.prepare_invoke();
+        inv.key(keys.schedulers())
+            .key(keys.wait())
+            .key(keys.paused())
+            .key(keys.delayed())
+            .key(keys.prioritized())
+            .key(keys.events())
+            .key(keys.job_hash_prefix())
+            .key(keys.scheduler_ticks(id))
+            .key(keys.active())
+            .arg(id)
+            .arg(now_ms())
+            .arg(self.max_stream_length as i64);
+        let mut conn = self.conn().await?;
+        let reply = self
+            .eval(&mut conn, "remove_scheduler", queue, None, &inv)
+            .await?;
+        Ok(redis::from_redis_value::<i64>(&reply)? >= 1)
     }
 
     async fn dependencies(&self, queue: &str, id: &JobId) -> Result<Dependencies> {

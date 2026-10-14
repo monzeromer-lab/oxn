@@ -35,6 +35,7 @@ pub const QUEUE_KEYS: &[&str] = &[
     "id",
     "pc",
     "limiter",
+    "schedulers",
 ];
 
 /// Suffixes of per-job auxiliary keys (`{prefix}:{queue}:{id}:{suffix}`).
@@ -103,6 +104,10 @@ pub struct Snapshot {
     pub stalled: BTreeSet<String>,
     /// The `meta` hash.
     pub meta: BTreeMap<String, String>,
+    /// The `schedulers` hash: scheduler id → record JSON.
+    pub schedulers: BTreeMap<String, String>,
+    /// Per scheduler, the fire times of its possibly-pending ticks.
+    pub scheduler_ticks: BTreeMap<String, Vec<(String, f64)>>,
     /// Job hashes by id.
     pub jobs: BTreeMap<String, JobSnap>,
     /// Aux keys whose job hash does not exist: `(id, suffix)`.
@@ -180,6 +185,11 @@ impl Snapshot {
                 }
                 ("stalled", "set") => snap.stalled = payload.into_iter().collect(),
                 ("meta", "hash") => snap.meta = pairs(payload),
+                ("schedulers", "hash") => snap.schedulers = pairs(payload),
+                (s, "zset") if s.starts_with("schedulers:") => {
+                    snap.scheduler_ticks
+                        .insert(s["schedulers:".len()..].to_string(), pairs_scored(payload));
+                }
                 ("events", "stream") => {
                     snap.stream_len = payload.first().and_then(|n| n.parse().ok()).unwrap_or(0);
                 }

@@ -132,16 +132,7 @@ where
     /// # Ok(()) }
     /// ```
     pub async fn add(&self, data: D, opts: JobOptions) -> Result<JobId> {
-        let opts = opts.resolve_with(&self.opts.default_job_options);
-        if let Some(id) = &opts.id {
-            crate::validate::job_id(id)?;
-        }
-        let insert = JobInsert {
-            name: opts.name.clone().unwrap_or_else(|| self.name.clone()),
-            data: serde_json::to_string(&data)?,
-            opts,
-            timestamp_ms: now_ms(),
-        };
+        let insert = self.insert(&data, opts)?;
         let span =
             tracing::debug_span!("oxn.add", queue = %self.name, job_id = tracing::field::Empty);
         let id = self
@@ -177,23 +168,39 @@ where
     pub async fn add_bulk(&self, jobs: Vec<(D, JobOptions)>) -> Result<Vec<JobId>> {
         let inserts = jobs
             .into_iter()
-            .map(|(d, opts)| {
-                let opts = opts.resolve_with(&self.opts.default_job_options);
-                if let Some(id) = &opts.id {
-                    crate::validate::job_id(id)?;
-                }
-                let name = opts.name.clone().unwrap_or_else(|| self.name.clone());
-                Ok(JobInsert {
-                    name,
-                    data: serde_json::to_string(&d)?,
-                    opts,
-                    timestamp_ms: now_ms(),
-                })
-            })
+            .map(|(d, opts)| self.insert(&d, opts))
             .collect::<Result<Vec<_>>>()?;
         let ids = self.backend.add_bulk(&self.name, inserts).await?;
         crate::telemetry::added(&self.name, ids.len());
         Ok(ids)
+    }
+
+    /// A job as it is submitted: options merged with the queue's defaults
+    /// and validated, payload encoded, timestamped now.
+    pub(crate) fn insert(&self, data: &D, opts: JobOptions) -> Result<JobInsert> {
+        let opts = opts.resolve_with(&self.opts.default_job_options);
+        if let Some(id) = &opts.id {
+            crate::validate::job_id(id)?;
+        }
+        Ok(JobInsert {
+            name: opts.name.clone().unwrap_or_else(|| self.name.clone()),
+            data: serde_json::to_string(data)?,
+            opts,
+            timestamp_ms: now_ms(),
+        })
+    }
+
+    /// The job schedulers registered on this queue (see
+    /// `scheduler::JobScheduler`), with the fire time of each one's next
+    /// tick.
+    pub async fn schedulers(&self) -> Result<Vec<crate::backend::SchedulerInfo>> {
+        self.backend.schedulers(&self.name).await
+    }
+
+    /// Remove a scheduler and its pending tick. Every running instance of
+    /// it stops at its next tick. Returns whether it existed.
+    pub async fn remove_scheduler(&self, id: &str) -> Result<bool> {
+        self.backend.remove_scheduler(&self.name, id).await
     }
 
     /// A flow parent's children by outcome: pending, completed (with their

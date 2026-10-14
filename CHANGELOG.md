@@ -73,7 +73,12 @@ It contains breaking changes; see the migration notes below.
   `Failure::new(reason).retry_at(ms).removal(r).trace(t)`) (B12b);
   `fetch_next` takes a trailing `Option<RateLimit>` (B12d); new
   `add_flow`, `wait_for_children` and `dependencies` with default
-  implementations that refuse (B13).
+  implementations that refuse (B13); `schedule_tick`, `schedulers` and
+  `remove_scheduler` (B14).
+- Scheduler (B14): `RepeatOptions::Cron` is a struct variant
+  `{ expr, schedule }`; `every(d)` ticks are aligned to the Unix epoch
+  instead of `d` after each enqueue; `run` keeps the *next* tick queued
+  ahead instead of adding each tick when it fires.
 - Flows (B13): `FlowProducer::add` returns a `FlowJob` tree instead of the
   root's `JobId`; `FlowNode` gains `on_failure`; `ParentRef` is now
   `JobRef` (alias kept) and `Job::parent`, `Error::WaitingChildren` and
@@ -115,6 +120,21 @@ It contains breaking changes; see the migration notes below.
   immediately and its pool slot is detached instead of being returned with
   a block still pending; the stalled scanner is joined before `run()`
   returns.
+- **Schedulers are safe to run in every process (B14).** Each tick's job
+  id was the wall-clock time of the enqueue, so N processes running the
+  same `JobScheduler` added N jobs per tick (5 instances: 25 jobs for 5
+  ticks); `run` and `enqueue_next` disagreed (one added each tick when it
+  fired, the other one ahead) and intervals drifted per process. Now
+  every instance computes the same fire times — cron is absolute,
+  `every(d)` is aligned to the Unix epoch — tick `T` is the job
+  `sched-{id}-{T}`, and `schedule.lua` keeps each scheduler's latest tick
+  in `{prefix}:{queue}:schedulers`, so a tick is added once even after its
+  job was deleted by retention. The next tick is always queued ahead (it
+  fires if every scheduler process stops); a failed enqueue retries the
+  same tick. Schedulers are listed by `Queue::schedulers()` and removed by
+  `Queue::remove_scheduler` / `JobScheduler::remove`, which deletes every
+  pending tick and stops every running instance. Invalid scheduler ids and
+  zero intervals are refused.
 - **Flows work (B13).** `FlowProducer` added every node as an ordinary
   job: the parent ran first, child names were mangled to
   `name@child-of:…`, and nothing linked the jobs. Now `flow.lua` adds the

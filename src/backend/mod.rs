@@ -85,6 +85,61 @@ pub struct FlowJobInsert {
     pub ignore_dependency_on_failure: bool,
 }
 
+/// How a scheduler repeats, as stored with its record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Repeat {
+    /// A cron expression (seconds field first, as the `cron` crate parses).
+    Cron(String),
+    /// A fixed interval in ms; ticks are aligned to the Unix epoch.
+    EveryMs(u64),
+}
+
+/// A scheduler registered on a queue (see [`Backend::schedulers`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerInfo {
+    /// The scheduler's id.
+    pub id: String,
+    /// Its cadence.
+    pub repeat: Repeat,
+    /// Name of the jobs it adds.
+    pub name: String,
+    /// Fire time (epoch-ms) of the latest tick enqueued — the next one to
+    /// run, until it does.
+    #[serde(rename = "next_ms")]
+    pub next_fire_ms: i64,
+    /// Epoch-ms the record was last written.
+    pub updated_ms: i64,
+}
+
+/// One scheduler tick to enqueue (see [`Backend::schedule_tick`]).
+#[derive(Debug, Clone)]
+pub struct SchedulerTick {
+    /// The scheduler's id.
+    pub scheduler_id: String,
+    /// The tick's fire time, epoch-ms. The job is `sched-{id}-{fire_at_ms}`.
+    pub fire_at_ms: i64,
+    /// The scheduler's cadence, stored with its record.
+    pub repeat: Repeat,
+    /// `true` when a scheduler (re)starts: revives a removed one. A running
+    /// loop passes `false`, so a removed scheduler stops.
+    pub register: bool,
+    /// The job (its id and delay are set from the tick).
+    pub insert: JobInsert,
+}
+
+/// What [`Backend::schedule_tick`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TickOutcome {
+    /// This call enqueued the tick.
+    Added(JobId),
+    /// The tick (or a later one) was already enqueued — by another
+    /// instance, or earlier; carries the latest tick's job id.
+    Exists(JobId),
+    /// The scheduler was removed; a running loop should stop.
+    Removed,
+}
+
 /// A parent's children by outcome (see [`Backend::dependencies`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dependencies {
@@ -444,6 +499,30 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
     async fn wait_for_children(&self, queue: &str, id: &JobId, token: &str) -> Result<bool> {
         let _ = (queue, id, token);
         Err(Error::Config("this backend does not support flows".into()))
+    }
+
+    /// Enqueue one scheduler tick, at most once across every instance of
+    /// the scheduler.
+    async fn schedule_tick(&self, queue: &str, tick: SchedulerTick) -> Result<TickOutcome> {
+        let _ = (queue, tick);
+        Err(Error::Config(
+            "this backend does not support schedulers".into(),
+        ))
+    }
+
+    /// The schedulers registered on `queue` (removed ones excluded).
+    async fn schedulers(&self, queue: &str) -> Result<Vec<SchedulerInfo>> {
+        let _ = queue;
+        Ok(Vec::new())
+    }
+
+    /// Remove a scheduler and its pending tick; every running instance
+    /// stops at its next tick. Returns whether it existed.
+    async fn remove_scheduler(&self, queue: &str, id: &str) -> Result<bool> {
+        let _ = (queue, id);
+        Err(Error::Config(
+            "this backend does not support schedulers".into(),
+        ))
     }
 
     /// A job's children by outcome. Empty for a job that has none.

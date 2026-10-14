@@ -90,6 +90,10 @@ jobs:
           target/release/oxn-load flow --redis redis://127.0.0.1:6379 --flows 1000 --children 5
           --fail-parent-rate 0.1 --ignore-rate 0.1 --retry-rate 0.1 --dynamic-rate 0.1
           --restart-every-s 2 --label ci
+      - name: schedulers (one run per tick across instances)
+        run: >-
+          target/release/oxn-load schedule --redis redis://127.0.0.1:6379 --schedulers 20
+          --instances 5 --every-ms 200 --duration-s 8 --restart-every-s 3 --label ci
       - name: Upload load reports
         if: always()
         uses: actions/upload-artifact@v4
