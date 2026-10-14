@@ -30,6 +30,8 @@ mod flow;
 mod handler_panics;
 mod job_context;
 mod job_defaults;
+#[cfg(feature = "metrics")]
+mod metrics;
 mod obliterate_scope;
 mod pause_resume;
 mod pickup_latency;

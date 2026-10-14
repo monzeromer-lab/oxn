@@ -41,6 +41,8 @@ pub enum WEvent {
         worker: u32,
         at_us: u64,
         due_us: u64,
+        /// Backend job id (numeric), 0 if unknown.
+        job_id: u64,
     },
     Done {
         seq: u64,
@@ -71,8 +73,9 @@ impl WEvent {
                 worker,
                 at_us,
                 due_us,
+                job_id,
             } => {
-                format!("S {seq} {attempt} {worker} {at_us} {due_us}")
+                format!("S {seq} {attempt} {worker} {at_us} {due_us} {job_id}")
             }
             WEvent::Done {
                 seq,
@@ -105,6 +108,7 @@ impl WEvent {
                 worker: n()?.parse().ok()?,
                 at_us: n()?.parse().ok()?,
                 due_us: n()?.parse().ok()?,
+                job_id: n().and_then(|v| v.parse().ok()).unwrap_or(0),
             }),
             "D" => {
                 let seq = n()?.parse().ok()?;
@@ -139,13 +143,14 @@ pub fn apply(ledger: &Ledger, stats: &Stats, ev: WEvent) {
             worker,
             at_us,
             due_us,
+            job_id,
         } => {
             stats.started.fetch_add(1, Ordering::Relaxed);
             stats.start_times.lock().push(at_us);
             if attempt <= 1 {
                 stats.pickup.record(at_us.saturating_sub(due_us));
             }
-            ledger.start(seq, attempt, worker, at_us);
+            ledger.start(seq, attempt, worker, at_us, job_id);
         }
         WEvent::Done {
             seq,
@@ -247,6 +252,7 @@ pub fn build_worker(
     let mut b = Worker::builder_with_ctx(queue, move |job: Job<LoadJob>, ctx: oxn::JobContext| {
         let sink = sink.clone();
         async move {
+            let job_id = job.id.as_str().parse().unwrap_or(0);
             let d = job.data;
             let attempt = job.attempts_made;
             if ctx_ops {
@@ -257,6 +263,7 @@ pub fn build_worker(
             let start = now_us();
             sink.emit(WEvent::Start {
                 seq: d.seq,
+                job_id,
                 attempt,
                 worker: index,
                 at_us: start,
@@ -440,6 +447,10 @@ pub fn plan(cfg: &Config, seq: u64, seed: u64) -> (LoadJob, JobOptions) {
     (job, opts)
 }
 
+/// Retried adds get `seq + (try << AMBIGUOUS_SEQ_SHIFT)`; seqs stay far
+/// below 2^40.
+pub const AMBIGUOUS_SEQ_SHIFT: u32 = 40;
+
 /// Run one producer until the job budget or duration is exhausted.
 #[allow(clippy::too_many_arguments)]
 pub async fn producer(
@@ -499,14 +510,18 @@ pub async fn producer(
                 next_at = now; // fell far behind; don't burst to catch up
             }
         }
-        // Retry the same seqs until they land so the ledger never has
-        // holes. A failed `add` may still have been applied server-side
-        // (reply lost); the ledger would then see unknown job ids in the
-        // stream, which the observer ignores, and these seqs get new jobs.
+        // Retry until the batch lands. A failed `add` may still have been
+        // applied server-side (reply lost to a dropped connection), so a
+        // failed batch stays in the ledger as *ambiguous* and the retry
+        // uses fresh seqs (same plans, offset by the try number): a job
+        // that did land runs under its own seq and is verified like any
+        // other, instead of looking like a duplicate of its retry.
+        let mut try_no = 0u64;
         loop {
             let planned: Vec<(LoadJob, JobOptions)> = (first..last)
                 .map(|seq| {
                     let (mut job, opts) = plan(&cfg, seq, seed);
+                    job.seq = seq + (try_no << AMBIGUOUS_SEQ_SHIFT);
                     job.enq_us = now_us();
                     (job, opts)
                 })
@@ -530,6 +545,10 @@ pub async fn producer(
                     break;
                 }
                 Err(e) => {
+                    for job in jobs {
+                        ledger.add_ambiguous(job);
+                    }
+                    try_no += 1;
                     let k = stats.add_errors.fetch_add(1, Ordering::Relaxed);
                     if k.is_multiple_of(100) {
                         stats.note(format!("add failed (#{}): {e}", k + 1));
@@ -886,6 +905,7 @@ mod tests {
                 worker: 3,
                 at_us: 100,
                 due_us: 90,
+                job_id: 41,
             },
             WEvent::Done {
                 seq: 7,

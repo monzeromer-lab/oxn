@@ -61,6 +61,8 @@ pub struct Outcome {
     pub health_after_cleanup: Option<RedisHealth>,
     pub rows: Vec<Row>,
     pub kills: u32,
+    /// oxn `metrics` counters for the queue (in-process workers only).
+    pub oxn_metrics: Option<BTreeMap<String, f64>>,
     /// `--rate-limit`: the most starts seen in any sliding window of the
     /// limit's length, and the mean start rate per window.
     pub rate_limit_peak: Option<usize>,
@@ -87,6 +89,9 @@ pub struct LeakReport {
 
 pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
     workload::MAX_STREAM_LEN.store(cfg.max_stream_len, std::sync::atomic::Ordering::Relaxed);
+    // oxn's own metrics, cross-checked against the ledger and the raw
+    // stream at the end (in-process workers only: children have their own).
+    let metrics = (!cfg.processes).then(oxn_testkit::metrics::install);
     let cfg = Arc::new(cfg);
     let client = redis::Client::open(cfg.redis.as_str())?;
     // Auto-reconnecting: the harness must keep observing across Redis
@@ -281,7 +286,15 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
     let drain_start = Instant::now();
     let mut drained = false;
     while drain_start.elapsed() < cfg.drain_timeout {
-        if ledger.pending(cfg.attempts) == 0 {
+        // After a failed add, a job may exist that the ledger can't know
+        // about until it starts: also wait for Redis to hold no ready,
+        // delayed or active work.
+        let redis_idle = stats.add_errors.load(std::sync::atomic::Ordering::Relaxed) == 0
+            || pq
+                .counts()
+                .await
+                .is_ok_and(|c| c.waiting + c.paused + c.active + c.delayed + c.prioritized == 0);
+        if ledger.pending(cfg.attempts) == 0 && redis_idle {
             drained = true;
             break;
         }
@@ -491,6 +504,77 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
         }
         None => (None, None),
     };
+    let oxn_metrics = metrics.map(|m| {
+        let l = [("queue", queue.as_str())];
+        let mut out = BTreeMap::new();
+        for name in [
+            oxn::metrics::ADDED,
+            oxn::metrics::STARTED,
+            oxn::metrics::COMPLETED,
+            oxn::metrics::FAILED,
+            oxn::metrics::RETRIED,
+            oxn::metrics::POSTPONED,
+            oxn::metrics::RELEASED,
+            oxn::metrics::STALLED,
+            oxn::metrics::LOCK_LOST,
+            oxn::metrics::TRANSITION_ERRORS,
+            oxn::metrics::FETCH_ERRORS,
+            oxn::metrics::RATE_LIMITED,
+        ] {
+            out.insert(name.to_string(), m.counter(name, &l) as f64);
+        }
+        out.insert(
+            oxn::metrics::ACTIVE.into(),
+            m.gauge(oxn::metrics::ACTIVE, &l),
+        );
+        out.insert(
+            format!("{}_count", oxn::metrics::JOB_DURATION),
+            m.histogram(oxn::metrics::JOB_DURATION, &l).len() as f64,
+        );
+        // Exact agreement is only expected without chaos: a transition
+        // lost to a dropped connection is neither emitted nor counted the
+        // same way by every source.
+        if cfg.chaos.is_empty() {
+            let ev = |k: &str| stream_counts.lock().get(k).copied().unwrap_or(0) as f64;
+            let relaxed = |a: &std::sync::atomic::AtomicU64| {
+                a.load(std::sync::atomic::Ordering::Relaxed) as f64
+            };
+            let checks = [
+                (
+                    oxn::metrics::ADDED,
+                    relaxed(&stats.added),
+                    "jobs the producers added",
+                ),
+                (
+                    oxn::metrics::STARTED,
+                    relaxed(&stats.started),
+                    "handler starts in the ledger",
+                ),
+                (
+                    oxn::metrics::COMPLETED,
+                    ev("completed"),
+                    "`completed` events",
+                ),
+                (oxn::metrics::FAILED, ev("failed"), "`failed` events"),
+                (oxn::metrics::ACTIVE, 0.0, "nothing running after the drain"),
+                (
+                    oxn::metrics::TRANSITION_ERRORS,
+                    0.0,
+                    "no refused transitions",
+                ),
+            ];
+            for (name, want, what) in checks {
+                let got = out[name];
+                if (got - want).abs() > f64::EPSILON {
+                    failures.push(format!("oxn metric {name} = {got} but {what} = {want}"));
+                }
+            }
+            if out[&format!("{}_count", oxn::metrics::JOB_DURATION)] != out[oxn::metrics::STARTED] {
+                failures.push("oxn_job_duration_seconds samples ≠ starts".into());
+            }
+        }
+        out
+    });
     let pickup = stats.pickup.summary();
     if let Some(slo) = cfg.slo_pickup_p99_ms
         && pickup.p99_ms > slo
@@ -524,6 +608,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
         verdict,
         rate_limit_peak,
         rate_limit_mean_per_window,
+        oxn_metrics,
         stream_events: stream_counts.lock().clone(),
         final_sizes,
         retention_findings,

@@ -652,6 +652,7 @@ impl Backend for RedisBackend {
                 // before then, whatever the marker says.
                 let wait = retry_in.max(MIN_BLOCK);
                 tracing::debug!(queue, wait_ms = wait.as_millis() as u64, "rate limited");
+                crate::telemetry::rate_limited(queue);
                 tokio::select! {
                     _ = cancel.cancelled() => {}
                     _ = tokio::time::sleep(wait) => {}

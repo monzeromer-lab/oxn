@@ -29,6 +29,7 @@
 pub mod capture;
 pub mod env;
 pub mod invariants;
+pub mod metrics;
 pub mod monitor;
 pub mod recorder;
 pub mod report;

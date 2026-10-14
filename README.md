@@ -90,7 +90,7 @@ async fn main() -> oxn::Result<()> {
 | `redis-backend`   | **Default.** `backend::redis::RedisBackend`                    |
 | `scheduler`       | `JobScheduler` — cron and fixed-interval repeats               |
 | `flow`            | `FlowProducer` — parent/child DAG submission                   |
-| `metrics`         | Emits counters/histograms via the `metrics` crate              |
+| `metrics`         | `oxn_*` counters, histograms and a gauge via the `metrics` crate (names in `oxn::metrics`) |
 | `dashboard-axum`  | `dashboard::axum_router` — mount on any axum app               |
 | `dashboard-actix` | `dashboard::actix_scope` — mount on any actix-web app          |
 | `full`            | Everything above except actix (choose one dashboard)           |

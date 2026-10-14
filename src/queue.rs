@@ -150,6 +150,7 @@ where
             .instrument(span.clone())
             .await?;
         span.record("job_id", id.as_str());
+        crate::telemetry::added(&self.name, 1);
         Ok(id)
     }
 
@@ -190,7 +191,9 @@ where
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        self.backend.add_bulk(&self.name, inserts).await
+        let ids = self.backend.add_bulk(&self.name, inserts).await?;
+        crate::telemetry::added(&self.name, ids.len());
+        Ok(ids)
     }
 
     /// Stop accepting new active jobs; existing ones continue.

@@ -86,7 +86,7 @@
 //! | `tls-native`       | `rediss://` URL support via native-tls (OpenSSL/SChannel).    |
 //! | `scheduler`        | `JobScheduler` — cron and fixed-interval repeats.             |
 //! | `flow`             | `FlowProducer` — parent/child DAGs.                           |
-//! | `metrics`          | Emits counters/histograms via the `metrics` crate.            |
+//! | `metrics`          | `oxn_*` counters/histograms via the `metrics` crate (`oxn::metrics`). |
 //! | `dashboard-axum`   | `dashboard::axum_router` — mount on any axum app.             |
 //! | `dashboard-actix`  | `dashboard::actix_scope` — mount on any actix-web app.        |
 //! | `full`             | All of the above (rustls TLS), with `dashboard-axum` selected.|
@@ -182,6 +182,11 @@ pub mod scheduler;
 #[cfg(feature = "dashboard")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dashboard")))]
 pub mod dashboard;
+
+#[cfg(feature = "metrics")]
+#[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
+pub mod metrics;
+mod telemetry;
 
 pub mod prelude;
 

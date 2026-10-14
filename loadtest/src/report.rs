@@ -88,6 +88,13 @@ pub fn render(o: &Outcome) -> String {
         v.explained_duplicates,
         v.missing_server_events
     );
+    if v.ambiguous_adds_landed + v.ambiguous_adds_unseen > 0 {
+        let _ = writeln!(
+            s,
+            "Failed `add` calls: {} created their job anyway (it ran and is verified above), {} never ran (assumed not created).\n",
+            v.ambiguous_adds_landed, v.ambiguous_adds_unseen
+        );
+    }
     if v.counts.is_empty() {
         let _ = writeln!(
             s,
@@ -201,6 +208,13 @@ pub fn render(o: &Outcome) -> String {
         );
     }
 
+    if let Some(m) = &o.oxn_metrics {
+        let _ = writeln!(s, "## oxn metrics\n");
+        for (k, v) in m {
+            let _ = writeln!(s, "- `{k}` = {v}");
+        }
+        let _ = writeln!(s);
+    }
     let _ = writeln!(s, "## Timeline (per second)\n");
     let _ = writeln!(
         s,

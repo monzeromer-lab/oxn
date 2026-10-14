@@ -102,6 +102,9 @@ pub struct Entry {
     pub job: Option<LoadJob>,
     /// Backend-assigned id.
     pub job_id: Option<String>,
+    /// The `add` returned an error, so whether the job exists is unknown
+    /// until (and unless) a worker starts it.
+    pub ambiguous: bool,
     /// Handler starts.
     pub starts: u32,
     /// `Ok` returns.
@@ -143,6 +146,11 @@ impl Entry {
             self.history.remove(1.min(self.history.len() - 1)); // keep the first (Added) for context
         }
         self.history.push((at_us, m));
+    }
+
+    /// An ambiguous add no worker ever started: assumed not to exist.
+    pub fn unlanded(&self) -> bool {
+        self.ambiguous && self.starts == 0
     }
 
     /// Whether the job reached the terminal state its plan predicts
@@ -194,8 +202,31 @@ impl Ledger {
         });
     }
 
-    pub fn start(&self, seq: u64, attempt: u32, worker: u32, at_us: u64) {
+    /// A submission whose `add` failed: it may or may not have landed.
+    pub fn add_ambiguous(&self, job: LoadJob) {
         let cap = self.history_cap;
+        let at = job.enq_us;
+        self.with(job.seq, |e| {
+            e.job = Some(job);
+            e.ambiguous = true;
+            e.mark(cap, at, Mark::Added);
+        });
+    }
+
+    pub fn start(&self, seq: u64, attempt: u32, worker: u32, at_us: u64, job_id: u64) {
+        let cap = self.history_cap;
+        // An ambiguous add that did land: learn its id so the stream's
+        // events for it are attributed from here on.
+        let bind = self.with(seq, |e| {
+            (e.ambiguous && e.job_id.is_none() && job_id != 0).then(|| {
+                let id = job_id.to_string();
+                e.job_id = Some(id.clone());
+                id
+            })
+        });
+        if let Some(id) = bind {
+            self.by_id.lock().insert(id, seq);
+        }
         self.with(seq, |e| {
             e.starts += 1;
             e.max_attempt = e.max_attempt.max(attempt);
@@ -264,7 +295,7 @@ impl Ledger {
             .map(|s| {
                 s.lock()
                     .values()
-                    .filter(|e| e.job.is_some() && !e.is_terminal(attempts))
+                    .filter(|e| e.job.is_some() && !e.is_terminal(attempts) && !e.unlanded())
                     .count()
             })
             .sum()
@@ -276,6 +307,13 @@ impl Ledger {
         for shard in &self.shards {
             for (seq, e) in shard.lock().iter() {
                 let Some(job) = &e.job else { continue };
+                if e.unlanded() {
+                    v.ambiguous_adds_unseen += 1;
+                    continue;
+                }
+                if e.ambiguous {
+                    v.ambiguous_adds_landed += 1;
+                }
                 v.total += 1;
                 let exp = job.expected(attempts);
                 let mut push = |kind: Anomaly, why: String| {
@@ -517,6 +555,10 @@ pub struct Verdict {
     /// Successful jobs for which the observer saw no server terminal event
     /// (events trimmed from the stream, or never emitted).
     pub missing_server_events: u64,
+    /// `add` calls that errored yet created the job (a worker ran it).
+    pub ambiguous_adds_landed: u64,
+    /// `add` calls that errored and whose job never ran (assumed absent).
+    pub ambiguous_adds_unseen: u64,
 }
 
 impl Verdict {
@@ -558,10 +600,54 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_adds_count_only_if_they_ran() {
+        let l = Ledger::new(24);
+        // seq 1: the add errored but the job landed and completed (id 7).
+        l.add_ambiguous(job(1, 0, false));
+        // seq 2: the add errored and nothing ran; its retry is seq 3.
+        l.add_ambiguous(job(2, 0, false));
+        l.added(job(3, 0, false), "8".into(), 0);
+        assert_eq!(
+            l.pending(3),
+            1,
+            "an ambiguous add isn't waited for until it starts"
+        );
+        l.start(1, 1, 0, 10, 7);
+        l.finish(
+            1,
+            Mark::Ok {
+                worker: 0,
+                attempt: 1,
+            },
+            11,
+        );
+        l.server_event("7", "completed", 12);
+        l.start(3, 1, 0, 10, 8);
+        l.finish(
+            3,
+            Mark::Ok {
+                worker: 0,
+                attempt: 1,
+            },
+            11,
+        );
+        l.server_event("8", "completed", 12);
+        assert_eq!(l.pending(3), 0);
+        let v = l.verify(3, 0);
+        assert!(v.ok(), "{:?}", v.counts);
+        assert_eq!((v.ambiguous_adds_landed, v.ambiguous_adds_unseen), (1, 1));
+        assert_eq!(v.completed_jobs, 2);
+        assert_eq!(
+            v.missing_server_events, 0,
+            "the landed job's id was learned"
+        );
+    }
+
+    #[test]
     fn clean_run_verifies() {
         let l = Ledger::new(24);
         l.added(job(1, 1, false), "1".into(), 0);
-        l.start(1, 1, 0, 10);
+        l.start(1, 1, 0, 10, 0);
         l.finish(
             1,
             Mark::Err {
@@ -570,7 +656,7 @@ mod tests {
             },
             11,
         );
-        l.start(1, 2, 0, 20);
+        l.start(1, 2, 0, 20, 0);
         l.finish(
             1,
             Mark::Ok {
@@ -592,7 +678,7 @@ mod tests {
         l.added(job(1, 0, false), "1".into(), 0); // never started → lost
         l.added(job(2, 0, false), "2".into(), 0);
         for _ in 0..2 {
-            l.start(2, 1, 0, 1);
+            l.start(2, 1, 0, 1, 0);
             l.finish(
                 2,
                 Mark::Ok {
@@ -603,7 +689,7 @@ mod tests {
             );
         }
         l.added(job(3, 0, true), "3".into(), 0);
-        l.start(3, 1, 0, 1);
+        l.start(3, 1, 0, 1, 0);
         l.finish(
             3,
             Mark::Fatal {
@@ -612,7 +698,7 @@ mod tests {
             },
             2,
         );
-        l.start(3, 2, 0, 3);
+        l.start(3, 2, 0, 3, 0);
         let v = l.verify(3, 0);
         assert_eq!(v.counts.get(&Anomaly::Lost), Some(&1));
         assert_eq!(v.counts.get(&Anomaly::DuplicateCompletion), Some(&1));
@@ -629,8 +715,8 @@ mod tests {
     fn interrupted_attempt_without_stall_is_flagged() {
         let l = Ledger::new(24);
         l.added(job(1, 0, false), "1".into(), 0);
-        l.start(1, 1, 0, 1); // never reports back, no stall recorded
-        l.start(1, 2, 0, 2);
+        l.start(1, 1, 0, 1, 0); // never reports back, no stall recorded
+        l.start(1, 2, 0, 2, 0);
         l.finish(
             1,
             Mark::Ok {
@@ -650,7 +736,7 @@ mod tests {
         let l = Ledger::new(24);
         l.added(job(1, 3, false), "1".into(), 0);
         for a in 1..=2 {
-            l.start(1, a, 0, a as u64);
+            l.start(1, a, 0, a as u64, 0);
             l.finish(
                 1,
                 Mark::Err {
@@ -660,9 +746,9 @@ mod tests {
                 a as u64,
             );
         }
-        l.start(1, 3, 0, 10);
+        l.start(1, 3, 0, 10, 0);
         l.server_event("1", "stalled", 11);
-        l.start(1, 4, 1, 12);
+        l.start(1, 4, 1, 12, 0);
         l.finish(
             1,
             Mark::Ok {
@@ -682,7 +768,7 @@ mod tests {
         // that died before its handler ran; attempt 3 fails at the limit.
         let l = Ledger::new(24);
         l.added(job(1, 5, false), "1".into(), 0);
-        l.start(1, 1, 0, 1);
+        l.start(1, 1, 0, 1, 0);
         l.finish(
             1,
             Mark::Err {
@@ -692,7 +778,7 @@ mod tests {
             2,
         );
         l.server_event("1", "stalled", 3);
-        l.start(1, 3, 1, 4);
+        l.start(1, 3, 1, 4, 0);
         l.finish(
             1,
             Mark::Err {
@@ -713,9 +799,9 @@ mod tests {
         // the re-run is attempt 1 again.
         let l = Ledger::new(24);
         l.added(job(1, 0, false), "1".into(), 0);
-        l.start(1, 1, 0, 1);
+        l.start(1, 1, 0, 1, 0);
         l.server_event("1", "released", 2);
-        l.start(1, 1, 1, 3);
+        l.start(1, 1, 1, 3, 0);
         l.finish(
             1,
             Mark::Ok {
@@ -733,7 +819,7 @@ mod tests {
     fn running_out_of_stalls_is_an_accepted_failure() {
         let l = Ledger::new(24);
         l.added(job(1, 0, false), "1".into(), 0);
-        l.start(1, 1, 0, 1); // killed
+        l.start(1, 1, 0, 1, 0); // killed
         l.server_event("1", "stall-failed", 2);
         let v = l.verify(3, 0);
         assert!(v.ok(), "{:?}", v.counts);
@@ -745,7 +831,7 @@ mod tests {
     fn ok_lost_to_a_killed_worker_then_stall_failed_is_accounted() {
         let l = Ledger::new(24);
         l.added(job(1, 0, false), "1".into(), 0);
-        l.start(1, 1, 0, 1);
+        l.start(1, 1, 0, 1, 0);
         l.finish(
             1,
             Mark::Ok {
@@ -768,7 +854,7 @@ mod tests {
         // fail twice, succeed on the 3rd of 3 attempts, after one postponement
         let l = Ledger::new(24);
         l.added(job(1, 2, false), "1".into(), 0);
-        l.start(1, 1, 0, 1);
+        l.start(1, 1, 0, 1, 0);
         l.finish(
             1,
             Mark::Postponed {
@@ -778,7 +864,7 @@ mod tests {
             2,
         );
         for a in 1..=2 {
-            l.start(1, a, 0, 10 + a as u64);
+            l.start(1, a, 0, 10 + a as u64, 0);
             l.finish(
                 1,
                 Mark::Err {
@@ -788,7 +874,7 @@ mod tests {
                 11 + a as u64,
             );
         }
-        l.start(1, 3, 0, 20);
+        l.start(1, 3, 0, 20, 0);
         l.finish(
             1,
             Mark::Ok {
@@ -804,7 +890,7 @@ mod tests {
         // A fatal job postponed first starts twice; that is not a retry.
         let l = Ledger::new(24);
         l.added(job(2, 0, true), "2".into(), 0);
-        l.start(2, 1, 0, 1);
+        l.start(2, 1, 0, 1, 0);
         l.finish(
             2,
             Mark::Postponed {
@@ -813,7 +899,7 @@ mod tests {
             },
             2,
         );
-        l.start(2, 1, 0, 3);
+        l.start(2, 1, 0, 3, 0);
         l.finish(
             2,
             Mark::Fatal {
@@ -830,10 +916,10 @@ mod tests {
     fn retry_past_the_limit_is_flagged_even_with_interruptions() {
         let l = Ledger::new(24);
         l.added(job(1, 5, false), "1".into(), 0);
-        l.start(1, 1, 0, 1); // killed
+        l.start(1, 1, 0, 1, 0); // killed
         l.server_event("1", "stalled", 2);
         for a in 2..=3 {
-            l.start(1, a, 0, a as u64 * 10);
+            l.start(1, a, 0, a as u64 * 10, 0);
             l.finish(
                 1,
                 Mark::Err {
@@ -844,7 +930,7 @@ mod tests {
             );
         }
         // attempt 3 failed at the limit of 3 — oxn must not run it again.
-        l.start(1, 6, 0, 100);
+        l.start(1, 6, 0, 100, 0);
         l.finish(
             1,
             Mark::Ok {
@@ -861,9 +947,9 @@ mod tests {
     fn stalls_explain_extra_starts() {
         let l = Ledger::new(24);
         l.added(job(1, 0, false), "1".into(), 0);
-        l.start(1, 1, 0, 1);
+        l.start(1, 1, 0, 1, 0);
         l.server_event("1", "stalled", 2);
-        l.start(1, 2, 1, 3);
+        l.start(1, 2, 1, 3, 0);
         l.finish(
             1,
             Mark::Ok {
@@ -884,7 +970,7 @@ mod tests {
         j.delay_ms = 1000;
         j.enq_us = 1_000_000;
         l.added(j, "1".into(), 0);
-        l.start(1, 1, 0, 1_100_000); // 900ms early
+        l.start(1, 1, 0, 1_100_000, 0); // 900ms early
         l.finish(
             1,
             Mark::Ok {

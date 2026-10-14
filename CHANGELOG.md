@@ -108,6 +108,17 @@ It contains breaking changes; see the migration notes below.
   immediately and its pool slot is detached instead of being returned with
   a block still pending; the stalled scanner is joined before `run()`
   returns.
+- **The `metrics` feature emits metrics (B12e).** It only pulled in the
+  `metrics` crate; nothing was ever recorded. New `oxn::metrics` module
+  documents the series and exports their names and `describe()`. All are
+  labelled `queue`: counters `oxn_jobs_{added,started,completed,failed,
+  retried,postponed,released,stalled}_total`, `oxn_lock_lost_total`,
+  `oxn_transition_errors_total{to}`, `oxn_fetch_errors_total`,
+  `oxn_rate_limited_total`; histograms `oxn_job_duration_seconds{outcome}`
+  and `oxn_job_wait_seconds`; gauge `oxn_jobs_active`. Transitions count
+  only once Redis accepted them (a refused completion counts as
+  `oxn_lock_lost_total`, never as completed). Without the feature the
+  emitters compile to nothing.
 - **`rate_limit(max, per)` limits (B12d).** It was stored and never
   read. It is now a queue-wide fixed-window limit counted in Redis
   (`{prefix}:{queue}:limiter`) inside `move_to_active`: at most `max` jobs

@@ -279,6 +279,7 @@ where
             cancel,
             _data,
         } = self;
+        crate::telemetry::describe();
 
         let semaphore = Arc::new(Semaphore::new(opts.concurrency));
         let token_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -301,8 +302,9 @@ where
                     tokio::select! {
                         _ = c.cancelled() => break,
                         _ = tick.tick() => {
-                            if let Err(e) = backend.scan_stalled(&queue, max_stalled).await {
-                                tracing::warn!(queue = %queue, error = %e, "stalled scan failed");
+                            match backend.scan_stalled(&queue, max_stalled).await {
+                                Ok(ids) => crate::telemetry::stalled(&queue, ids.len()),
+                                Err(e) => tracing::warn!(queue = %queue, error = %e, "stalled scan failed"),
                             }
                         }
                     }
@@ -353,7 +355,7 @@ where
                     fetch_span.record("job_id", raw.id.as_str());
                     fetch_span.record("outcome", "released-on-shutdown");
                     let r = backend.release(&queue, &raw.id, &token).await;
-                    log_transition("released", &r);
+                    log_transition(&queue, "released", &r);
                     drop(permit);
                     break 'main;
                 }
@@ -387,6 +389,7 @@ where
                 }
                 Err(e) => {
                     fetch_span.record("outcome", "error");
+                    crate::telemetry::fetch_error(&queue);
                     tracing::warn!(queue = %queue, worker = %id, error = %e, "fetch_next failed");
                     drop(permit);
                     tokio::select! {
@@ -464,6 +467,12 @@ async fn process_one<D, R>(
         elapsed_us = tracing::field::Empty,
     );
     let started = std::time::Instant::now();
+    let wait = (raw.attempts_made <= 1).then(|| {
+        let due = raw.timestamp_ms + raw.opts.delay.map_or(0, |d| d.as_millis() as i64);
+        Duration::from_millis((chrono_like_now_ms() - due).max(0) as u64)
+    });
+    crate::telemetry::started(&queue, wait);
+    let q = queue.clone();
     process_one_inner(
         backend,
         queue,
@@ -476,6 +485,7 @@ async fn process_one<D, R>(
     )
     .instrument(span.clone())
     .await;
+    crate::telemetry::finished(&q);
     span.record("elapsed_us", started.elapsed().as_micros() as u64);
 }
 
@@ -518,7 +528,7 @@ async fn process_one_inner<D, R>(
                     Failure::new(&reason).removal(remove_on_fail).trace(&trace),
                 )
                 .await;
-            log_transition("failed", &r);
+            log_transition(&queue, "failed", &r);
             return;
         }
     };
@@ -540,6 +550,7 @@ async fn process_one_inner<D, R>(
     };
     let abort = signals.abort;
     tracing::trace!("handler started");
+    let ran = std::time::Instant::now();
     // A panic — while building the future or while polling it — becomes
     // `Error::Panicked`, handled like any returned error. Uncaught, it would
     // unwind this task and leave the job locked until its lock expired.
@@ -562,11 +573,12 @@ async fn process_one_inner<D, R>(
                 // shutdown_timeout elapsed: drop the handler and hand the
                 // job back. It did not fail; it was interrupted.
                 drop(handler_fut);
+                crate::telemetry::ran(&queue, "aborted", ran.elapsed());
                 span.record("outcome", "aborted");
                 span.record("transition", "released");
                 tracing::debug!("handler aborted by shutdown_timeout; releasing job");
                 let r = backend.release(&queue, &id, &token).await;
-                log_transition("released", &r);
+                log_transition(&queue, "released", &r);
                 return;
             }
             _ = renew.tick(), if !lock_lost.is_cancelled() => {
@@ -584,6 +596,7 @@ async fn process_one_inner<D, R>(
             r = &mut handler_fut => break r,
         }
     };
+    crate::telemetry::ran(&queue, outcome_label(&outcome), ran.elapsed());
     span.record("outcome", outcome_label(&outcome));
     tracing::debug!(outcome = outcome_label(&outcome), "handler finished");
     let trace = outcome
@@ -599,7 +612,7 @@ async fn process_one_inner<D, R>(
             let r = backend
                 .complete(&queue, &id, &token, json, remove_on_complete)
                 .await;
-            log_transition("completed", &r);
+            log_transition(&queue, "completed", &r);
         }
         // Postponements, not failures: the attempt is refunded and no
         // failedReason is recorded.
@@ -607,7 +620,7 @@ async fn process_one_inner<D, R>(
             let until = chrono_like_now_ms() + delay_ms as i64;
             span.record("transition", "postponed");
             let r = backend.delay(&queue, &id, &token, until).await;
-            log_transition("postponed", &r);
+            log_transition(&queue, "postponed", &r);
         }
         Err(Error::Unrecoverable(msg)) => {
             span.record("transition", "failed");
@@ -619,7 +632,7 @@ async fn process_one_inner<D, R>(
                     failure(&msg, None, remove_on_fail, trace),
                 )
                 .await;
-            log_transition("failed", &r);
+            log_transition(&queue, "failed", &r);
         }
         Err(err) => {
             // `attempts_made` has already been incremented by `fetch_next`
@@ -640,7 +653,7 @@ async fn process_one_inner<D, R>(
                         failure(&err.to_string(), Some(retry_at), remove_on_fail, trace),
                     )
                     .await;
-                log_transition("retry-delayed", &r);
+                log_transition(&queue, "retry-delayed", &r);
             } else {
                 span.record("transition", "failed");
                 let r = backend
@@ -651,7 +664,7 @@ async fn process_one_inner<D, R>(
                         failure(&err.to_string(), None, remove_on_fail, trace),
                     )
                     .await;
-                log_transition("failed", &r);
+                log_transition(&queue, "failed", &r);
             }
         }
     }
@@ -727,7 +740,8 @@ fn outcome_label<R>(r: &Result<R>) -> &'static str {
 /// worker took the job over) and is a warning: this worker's outcome is
 /// discarded and the job's new owner decides its fate. Anything else is an
 /// error — the outcome was not recorded and nobody else owns the job yet.
-fn log_transition(to: &'static str, r: &Result<()>) {
+fn log_transition(queue: &str, to: &'static str, r: &Result<()>) {
+    crate::telemetry::transition(queue, to, r);
     match r {
         Ok(()) => tracing::debug!(to, "transition applied"),
         Err(e) if e.is_lock_lost() => tracing::warn!(
