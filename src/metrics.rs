@@ -20,7 +20,7 @@
 //! | `oxn_transition_errors_total` | counter | `to` | outcomes Redis did not record for another reason |
 //! | `oxn_fetch_errors_total` | counter | | failed fetches |
 //! | `oxn_rate_limited_total` | counter | | fetches refused by the queue's rate limit |
-//! | `oxn_job_duration_seconds` | histogram | `outcome` | handler run time; `outcome` is `ok`, `error`, `panicked`, `unrecoverable`, `delayed`, `rate-limited`, `cancelled` (`Error::Closed`) or `aborted` (by `shutdown_timeout`) |
+//! | `oxn_job_duration_seconds` | histogram | `outcome` | handler run time; `outcome` is `ok`, `error`, `panicked`, `unrecoverable`, `delayed`, `rate-limited`, `waiting-children`, `cancelled` (`Error::Closed`) or `aborted` (by `shutdown_timeout`) |
 //! | `oxn_job_wait_seconds` | histogram | | first attempt: from enqueue (or the end of its delay) to start; a postponed job's wait includes the postponement |
 //! | `oxn_jobs_active` | gauge | | jobs this process is running now |
 //!

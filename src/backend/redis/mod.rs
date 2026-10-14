@@ -24,12 +24,12 @@ use redis::AsyncCommands;
 use tracing::Instrument;
 
 use crate::backend::{
-    Backend, EventRecord, Failure, Fetched, JobInsert, JobRange, RawJob, RecordStream, StateCounts,
-    StreamStart,
+    Backend, Dependencies, EventRecord, Failure, Fetched, FlowJobInsert, JobInsert, JobRange,
+    RawJob, RecordStream, StateCounts, StreamStart,
 };
 use crate::error::{Error, Result};
 use crate::events::Event;
-use crate::job::{JobId, JobState};
+use crate::job::{JobId, JobRef, JobState};
 use crate::options::{Removal, ResolvedJobOptions};
 
 /// Construction config for [`RedisBackend`].
@@ -1115,6 +1115,7 @@ impl Backend for RedisBackend {
             .key(keys.prioritized())
             .key(keys.priority_counter())
             .key(keys.meta())
+            .key(keys.waiting_children())
             .arg(id.as_str())
             .arg(self.max_stream_length as i64);
         let mut conn = self.conn().await?;
@@ -1126,25 +1127,118 @@ impl Backend for RedisBackend {
     async fn remove(&self, queue: &str, id: &JobId) -> Result<()> {
         let keys = self.keys(queue);
         let mut inv = self.scripts.remove.prepare_invoke();
-        inv.key(keys.wait())
-            .key(keys.paused())
-            .key(keys.active())
-            .key(keys.delayed())
-            .key(keys.prioritized())
-            .key(keys.completed())
-            .key(keys.failed())
-            .key(keys.job_hash(id.as_str()))
-            .key(keys.job_lock(id.as_str()))
-            .key(keys.job_logs(id.as_str()))
-            .key(keys.events())
-            .key(keys.waiting_children())
-            .key(keys.job_hash_prefix())
+        inv.key(keys.job_hash(id.as_str()))
             .arg(id.as_str())
             .arg(self.max_stream_length as i64);
         let mut conn = self.conn().await?;
         self.eval(&mut conn, "remove", queue, Some(id.as_str()), &inv)
             .await?;
         Ok(())
+    }
+
+    async fn add_flow(
+        &self,
+        nodes: Vec<FlowJobInsert>,
+        parent: Option<&JobRef>,
+    ) -> Result<Vec<JobId>> {
+        let Some(root) = nodes.first() else {
+            return Ok(Vec::new());
+        };
+        let root_queue = root.queue.clone();
+        let mut queues: Vec<&str> = nodes.iter().map(|n| n.queue.as_str()).collect();
+        queues.sort_unstable();
+        queues.dedup();
+        for q in queues {
+            self.register_queue(q).await?;
+        }
+        let json = nodes
+            .iter()
+            .map(|n| {
+                let i = &n.insert;
+                Ok(serde_json::json!({
+                    "base": format!("{}:{}", self.prefix, n.queue),
+                    "name": i.name,
+                    "data": i.data,
+                    "opts": opts_to_json(&i.opts)?,
+                    "ts": i.timestamp_ms,
+                    "delay": i.opts.delay.map(|d| d.as_millis() as i64).unwrap_or(0),
+                    "priority": i.opts.priority,
+                    "lifo": if i.opts.lifo { 1 } else { 0 },
+                    "id": i.opts.id.as_deref().unwrap_or(""),
+                    "parent": n.parent.map(|p| p as i64).unwrap_or(-1),
+                    "fpof": i32::from(n.fail_parent_on_failure),
+                    "idof": i32::from(n.ignore_dependency_on_failure),
+                    "kids": n.children,
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let external = parent
+            .map(|p| self.keys(&p.queue).job_hash(p.id.as_str()))
+            .unwrap_or_default();
+        let mut inv = self.scripts.flow.prepare_invoke();
+        inv.arg(self.max_stream_length as i64)
+            .arg(external)
+            .arg(serde_json::to_string(&json)?);
+        let mut conn = self.conn().await?;
+        let reply = self
+            .eval(&mut conn, "flow", &root_queue, None, &inv)
+            .await?;
+        let ids: Vec<String> = redis::from_redis_value(&reply)?;
+        Ok(ids.into_iter().map(JobId::new).collect())
+    }
+
+    async fn wait_for_children(&self, queue: &str, id: &JobId, token: &str) -> Result<bool> {
+        let keys = self.keys(queue);
+        let mut inv = self.scripts.move_to_waiting_children.prepare_invoke();
+        inv.key(keys.active())
+            .key(keys.job_hash(id.as_str()))
+            .key(keys.job_lock(id.as_str()))
+            .key(keys.waiting_children())
+            .arg(id.as_str())
+            .arg(token)
+            .arg(self.max_stream_length as i64);
+        let mut conn = self.conn().await?;
+        let reply = self
+            .eval(
+                &mut conn,
+                "move_to_waiting_children",
+                queue,
+                Some(id.as_str()),
+                &inv,
+            )
+            .await?;
+        Ok(redis::from_redis_value::<i64>(&reply)? == 1)
+    }
+
+    async fn dependencies(&self, queue: &str, id: &JobId) -> Result<Dependencies> {
+        let keys = self.keys(queue);
+        let mut conn = self.conn().await?;
+        let (pending, processed, failed): (
+            Vec<String>,
+            std::collections::HashMap<String, String>,
+            std::collections::HashMap<String, String>,
+        ) = redis::pipe()
+            .smembers(keys.job_deps(id.as_str()))
+            .hgetall(keys.job_processed(id.as_str()))
+            .hgetall(format!("{}:failed", keys.job_hash(id.as_str())))
+            .query_async(&mut *conn)
+            .await?;
+        let to_ref = |key: &str| child_ref(&self.prefix, key);
+        let mut deps = Dependencies {
+            pending: pending.iter().filter_map(|k| to_ref(k)).collect(),
+            processed: processed
+                .into_iter()
+                .filter_map(|(k, v)| Some((to_ref(&k)?, v)))
+                .collect(),
+            failed: failed
+                .into_iter()
+                .filter_map(|(k, v)| Some((to_ref(&k)?, v)))
+                .collect(),
+        };
+        deps.pending.sort_by(job_ref_order);
+        deps.processed.sort_by(|a, b| job_ref_order(&a.0, &b.0));
+        deps.failed.sort_by(|a, b| job_ref_order(&a.0, &b.0));
+        Ok(deps)
     }
 
     async fn get(&self, queue: &str, id: &JobId) -> Result<Option<RawJob>> {
@@ -1427,6 +1521,26 @@ where
     Ok(ids)
 }
 
+/// `{prefix}:{queue}:{id}` → the job it names (queue names and ids never
+/// contain `:`).
+fn child_ref(prefix: &str, key: &str) -> Option<JobRef> {
+    let rest = key.strip_prefix(prefix)?.strip_prefix(':')?;
+    let (queue, id) = rest.split_once(':')?;
+    (!id.contains(':')).then(|| JobRef::new(queue, id))
+}
+
+/// Queue, then numeric ids in numeric order.
+fn job_ref_order(a: &JobRef, b: &JobRef) -> std::cmp::Ordering {
+    let key = |r: &JobRef| {
+        (
+            r.queue.clone(),
+            r.id.as_str().len(),
+            r.id.as_str().to_string(),
+        )
+    };
+    key(a).cmp(&key(b))
+}
+
 fn hash_to_raw(
     id: JobId,
     mut map: std::collections::HashMap<String, String>,
@@ -1459,6 +1573,7 @@ fn hash_to_raw(
         return_value_json: take(&mut map, "returnvalue"),
         lock_token: take(&mut map, "lockToken"),
         state,
+        parent: take(&mut map, "parent").and_then(|s| serde_json::from_str(&s).ok()),
     })
 }
 
@@ -1649,6 +1764,10 @@ fn parse_stream_entry(map: &std::collections::HashMap<String, redis::Value>) -> 
             name: s(map, "name").unwrap_or_default(),
         },
         "waiting" => Event::Waiting {
+            id,
+            prev: s(map, "prev"),
+        },
+        "waiting-children" => Event::WaitingChildren {
             id,
             prev: s(map, "prev"),
         },

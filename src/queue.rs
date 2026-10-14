@@ -196,6 +196,13 @@ where
         Ok(ids)
     }
 
+    /// A flow parent's children by outcome: pending, completed (with their
+    /// return values) and ignored failures. Empty for a job without
+    /// children.
+    pub async fn dependencies(&self, id: &JobId) -> Result<crate::backend::Dependencies> {
+        self.backend.dependencies(&self.name, id).await
+    }
+
     /// Stop accepting new active jobs; existing ones continue.
     pub async fn pause(&self) -> Result<()> {
         self.backend.pause(&self.name).await
@@ -309,8 +316,7 @@ where
         stacktrace: raw.stacktrace,
         progress,
         return_value,
-        #[cfg(feature = "flow")]
-        parent: None,
+        parent: raw.parent,
         lock_token: raw.lock_token,
     })
 }

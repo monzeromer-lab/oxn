@@ -16,6 +16,7 @@
 
 mod chaos;
 mod config;
+mod flow;
 mod ledger;
 mod report;
 mod run;
@@ -35,6 +36,8 @@ struct Cli {
 enum Cmd {
     /// Run a scenario and write a report.
     Run(Box<config::RunArgs>),
+    /// Flow fan-out: parents × children with per-flow verification.
+    Flow(Box<flow::FlowArgs>),
     /// Internal: a worker child process (used by `--processes true`).
     #[command(hide = true)]
     Worker {
@@ -102,6 +105,28 @@ async fn main() -> anyhow::Result<()> {
                 rate_limit,
             };
             workload::child_worker_main(redis, queue, spec).await
+        }
+        Cmd::Flow(args) => {
+            let outcome = flow::run(*args).await?;
+            let path = flow::write(&outcome)?;
+            let h = &outcome.release_latency;
+            println!();
+            println!(
+                "{} flow — {} flows, {:.0} handler runs/s, parent release p50 {:.1}ms p99 {:.1}ms",
+                if outcome.passed { "PASS" } else { "FAIL" },
+                outcome.args.flows,
+                outcome.jobs_per_s,
+                h.p50_ms,
+                h.p99_ms
+            );
+            for f in &outcome.failures {
+                println!("  - {f}");
+            }
+            println!("report: {}", path.display());
+            if !outcome.passed {
+                std::process::exit(1);
+            }
+            Ok(())
         }
         Cmd::Run(args) => {
             let cfg = config::Config::resolve(&args)?;

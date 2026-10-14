@@ -734,7 +734,7 @@ fn record_violations(into: &Mutex<Vec<(f64, Violation)>>, t: f64, vs: Vec<Violat
     }
 }
 
-async fn client_kill(conn: &mut redis::aio::ConnectionManager, fraction: f64) -> String {
+pub(crate) async fn client_kill(conn: &mut redis::aio::ConnectionManager, fraction: f64) -> String {
     let me: i64 = redis::cmd("CLIENT")
         .arg("ID")
         .query_async(conn)
@@ -771,7 +771,7 @@ async fn client_kill(conn: &mut redis::aio::ConnectionManager, fraction: f64) ->
     format!("killed {killed}/{} client connections", ids.len())
 }
 
-async fn foreign_keys(conn: &mut redis::aio::ConnectionManager) -> anyhow::Result<u64> {
+pub(crate) async fn foreign_keys(conn: &mut redis::aio::ConnectionManager) -> anyhow::Result<u64> {
     let total: u64 = redis::cmd("DBSIZE").query_async(conn).await?;
     if total == 0 {
         return Ok(0);
@@ -780,7 +780,7 @@ async fn foreign_keys(conn: &mut redis::aio::ConnectionManager) -> anyhow::Resul
     Ok(total.saturating_sub(ours))
 }
 
-async fn count_keys(conn: &mut redis::aio::ConnectionManager, prefix: &str) -> u64 {
+pub(crate) async fn count_keys(conn: &mut redis::aio::ConnectionManager, prefix: &str) -> u64 {
     let mut cursor: u64 = 0;
     let mut n = 0u64;
     loop {
@@ -860,17 +860,17 @@ fn check_retention(
     out
 }
 
-fn loadavg() -> Option<String> {
+pub(crate) fn loadavg() -> Option<String> {
     std::fs::read_to_string("/proc/loadavg")
         .ok()
         .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
 }
 
-fn uuid_like() -> String {
+pub(crate) fn uuid_like() -> String {
     format!("{:016x}", rand::random::<u64>())
 }
 
-fn chrono_like_now() -> String {
+pub(crate) fn chrono_like_now() -> String {
     let s = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

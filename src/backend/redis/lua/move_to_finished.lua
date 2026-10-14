@@ -18,7 +18,11 @@
 -- ARGV[9] stack-trace entry for this failed attempt (may be empty)
 --
 -- Returns 1, or -1 (job hash gone) / -2 (lock missing) / -6 (lock held by
--- another token).
+-- another token) / -4 (completing a parent whose children are still
+-- pending; nothing changes).
+--
+-- A child of a flow reports to its parent before retention runs (see
+-- oxnChildDone / oxnChildFailed): its return value, or its failure.
 
 local activeKey = KEYS[1]
 local targetKey = KEYS[2]
@@ -52,6 +56,9 @@ end
 if held ~= token then
   return -6
 end
+if event == 'completed' and redis.call('SCARD', hashKey .. ':dependencies') > 0 then
+  return -4
+end
 
 -- remove from active and delete lock
 redis.call('LREM', activeKey, 1, id)
@@ -74,6 +81,12 @@ redis.call('HDEL', hashKey, 'lockToken')
 
 -- event payload read before retention may delete the hash
 local attemptsMade = redis.call('HGET', hashKey, 'attemptsMade') or '0'
+
+if event == 'completed' then
+  oxnChildDone(hashKey, redis.call('HGET', hashKey, 'parentKey'), ret, maxStream)
+else
+  oxnChildFailed(hashKey, reason, nowMs, maxStream)
+end
 
 oxnRetain(targetKey, hashPrefix, id, policy, nowMs)
 

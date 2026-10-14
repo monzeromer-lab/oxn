@@ -57,6 +57,15 @@ pub enum Event {
         /// for a job a shutting-down worker released. `None` for new jobs.
         prev: Option<String>,
     },
+    /// A parent is waiting for its children: added by a flow, parked by a
+    /// handler that returned `Error::WaitingChildren`, or retried while
+    /// children are still pending.
+    WaitingChildren {
+        /// The affected job id.
+        id: JobId,
+        /// The state it came from (`"active"`, `"failed"`), `None` when new.
+        prev: Option<String>,
+    },
     /// A worker picked up the job and acquired its lock.
     Active {
         /// The affected job id.

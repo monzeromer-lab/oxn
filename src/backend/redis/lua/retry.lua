@@ -9,7 +9,11 @@
 -- KEYS[7] prioritized
 -- KEYS[8] priority counter
 -- KEYS[9] meta
+-- KEYS[10] waiting-children
 -- ARGV[1] id
+--
+-- A parent whose children are still pending goes back to waiting for them
+-- (`waiting-children`) instead of becoming ready.
 -- ARGV[2] max stream len
 
 local failedKey = KEYS[1]
@@ -28,6 +32,11 @@ if not score then return -3 end
 redis.call('ZREM', failedKey, id)
 redis.call('HDEL', hashKey, 'failedReason', 'finishedOn', 'stacktrace')
 redis.call('HSET', hashKey, 'attemptsMade', '0')
+if redis.call('SCARD', hashKey .. ':dependencies') > 0 then
+  redis.call('ZADD', KEYS[10], oxnNowMs(), id)
+  oxnEmit(eventsKey, maxStream, 'event', 'waiting-children', 'jobId', id, 'prev', 'failed')
+  return 1
+end
 local landed = oxnPushReady({
   wait = waitKey, paused = KEYS[6], prio = KEYS[7], pc = KEYS[8],
   meta = KEYS[9], marker = markerKey,

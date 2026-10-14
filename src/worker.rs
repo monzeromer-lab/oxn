@@ -120,6 +120,34 @@ impl JobContext {
     pub async fn cancelled(&self) {
         self.inner.shutdown.cancelled().await;
     }
+
+    /// This job as a [`JobRef`](crate::JobRef) — the parent to pass to
+    /// `FlowProducer::add_under` when adding children at run time.
+    pub fn as_parent(&self) -> crate::job::JobRef {
+        crate::job::JobRef::new(self.inner.queue.clone(), self.inner.id.clone())
+    }
+
+    /// This job's children by outcome (pending, completed with return
+    /// values, ignored failures). Empty for a job without children.
+    pub async fn dependencies(&self) -> Result<crate::backend::Dependencies> {
+        self.inner
+            .backend
+            .dependencies(&self.inner.queue, &self.inner.id)
+            .await
+    }
+
+    /// The return values of this job's completed children, decoded as `T`
+    /// (use `serde_json::Value` for children of mixed types).
+    pub async fn children_values<T: DeserializeOwned>(
+        &self,
+    ) -> Result<Vec<(crate::job::JobRef, T)>> {
+        self.dependencies()
+            .await?
+            .processed
+            .into_iter()
+            .map(|(child, json)| Ok((child, serde_json::from_str(&json)?)))
+            .collect()
+    }
 }
 
 /// The two shutdown signals a running job observes.
@@ -612,7 +640,35 @@ async fn process_one_inner<D, R>(
             let r = backend
                 .complete(&queue, &id, &token, json, remove_on_complete)
                 .await;
-            log_transition(&queue, "completed", &r);
+            if matches!(
+                r,
+                Err(Error::Script(crate::error::ScriptError::PendingChildren))
+            ) {
+                // A parent can't complete before its children: the handler
+                // added children and returned Ok instead of WaitingChildren.
+                let reason = "handler returned Ok while child jobs are still pending \
+                              (return Error::WaitingChildren to wait for them)";
+                let trace = format!("attempt {attempts_made}: {reason}");
+                span.record("transition", "failed");
+                let r = backend
+                    .fail(
+                        &queue,
+                        &id,
+                        &token,
+                        Failure::new(reason).removal(remove_on_fail).trace(&trace),
+                    )
+                    .await;
+                log_transition(&queue, "failed", &r);
+            } else {
+                log_transition(&queue, "completed", &r);
+            }
+        }
+        // Park until the children added under this job resolve; the
+        // attempt is refunded.
+        Err(Error::WaitingChildren) => {
+            span.record("transition", "waiting-children");
+            let r = backend.wait_for_children(&queue, &id, &token).await;
+            log_transition(&queue, "waiting-children", &r.map(|_| ()));
         }
         // Postponements, not failures: the attempt is refunded and no
         // failedReason is recorded.
@@ -728,6 +784,7 @@ fn outcome_label<R>(r: &Result<R>) -> &'static str {
         Ok(_) => "ok",
         Err(Error::Delayed { .. }) => "delayed",
         Err(Error::RateLimited { .. }) => "rate-limited",
+        Err(Error::WaitingChildren) => "waiting-children",
         Err(Error::Unrecoverable(_)) => "unrecoverable",
         Err(Error::Closed) => "cancelled",
         Err(_) => "error",

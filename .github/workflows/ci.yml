@@ -85,6 +85,11 @@ jobs:
         run: target/release/oxn-load run --redis redis://127.0.0.1:6379 --scenario smoke
       - name: latency (pickup p99 < 50ms at the default drain_delay)
         run: target/release/oxn-load run --redis redis://127.0.0.1:6379 --scenario latency --duration 20s
+      - name: flow fan-out (every parent once, after its children)
+        run: >-
+          target/release/oxn-load flow --redis redis://127.0.0.1:6379 --flows 1000 --children 5
+          --fail-parent-rate 0.1 --ignore-rate 0.1 --retry-rate 0.1 --dynamic-rate 0.1
+          --restart-every-s 2 --label ci
       - name: Upload load reports
         if: always()
         uses: actions/upload-artifact@v4

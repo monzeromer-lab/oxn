@@ -22,6 +22,12 @@
 //! | `dedup-dangling` | warning | dedup pointer to a job that no longer exists |
 //! | `stalled-set-leak` | warning | `stalled` set holds ids that aren't active/waiting |
 //! | `unknown-key` | error | key under the queue fits no documented pattern |
+//! | `stuck-parent` | error | parent waits in `waiting-children` with no pending child |
+//! | `parent-ready-early` | error | parent is ready (wait/paused/prioritized/delayed) with children pending |
+//! | `dependency-dangling` | error | a pending dependency in this queue has no job hash |
+//! | `child-unlinked` | error | child in this queue disagrees with its parent's bookkeeping |
+//!
+//! Flow rules see one queue: links to jobs in other queues are skipped.
 
 use std::fmt;
 
@@ -238,6 +244,8 @@ pub fn check(snap: &Snapshot) -> Vec<Violation> {
         ));
     }
 
+    flow_rules(snap, &mut out);
+
     for (key, ty) in &snap.unknown_keys {
         out.push(v(
             "unknown-key",
@@ -249,6 +257,89 @@ pub fn check(snap: &Snapshot) -> Vec<Violation> {
 
     out.sort_by(|a, b| b.severity.cmp(&a.severity).then(a.rule.cmp(b.rule)));
     out
+}
+
+/// Parent/child bookkeeping (see the module table).
+fn flow_rules(snap: &Snapshot, out: &mut Vec<Violation>) {
+    use Severity::*;
+    let base = format!("{}:{}:", snap.prefix, snap.queue);
+    fn local<'a>(base: &str, key: &'a str) -> Option<&'a str> {
+        key.strip_prefix(base).filter(|id| !id.contains(':'))
+    }
+    for (id, job) in &snap.jobs {
+        let c = snap.containers_of(id);
+        let waiting = c.contains(&"waiting-children");
+        if waiting && job.deps.is_empty() {
+            out.push(v(
+                "stuck-parent",
+                Error,
+                Some(id),
+                "in waiting-children with no pending child: nothing will release it".into(),
+            ));
+        }
+        if !job.deps.is_empty()
+            && ["wait", "paused", "prioritized", "delayed"]
+                .iter()
+                .any(|s| c.contains(s))
+        {
+            out.push(v(
+                "parent-ready-early",
+                Error,
+                Some(id),
+                format!(
+                    "in {} with {} child(ren) pending: {:?}",
+                    snap.location(id),
+                    job.deps.len(),
+                    job.deps
+                ),
+            ));
+        }
+        for dep in &job.deps {
+            if let Some(child) = local(&base, dep)
+                && !snap.jobs.contains_key(child)
+            {
+                out.push(v(
+                    "dependency-dangling",
+                    Error,
+                    Some(id),
+                    format!("pending child `{dep}` has no job hash"),
+                ));
+            }
+        }
+        let Some(parent_id) = job.fields.get("parentKey").and_then(|k| local(&base, k)) else {
+            continue;
+        };
+        let Some(parent) = snap.jobs.get(parent_id) else {
+            continue;
+        };
+        let me = format!("{base}{id}");
+        let pending = parent.deps.contains(&me);
+        let done = parent.processed.contains_key(&me);
+        let ignored = parent.failed_children.contains_key(&me);
+        let completed = c.contains(&"completed");
+        let problem = if completed && pending {
+            Some("completed but still pending in its parent's dependencies")
+        } else if completed && !done {
+            Some("completed but its return value is not in the parent's :processed")
+        } else if !completed && !c.contains(&"failed") && !pending {
+            Some("unfinished but not in its parent's dependencies")
+        } else if ignored && pending {
+            Some("both an ignored failure and a pending dependency")
+        } else {
+            None
+        };
+        if let Some(p) = problem {
+            out.push(v(
+                "child-unlinked",
+                Error,
+                Some(id),
+                format!(
+                    "{p} (parent {parent_id} is in {})",
+                    snap.location(parent_id)
+                ),
+            ));
+        }
+    }
 }
 
 /// `true` if any violation is at least `min` severe.
@@ -341,6 +432,60 @@ mod tests {
         assert!(r.contains(&"attempts-exceeded"));
         assert!(r.contains(&"paused-but-waiting"));
         assert!(r.contains(&"finished-without-timestamp"));
+    }
+
+    #[test]
+    fn flow_rules() {
+        let mut s = Snapshot {
+            prefix: "p".into(),
+            queue: "q".into(),
+            ..Default::default()
+        };
+        // 1: parent stuck (no deps). 2: parent ready with a pending child 3.
+        s.zsets
+            .insert("waiting-children".into(), vec![("1".into(), 1.0)]);
+        s.jobs.insert("1".into(), job(&[]));
+        s.lists.insert("wait".into(), vec!["2".into(), "3".into()]);
+        let mut p2 = job(&[]);
+        p2.deps.insert("p:q:3".into());
+        p2.deps.insert("p:q:9".into()); // dangling
+        p2.deps.insert("p:other:5".into()); // other queue: skipped
+        s.jobs.insert("2".into(), p2);
+        s.jobs.insert("3".into(), job(&[("parentKey", "p:q:2")]));
+        // 4: completed child not recorded in parent 5's :processed.
+        s.zsets.insert("completed".into(), vec![("4".into(), 1.0)]);
+        s.jobs.insert(
+            "4".into(),
+            job(&[("parentKey", "p:q:5"), ("finishedOn", "1")]),
+        );
+        s.zsets
+            .get_mut("waiting-children")
+            .unwrap()
+            .push(("5".into(), 1.0));
+        let mut p5 = job(&[]);
+        p5.deps.insert("p:q:6".into());
+        s.jobs.insert("5".into(), p5);
+        s.lists.get_mut("wait").unwrap().push("6".into());
+        s.jobs.insert("6".into(), job(&[("parentKey", "p:q:5")]));
+        let vs = check(&s);
+        let find = |rule: &str, id: &str| {
+            vs.iter()
+                .any(|v| v.rule == rule && v.job_id.as_deref() == Some(id))
+        };
+        assert!(find("stuck-parent", "1"), "{vs:?}");
+        assert!(find("parent-ready-early", "2"));
+        assert!(find("dependency-dangling", "2"));
+        assert_eq!(
+            vs.iter()
+                .filter(|v| v.rule == "dependency-dangling")
+                .count(),
+            1
+        );
+        assert!(find("child-unlinked", "4"));
+        assert!(
+            !find("child-unlinked", "3") && !find("child-unlinked", "6"),
+            "{vs:?}"
+        );
     }
 
     #[test]

@@ -89,7 +89,7 @@ async fn main() -> oxn::Result<()> {
 | ----------------- | -------------------------------------------------------------- |
 | `redis-backend`   | **Default.** `backend::redis::RedisBackend`                    |
 | `scheduler`       | `JobScheduler` — cron and fixed-interval repeats               |
-| `flow`            | `FlowProducer` — parent/child DAG submission                   |
+| `flow`            | `FlowProducer` — parent/child trees (a parent runs after its children) |
 | `metrics`         | `oxn_*` counters, histograms and a gauge via the `metrics` crate (names in `oxn::metrics`) |
 | `dashboard-axum`  | `dashboard::axum_router` — mount on any axum app               |
 | `dashboard-actix` | `dashboard::actix_scope` — mount on any actix-web app          |
@@ -273,15 +273,28 @@ Fire-and-forget or driven manually with `sched.enqueue_next().await?`.
 
 ### Flow (feature `flow`)
 
+A flow is added atomically. The parent waits in `waiting-children` until
+every child has resolved, then runs with its children's results:
+
 ```rust
-use oxn::{FlowNode, flow::FlowProducer};
+use oxn::{FlowNode, FlowProducer};
 
 let tree = FlowNode::new("reports", "generate", &pdf_task, JobOptions::default())?
     .child(FlowNode::new("extract", "a", &task_a, JobOptions::default())?)
-    .child(FlowNode::new("extract", "b", &task_b, JobOptions::default())?);
+    .child(FlowNode::new("extract", "b", &task_b, JobOptions::default())?.fail_parent_on_failure());
 
-FlowProducer::new(queue.backend()).add(tree).await?;
+let added = FlowProducer::new(queue.backend()).add(tree).await?; // ids of the whole tree
+
+// in the parent's handler (Worker::builder_with_ctx):
+let parts: Vec<(JobRef, Extracted)> = ctx.children_values().await?;
 ```
+
+A child that fails for good either keeps its parent waiting (the default:
+retry the child to continue), fails the parent (`fail_parent_on_failure`),
+or is skipped (`ignore_dependency_on_failure`). Removing a parent removes
+its whole tree. A handler can also add children to its own job with
+`FlowProducer::add_under(&ctx.as_parent(), node)` and return
+`Error::WaitingChildren` to run again once they finish.
 
 ## Dashboard
 

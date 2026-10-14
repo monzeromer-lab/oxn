@@ -10,7 +10,7 @@ name = "oxn-load"
 path = "src/main.rs"
 
 [dependencies]
-oxn = { path = "..", features = ["redis-backend", "metrics"] }
+oxn = { path = "..", features = ["redis-backend", "metrics", "flow"] }
 oxn-testkit = { path = "../testkit" }
 tokio = { version = "1.40", features = ["full"] }
 tokio-util = "0.7"

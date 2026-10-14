@@ -61,9 +61,10 @@ pub enum Error {
     #[error("unrecoverable: {0}")]
     Unrecoverable(String),
 
-    /// The parent job is blocked waiting on child dependencies to finish.
-    #[cfg(feature = "flow")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "flow")))]
+    /// Return this from a handler to park the job until its children (added
+    /// under it with `FlowProducer::add_under`) resolve. The attempt is
+    /// refunded; the job runs again once the last child completes — at once
+    /// if none is pending.
     #[error("waiting on child dependencies")]
     WaitingChildren,
 
@@ -121,6 +122,7 @@ impl Error {
                     | ScriptError::LockMismatch
                     | ScriptError::JobLocked
                     | ScriptError::PendingChildren
+                    | ScriptError::JobExists
             )
         )
     }
@@ -165,6 +167,9 @@ pub enum ScriptError {
     /// removed out from under it.
     #[error("job is locked by an active worker")]
     JobLocked,
+    /// An explicit job id in a flow already names a job; nothing was added.
+    #[error("a job with that explicit id already exists")]
+    JobExists,
     /// A parent has children that failed permanently.
     #[error("parent has failed children")]
     FailedChildren,
@@ -187,6 +192,7 @@ impl ScriptError {
             -5 => Self::ParentNotFound,
             -6 => Self::LockMismatch,
             -7 => Self::JobLocked,
+            -8 => Self::JobExists,
             -9 => Self::FailedChildren,
             other => Self::Unknown(other),
         }

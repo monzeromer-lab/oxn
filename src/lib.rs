@@ -192,13 +192,13 @@ pub mod prelude;
 
 pub use crate::error::{Error, Result};
 pub use crate::events::{Event, EventRecord, QueueEvents, StreamStart};
-pub use crate::job::{Backoff, Job, JobId, JobState, Progress};
+pub use crate::job::{Backoff, Job, JobId, JobRef, JobState, Progress};
 pub use crate::options::{JobOptions, QueueOptions, ResolvedJobOptions, WorkerOptions};
 pub use crate::queue::Queue;
 pub use crate::worker::{JobContext, Worker};
 
 #[cfg(feature = "flow")]
-pub use crate::flow::{FlowNode, FlowProducer};
+pub use crate::flow::{FlowJob, FlowNode, FlowProducer, OnFailure};
 
 #[cfg(feature = "scheduler")]
 pub use crate::scheduler::{JobScheduler, RepeatOptions};

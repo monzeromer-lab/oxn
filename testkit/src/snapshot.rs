@@ -56,6 +56,12 @@ pub struct JobSnap {
     pub lock: Option<(String, i64)>,
     /// Auxiliary key suffixes present for this job (`logs`, `lock`, …).
     pub aux: BTreeSet<String>,
+    /// Flow parent: hash keys of children still pending (`:dependencies`).
+    pub deps: BTreeSet<String>,
+    /// Flow parent: completed child key → return value (`:processed`).
+    pub processed: BTreeMap<String, String>,
+    /// Flow parent: ignored child failure key → reason (`:failed`).
+    pub failed_children: BTreeMap<String, String>,
 }
 
 impl JobSnap {
@@ -205,11 +211,17 @@ impl Snapshot {
         for (id, sfx, payload) in aux {
             match snap.jobs.get_mut(&id) {
                 Some(job) => {
-                    if sfx == "lock" {
-                        let mut it = payload.into_iter();
-                        if let (Some(token), Some(pttl)) = (it.next(), it.next()) {
-                            job.lock = Some((token, pttl.parse().unwrap_or(-1)));
+                    match sfx.as_str() {
+                        "lock" => {
+                            let mut it = payload.into_iter();
+                            if let (Some(token), Some(pttl)) = (it.next(), it.next()) {
+                                job.lock = Some((token, pttl.parse().unwrap_or(-1)));
+                            }
                         }
+                        "dependencies" => job.deps = payload.into_iter().collect(),
+                        "processed" => job.processed = pairs(payload),
+                        "failed" => job.failed_children = pairs(payload),
+                        _ => {}
                     }
                     job.aux.insert(sfx);
                 }

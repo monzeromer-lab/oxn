@@ -14,7 +14,7 @@ use crate::options::ResolvedJobOptions;
 
 /// A job id. Wraps `String` so the rest of the crate doesn't pass untyped
 /// strings around.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct JobId(pub String);
 
@@ -151,9 +151,8 @@ pub struct Job<D, R = ()> {
     pub progress: Option<Progress>,
     /// Return value, set on completion.
     pub return_value: Option<R>,
-    /// Parent reference, for flow-produced jobs.
-    #[cfg(feature = "flow")]
-    pub parent: Option<ParentRef>,
+    /// The parent this job reports to, for a child of a flow.
+    pub parent: Option<JobRef>,
     /// Lock token currently held. `None` when not active.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lock_token: Option<String>,
@@ -167,20 +166,34 @@ impl<D, R> Job<D, R> {
     }
 }
 
-/// Reference to a parent job for flow-produced children.
-///
-/// Stored on a child's [`Job::parent`] when the job is enqueued via
-/// [`FlowProducer`](crate::FlowProducer). Only available with the `flow`
-/// feature.
-#[cfg(feature = "flow")]
-#[cfg_attr(docsrs, doc(cfg(feature = "flow")))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ParentRef {
-    /// Parent's job id.
-    pub id: JobId,
-    /// Parent's queue name.
+/// A job anywhere under the backend's prefix: its queue and id. Flows use
+/// it for parents ([`Job::parent`]) and children.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct JobRef {
+    /// The job's queue.
     pub queue: String,
+    /// The job's id.
+    pub id: JobId,
 }
+
+impl JobRef {
+    /// Reference job `id` in `queue`.
+    pub fn new(queue: impl Into<String>, id: impl Into<JobId>) -> Self {
+        Self {
+            queue: queue.into(),
+            id: id.into(),
+        }
+    }
+}
+
+impl fmt::Display for JobRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.queue, self.id)
+    }
+}
+
+/// 0.2 name of [`JobRef`].
+pub type ParentRef = JobRef;
 
 #[cfg(test)]
 mod tests {

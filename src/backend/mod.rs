@@ -17,7 +17,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::job::{JobId, JobState};
 use crate::options::ResolvedJobOptions;
 
@@ -60,6 +60,42 @@ pub struct RawJob {
     pub lock_token: Option<String>,
     /// Resolved state, when the backend knows it (e.g. on `get`).
     pub state: Option<JobState>,
+    /// The parent this job reports to (flow children).
+    #[serde(default)]
+    pub parent: Option<crate::job::JobRef>,
+}
+
+/// One node of a flow, flattened for [`Backend::add_flow`]: parents come
+/// before their children.
+#[derive(Debug, Clone)]
+pub struct FlowJobInsert {
+    /// The node's queue.
+    pub queue: String,
+    /// The job itself.
+    pub insert: JobInsert,
+    /// Index of this node's parent in the same list; `None` for the root.
+    pub parent: Option<usize>,
+    /// Number of direct children. A node with children waits in
+    /// `waiting-children` until they resolve.
+    pub children: usize,
+    /// If this job fails for good, fail its parent too.
+    pub fail_parent_on_failure: bool,
+    /// If this job fails for good, drop the dependency and let the parent
+    /// run (the failure is listed in [`Dependencies::failed`]).
+    pub ignore_dependency_on_failure: bool,
+}
+
+/// A parent's children by outcome (see [`Backend::dependencies`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dependencies {
+    /// Children not resolved yet (including failed ones the parent still
+    /// waits on).
+    pub pending: Vec<crate::job::JobRef>,
+    /// Completed children and their JSON return values (`null` for none).
+    pub processed: Vec<(crate::job::JobRef, String)>,
+    /// Children whose failure was ignored (`ignore_dependency_on_failure`),
+    /// with their failure reasons.
+    pub failed: Vec<(crate::job::JobRef, String)>,
 }
 
 /// Input for a new job submission.
@@ -389,6 +425,32 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
 
     /// List queues known to this backend (used by the dashboard).
     async fn list_queues(&self) -> Result<Vec<String>>;
+
+    /// Add a flow tree atomically (see the `flow` module). With `parent`, the
+    /// root becomes a child of that job, which must be active or waiting
+    /// for children. Returns the ids in input order.
+    async fn add_flow(
+        &self,
+        nodes: Vec<FlowJobInsert>,
+        parent: Option<&crate::job::JobRef>,
+    ) -> Result<Vec<JobId>> {
+        let _ = (nodes, parent);
+        Err(Error::Config("this backend does not support flows".into()))
+    }
+
+    /// Park an active job until its children resolve (the handler returned
+    /// [`Error::WaitingChildren`]). Returns `false` when none was pending
+    /// and the job is ready again at once.
+    async fn wait_for_children(&self, queue: &str, id: &JobId, token: &str) -> Result<bool> {
+        let _ = (queue, id, token);
+        Err(Error::Config("this backend does not support flows".into()))
+    }
+
+    /// A job's children by outcome. Empty for a job that has none.
+    async fn dependencies(&self, queue: &str, id: &JobId) -> Result<Dependencies> {
+        let _ = (queue, id);
+        Err(Error::Config("this backend does not support flows".into()))
+    }
 }
 
 #[cfg(test)]

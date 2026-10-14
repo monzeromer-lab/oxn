@@ -71,7 +71,14 @@ It contains breaking changes; see the migration notes below.
   for postponements (B9); `fail(queue, id, token, Failure)` takes a
   `Failure { reason, retry_at_ms, removal, trace }` (builder:
   `Failure::new(reason).retry_at(ms).removal(r).trace(t)`) (B12b);
-  `fetch_next` takes a trailing `Option<RateLimit>` (B12d).
+  `fetch_next` takes a trailing `Option<RateLimit>` (B12d); new
+  `add_flow`, `wait_for_children` and `dependencies` with default
+  implementations that refuse (B13).
+- Flows (B13): `FlowProducer::add` returns a `FlowJob` tree instead of the
+  root's `JobId`; `FlowNode` gains `on_failure`; `ParentRef` is now
+  `JobRef` (alias kept) and `Job::parent`, `Error::WaitingChildren` and
+  `Event::WaitingChildren` exist without the `flow` feature; `Queue::remove`
+  of a parent removes its children too.
 - Dashboard (axum and actix) maps `NotFound` → **404** and state/lock
   conflicts → **409**, with `{"error": "..."}` bodies, instead of `204`.
 - New `Error::is_conflict()` and `Error::is_lock_lost()` helpers.
@@ -108,6 +115,26 @@ It contains breaking changes; see the migration notes below.
   immediately and its pool slot is detached instead of being returned with
   a block still pending; the stalled scanner is joined before `run()`
   returns.
+- **Flows work (B13).** `FlowProducer` added every node as an ordinary
+  job: the parent ran first, child names were mangled to
+  `name@child-of:…`, and nothing linked the jobs. Now `flow.lua` adds the
+  whole tree atomically (across queues of one prefix); a parent waits in
+  `waiting-children` until every child resolves, then becomes ready with
+  its priority, own delay and the pause state honored. Completed
+  children's return values are recorded with the parent
+  (`ctx.children_values()`, `ctx.dependencies()`, `Queue::dependencies`);
+  `Job::parent` is filled. A child's permanent failure (handler or stall
+  limit) keeps the parent waiting by default (retry the child to
+  continue), fails it with `fail_parent_on_failure()` (propagating up the
+  tree), or is skipped with `ignore_dependency_on_failure()`. Deleting a
+  pending child resolves the dependency; removing a parent removes its
+  whole tree (refused with `JobLocked` if any job in it is running).
+  Handlers can add children at run time (`FlowProducer::add_under`) and
+  return `Error::WaitingChildren` to run again after them (attempt
+  refunded); returning `Ok` with children pending fails the job with a
+  clear reason. An explicit id that exists rejects the whole flow
+  (`ScriptError::JobExists`, nothing written). Retrying a parent with
+  pending children puts it back in `waiting-children`.
 - **The `metrics` feature emits metrics (B12e).** It only pulled in the
   `metrics` crate; nothing was ever recorded. New `oxn::metrics` module
   documents the series and exports their names and `describe()`. All are

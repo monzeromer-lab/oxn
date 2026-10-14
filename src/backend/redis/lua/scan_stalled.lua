@@ -67,6 +67,7 @@ for i = 1, #active do
       oxnPushStack(hashKey, 'attempt ' .. attemptsMade .. ': ' .. reason
         .. ' (stalled ' .. stalled .. ' times)')
       local policy = oxnPolicyFromOpts(oxnJobOpts(hashKey)['remove_on_fail'])
+      oxnChildFailed(hashKey, reason, nowMs, maxStream)
       oxnRetain(failedKey, hashPrefix, id, policy, nowMs)
       oxnEmit(eventsKey, maxStream, 'event', 'failed', 'jobId', id,
         'failedReason', reason, 'attemptsMade', attemptsMade, 'stalled', tostring(stalled))
