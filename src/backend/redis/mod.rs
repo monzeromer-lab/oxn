@@ -11,6 +11,7 @@ mod keys;
 mod scripts;
 
 pub use keys::KeyBuilder;
+pub use scripts::script_hashes;
 
 use std::fmt;
 use std::sync::Arc;
@@ -18,16 +19,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use deadpool_redis::{Config as PoolConfig, Connection as PooledConn, Pool, Runtime};
-use futures::stream::{Stream, StreamExt};
+use futures::stream::Stream;
 use redis::AsyncCommands;
+use tracing::Instrument;
 
 use crate::backend::{
-    Backend, EventStream, Fetched, JobInsert, JobRange, RawJob, StateCounts,
+    Backend, Dependencies, EventRecord, Failure, Fetched, FlowJobInsert, JobInsert, JobRange,
+    RawJob, RecordStream, SchedulerInfo, SchedulerTick, StalledJob, StalledScan, StateCounts,
+    StreamStart, TickOutcome,
 };
 use crate::error::{Error, Result};
 use crate::events::Event;
-use crate::job::{JobId, JobState};
-use crate::options::{JobOptions, Removal};
+use crate::job::{JobId, JobRef, JobState};
+use crate::options::{Removal, ResolvedJobOptions};
 
 /// Construction config for [`RedisBackend`].
 #[derive(Debug, Clone)]
@@ -45,13 +49,18 @@ pub struct RedisConfig {
     /// every XADD.
     pub max_stream_length: usize,
     /// How often a background task PINGs every pool slot to keep the TCP
-    /// connection alive. Managed-Redis providers (DigitalOcean, AWS
-    /// ElastiCache Serverless, Upstash, Redis Cloud) close idle TCP
-    /// connections at the proxy after 60–300s; without keepalive, the
-    /// first command on a stale slot hangs for seconds while the kernel
+    /// connection alive. Managed-Redis providers (DigitalOcean, Upstash,
+    /// Redis Cloud) close idle TCP connections at the proxy after
+    /// 60–300s; without keepalive, the first command on a stale slot hangs for seconds while the kernel
     /// detects the dead socket and a fresh TLS handshake is paid. Set
     /// to `None` to disable. Default: `Some(Duration::from_secs(25))`.
     pub keepalive_interval: Option<Duration>,
+    /// How long a lock-consuming transition (complete, fail, delay,
+    /// release) keeps retrying after a connection failure before giving
+    /// up. Keep it at or below the workers' `lock_duration`: past that the
+    /// stalled scanner may hand the job to another worker anyway.
+    /// Default 30s.
+    pub transition_retry_for: Duration,
     /// Per-checkout health-check timeout for [`Self::keepalive_interval`].
     /// If a slot's PING does not return within this window, the connection
     /// is detached from the pool and a fresh one is minted. Default 2s.
@@ -69,7 +78,15 @@ impl RedisConfig {
             max_stream_length: 10_000,
             keepalive_interval: Some(Duration::from_secs(25)),
             health_check_timeout: Duration::from_secs(2),
+            transition_retry_for: Duration::from_secs(30),
         }
+    }
+
+    /// Override [`Self::transition_retry_for`].
+    #[must_use]
+    pub fn transition_retry_for(mut self, d: Duration) -> Self {
+        self.transition_retry_for = d;
+        self
     }
 
     /// Override the Redis key prefix.
@@ -112,8 +129,12 @@ impl RedisConfig {
 #[derive(Clone)]
 pub struct RedisBackend {
     pool: Pool,
+    /// For connections that must not come from the pool: each event
+    /// subscriber blocks in `XREAD` on its own connection.
+    client: redis::Client,
     prefix: String,
     max_stream_length: usize,
+    transition_retry_for: Duration,
     scripts: Arc<scripts::Scripts>,
     /// Process-local set of queue names we've already SADD'd into the
     /// `{prefix}:queues` registry. Eliminates an unconditional `SADD` round
@@ -184,10 +205,13 @@ impl RedisBackend {
             Arc::new(KeepaliveGuard { cancel })
         });
 
+        let client = redis::Client::open(cfg.url.as_str())?;
         let backend = Self {
             pool,
+            client,
             prefix: cfg.prefix,
             max_stream_length: cfg.max_stream_length,
+            transition_retry_for: cfg.transition_retry_for,
             scripts: Arc::new(scripts::Scripts::new()),
             registered_queues: Arc::new(dashmap::DashSet::new()),
             _keepalive: keepalive,
@@ -208,8 +232,7 @@ impl RedisBackend {
     /// On standalone Redis, `SCRIPT LOAD` populates a server-wide cache, so
     /// preloading on one connection is enough. On managed Redis services
     /// that front multiple backend nodes through a proxy
-    /// (DigitalOcean Managed Redis, AWS ElastiCache Serverless, Upstash,
-    /// Redis Cloud, …), each TCP connection may land on a different
+    /// (DigitalOcean Managed Redis, Upstash, Redis Cloud, …), each TCP connection may land on a different
     /// backend node and the script cache is **per-node**. Preloading on a
     /// single connection leaves the rest of the pool cold; the first
     /// `Queue::add()` that lands on an unprimed node still pays the
@@ -235,15 +258,14 @@ impl RedisBackend {
         // into a several-second cliff during connect(). With try_join_all,
         // every getter is polled simultaneously and deadpool mints all
         // slots concurrently.
-        let conn_futures = (0..pool_size).map(|_| async {
-            self.pool.get().await.map_err(crate::Error::from)
-        });
+        let conn_futures =
+            (0..pool_size).map(|_| async { self.pool.get().await.map_err(crate::Error::from) });
         let conns = futures::future::try_join_all(conn_futures).await?;
         // Preload on every slot in parallel; each future owns its conn,
         // and dropping it returns the slot to the pool.
-        let preloads = conns.into_iter().map(|mut conn| async move {
-            scripts::Scripts::preload(&mut *conn).await
-        });
+        let preloads = conns
+            .into_iter()
+            .map(|mut conn| async move { scripts::Scripts::preload(&mut *conn).await });
         futures::future::try_join_all(preloads).await?;
         Ok(())
     }
@@ -347,12 +369,279 @@ fn encode_removal(r: &Removal) -> String {
     }
 }
 
-fn opts_to_json(opts: &JobOptions) -> Result<String> {
+fn opts_to_json(opts: &ResolvedJobOptions) -> Result<String> {
     Ok(serde_json::to_string(opts)?)
 }
 
-fn opts_from_json(s: &str) -> Result<JobOptions> {
+fn opts_from_json(s: &str) -> Result<ResolvedJobOptions> {
     Ok(serde_json::from_str(s)?)
+}
+
+impl RedisBackend {
+    /// Wake one worker blocked on the queue's marker, on a second pool
+    /// slot (the caller's slot is busy blocking). Best effort: if no slot
+    /// frees up quickly, the BZPOPMIN timeout still wakes everyone.
+    async fn wake_queue(&self, keys: &KeyBuilder) {
+        let Ok(Ok(mut conn)) =
+            tokio::time::timeout(Duration::from_millis(50), self.pool.get()).await
+        else {
+            tracing::debug!("no pool slot free to wake the queue; relying on the timeout");
+            return;
+        };
+        let r: redis::RedisResult<()> = redis::cmd("ZADD")
+            .arg(keys.marker())
+            .arg(0)
+            .arg("0")
+            .query_async(&mut *conn)
+            .await;
+        if let Err(e) = r {
+            tracing::debug!(error = %e, "waking the queue failed; relying on the timeout");
+        }
+    }
+
+    /// Run a lock-consuming transition (complete, fail, delay, release,
+    /// wait for children), retrying a connection-level failure for up to
+    /// [`RedisConfig::transition_retry_for`].
+    ///
+    /// A dropped connection is ambiguous: the call may never have reached
+    /// Redis, or Redis ran it and only the reply was lost. Retries pass
+    /// the script's `retry` flag, and every such script is idempotent per
+    /// lock token (`doneToken`), so a transition that already applied
+    /// reports success instead of "lock lost" and is never applied twice.
+    async fn eval_transition<'s>(
+        &'s self,
+        script: &'static str,
+        queue: &str,
+        job_id: &str,
+        build: impl Fn(bool) -> redis::ScriptInvocation<'s> + Send,
+    ) -> Result<redis::Value> {
+        let deadline = std::time::Instant::now() + self.transition_retry_for;
+        let mut backoff = Duration::from_millis(25);
+        let mut attempt: u32 = 0;
+        loop {
+            let inv = build(attempt > 0);
+            let r = match self.conn().await {
+                Ok(mut conn) => {
+                    self.eval(&mut conn, script, queue, Some(job_id), &inv)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            match r {
+                Err(e) if is_transient(&e) && std::time::Instant::now() + backoff < deadline => {
+                    tracing::warn!(script, queue, job_id, attempt, error = %e, "transition interrupted by the connection; retrying");
+                    crate::telemetry::transition_retried(queue, script);
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(1));
+                    attempt += 1;
+                }
+                r => {
+                    if attempt > 0 && r.is_ok() {
+                        tracing::info!(
+                            script,
+                            queue,
+                            job_id,
+                            attempt,
+                            "transition applied after retrying"
+                        );
+                    }
+                    return r;
+                }
+            }
+        }
+    }
+
+    /// Run one Lua script inside an `oxn.script` tracing span.
+    ///
+    /// Every state transition funnels through here, so a single
+    /// `RUST_LOG=oxn=debug` (or the test kit's capture layer) shows which
+    /// script ran, for which job, how long it took and what it returned.
+    ///
+    /// A negative integer reply is the script refusing the call; it is
+    /// turned into a typed error here, in one place (see [`script_error`]).
+    /// Scripts that return counts never return negatives.
+    async fn eval(
+        &self,
+        conn: &mut PooledConn,
+        script: &'static str,
+        queue: &str,
+        job_id: Option<&str>,
+        inv: &redis::ScriptInvocation<'_>,
+    ) -> Result<redis::Value> {
+        let span = tracing::debug_span!(
+            "oxn.script",
+            script,
+            queue,
+            job_id = job_id.unwrap_or(""),
+            lua_rc = tracing::field::Empty,
+            reply = tracing::field::Empty,
+            elapsed_us = tracing::field::Empty,
+        );
+        let start = std::time::Instant::now();
+        let res: redis::RedisResult<redis::Value> =
+            inv.invoke_async(&mut **conn).instrument(span.clone()).await;
+        span.record("elapsed_us", start.elapsed().as_micros() as u64);
+        match &res {
+            Ok(redis::Value::Int(n)) => {
+                span.record("lua_rc", *n);
+                span.record("reply", "int");
+                if *n < 0 {
+                    let err = script_error(*n, script, queue, job_id);
+                    span.in_scope(|| tracing::debug!(error = %err, "script rejected the call"));
+                    return Err(err);
+                }
+            }
+            Ok(v) => {
+                span.record("reply", reply_kind(v));
+            }
+            Err(e) => {
+                span.in_scope(|| tracing::warn!(error = %e, "script call failed"));
+            }
+        }
+        Ok(res?)
+    }
+
+    async fn move_to_active(
+        &self,
+        queue: &str,
+        worker_token: &str,
+        lock_duration: Duration,
+        rate_limit: Option<crate::options::RateLimit>,
+    ) -> Result<Moved> {
+        let keys = self.keys(queue);
+        // Retried like a transition: a lost reply may hide a job this
+        // token already took (the script hands it back on a retry).
+        let reply = self
+            .eval_transition("move_to_active", queue, "", |retry| {
+                let mut inv = self.scripts.move_to_active.prepare_invoke();
+                inv.key(keys.wait())
+                    .key(keys.paused())
+                    .key(keys.active())
+                    .key(keys.prioritized())
+                    .key(keys.delayed())
+                    .key(keys.events())
+                    .key(keys.meta())
+                    .key(keys.marker())
+                    .key(keys.job_hash_prefix())
+                    .key(keys.priority_counter())
+                    .key(keys.limiter())
+                    .arg(worker_token)
+                    .arg(lock_duration.as_millis() as i64)
+                    .arg(now_ms())
+                    .arg(self.max_stream_length as i64)
+                    .arg(rate_limit.map(|r| r.max).unwrap_or(0))
+                    .arg(
+                        rate_limit
+                            .map(|r| r.per.as_millis().max(1) as i64)
+                            .unwrap_or(0),
+                    )
+                    .arg(i32::from(retry));
+                inv
+            })
+            .await?;
+        parse_fetched(reply, worker_token)
+    }
+}
+
+/// Outcome of one `move_to_active` call.
+#[derive(Debug)]
+enum Moved {
+    /// A job was moved to `active` and locked.
+    Job(Box<Fetched>),
+    /// Nothing ready. `next_due` is how long until the earliest delayed
+    /// job becomes eligible, if there is one.
+    Empty { next_due: Option<Duration> },
+    /// The queue's rate limit is exhausted for another `retry_in`.
+    RateLimited { retry_in: Duration },
+}
+
+/// Escape Redis glob metacharacters so a `SCAN MATCH` pattern built from a
+/// queue name matches that name literally.
+fn glob_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Job deletions per script call for batched operations; must match
+/// `OXN_BATCH` in `lua/includes/common.lua`.
+const SCRIPT_BATCH: u64 = 1000;
+
+/// Smallest block time handed to `BZPOPMIN`. A timeout of `0` means
+/// "block forever" in Redis, so a configured `drain_delay` of zero (or a
+/// delayed job due right now) must never reach the server as 0.
+const MIN_BLOCK: Duration = Duration::from_millis(1);
+
+/// How long a worker that found nothing to do should block: until the
+/// next delayed job is due, but never longer than `drain_delay`.
+/// A failure of the connection rather than an answer from Redis: the
+/// call may or may not have run, and trying again may succeed.
+fn is_transient(e: &Error) -> bool {
+    match e {
+        Error::Pool(_) => true,
+        Error::Redis(r) => {
+            r.is_io_error()
+                || r.is_connection_dropped()
+                || r.is_connection_refusal()
+                || r.is_timeout()
+                || matches!(
+                    r.kind(),
+                    redis::ErrorKind::BusyLoadingError
+                        | redis::ErrorKind::TryAgain
+                        | redis::ErrorKind::MasterDown
+                )
+        }
+        _ => false,
+    }
+}
+
+/// Sleep until `at`; never resolves for `None`.
+async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn block_time(drain_delay: Duration, next_due: Option<Duration>) -> Duration {
+    let t = match next_due {
+        Some(due) => drain_delay.min(due),
+        None => drain_delay,
+    };
+    t.max(MIN_BLOCK)
+}
+
+/// Translate a script's negative return code into an [`Error`].
+///
+/// `-1` ("the job does not exist") becomes [`Error::NotFound`] so callers
+/// and HTTP layers treat it like any other missing resource; every other
+/// code becomes the matching [`crate::error::ScriptError`].
+fn script_error(code: i64, script: &str, queue: &str, job_id: Option<&str>) -> Error {
+    match code {
+        -1 => Error::NotFound(match job_id {
+            Some(id) => format!("job `{id}` in queue `{queue}`"),
+            None => format!("job in queue `{queue}` ({script})"),
+        }),
+        other => Error::Script(crate::error::ScriptError::from_code(other)),
+    }
+}
+
+fn reply_kind(v: &redis::Value) -> &'static str {
+    match v {
+        redis::Value::Nil => "nil",
+        redis::Value::Int(_) => "int",
+        redis::Value::BulkString(_) => "bulk",
+        redis::Value::Array(a) if a.is_empty() => "empty-array",
+        redis::Value::Array(_) => "array",
+        redis::Value::SimpleString(_) => "simple",
+        redis::Value::Okay => "ok",
+        _ => "other",
+    }
 }
 
 #[async_trait]
@@ -361,13 +650,14 @@ impl Backend for RedisBackend {
         self.register_queue(queue).await?;
         let keys = self.keys(queue);
         let opts_json = opts_to_json(&insert.opts)?;
-        let delay_ms = insert
-            .opts
-            .delay
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+        let delay_ms = insert.opts.delay.map(|d| d.as_millis() as i64).unwrap_or(0);
         let priority = insert.opts.priority as i64;
-        let dedup_id = insert.opts.deduplication.as_ref().map(|d| d.id.clone()).unwrap_or_default();
+        let dedup_id = insert
+            .opts
+            .deduplication
+            .as_ref()
+            .map(|d| d.id.clone())
+            .unwrap_or_default();
         let dedup_ttl_ms = insert
             .opts
             .deduplication
@@ -377,11 +667,8 @@ impl Backend for RedisBackend {
         let explicit_id = insert.opts.id.clone().unwrap_or_default();
         let lifo = if insert.opts.lifo { 1 } else { 0 };
 
-        let mut conn = self.conn().await?;
-        let reply: redis::Value = self
-            .scripts
-            .add_job
-            .key(keys.meta())
+        let mut inv = self.scripts.add_job.prepare_invoke();
+        inv.key(keys.meta())
             .key(keys.id_counter())
             .key(keys.wait())
             .key(keys.paused())
@@ -390,7 +677,6 @@ impl Backend for RedisBackend {
             .key(keys.priority_counter())
             .key(keys.events())
             .key(keys.marker())
-            .key(keys.dedup(&dedup_id))
             .key(keys.job_hash_prefix())
             .arg(insert.name.as_str())
             .arg(insert.data.as_str())
@@ -400,13 +686,66 @@ impl Backend for RedisBackend {
             .arg(priority)
             .arg(dedup_id)
             .arg(dedup_ttl_ms)
-            .arg(explicit_id)
+            .arg(explicit_id.as_str())
             .arg(lifo)
-            .arg(self.max_stream_length as i64)
-            .invoke_async(&mut *conn)
+            .arg(self.max_stream_length as i64);
+        let mut conn = self.conn().await?;
+        let explicit = (!explicit_id.is_empty()).then_some(explicit_id.as_str());
+        let reply = self
+            .eval(&mut conn, "add_job", queue, explicit, &inv)
             .await?;
         let id: String = redis::from_redis_value(&reply)?;
         Ok(JobId::new(id))
+    }
+
+    async fn add_bulk(&self, queue: &str, inserts: Vec<JobInsert>) -> Result<Vec<JobId>> {
+        if inserts.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.register_queue(queue).await?;
+        let keys = self.keys(queue);
+        let mut ids = Vec::with_capacity(inserts.len());
+        // One script call per chunk of SCRIPT_BATCH jobs (0.2 made one
+        // call per job). Inputs were validated by the caller, since a
+        // script is not rolled back on a runtime error.
+        for chunk in inserts.chunks(SCRIPT_BATCH as usize) {
+            let jobs = chunk
+                .iter()
+                .map(|i| {
+                    let dedup = i.opts.deduplication.as_ref();
+                    Ok(serde_json::json!({
+                        "name": i.name,
+                        "data": i.data,
+                        "opts": opts_to_json(&i.opts)?,
+                        "ts": i.timestamp_ms,
+                        "delay": i.opts.delay.map(|d| d.as_millis() as i64).unwrap_or(0),
+                        "priority": i.opts.priority,
+                        "dedupId": dedup.map(|d| d.id.as_str()).unwrap_or(""),
+                        "dedupTtl": dedup.map(|d| d.ttl.as_millis() as i64).unwrap_or(0),
+                        "id": i.opts.id.as_deref().unwrap_or(""),
+                        "lifo": if i.opts.lifo { 1 } else { 0 },
+                    }))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut inv = self.scripts.add_bulk.prepare_invoke();
+            inv.key(keys.meta())
+                .key(keys.id_counter())
+                .key(keys.wait())
+                .key(keys.paused())
+                .key(keys.delayed())
+                .key(keys.prioritized())
+                .key(keys.priority_counter())
+                .key(keys.events())
+                .key(keys.marker())
+                .key(keys.job_hash_prefix())
+                .arg(self.max_stream_length as i64)
+                .arg(serde_json::to_string(&jobs)?);
+            let mut conn = self.conn().await?;
+            let reply = self.eval(&mut conn, "add_bulk", queue, None, &inv).await?;
+            let chunk_ids: Vec<String> = redis::from_redis_value(&reply)?;
+            ids.extend(chunk_ids.into_iter().map(JobId::new));
+        }
+        Ok(ids)
     }
 
     async fn fetch_next(
@@ -415,75 +754,154 @@ impl Backend for RedisBackend {
         worker_token: &str,
         lock_duration: Duration,
         block_for: Duration,
+        cancel: &tokio_util::sync::CancellationToken,
+        rate_limit: Option<crate::options::RateLimit>,
     ) -> Result<Option<Fetched>> {
-        let keys = self.keys(queue);
-        // First: try non-blocking move-to-active via Lua.
-        let mut conn = self.conn().await?;
-        let reply: redis::Value = self
-            .scripts
-            .move_to_active
-            .key(keys.wait())
-            .key(keys.paused())
-            .key(keys.active())
-            .key(keys.prioritized())
-            .key(keys.delayed())
-            .key(keys.events())
-            .key(keys.meta())
-            .key(keys.marker())
-            .key(keys.job_hash_prefix())
-            .arg(worker_token)
-            .arg(lock_duration.as_millis() as i64)
-            .arg(now_ms())
-            .arg(self.max_stream_length as i64)
-            .invoke_async(&mut *conn)
-            .await?;
-
-        if let Some(fetched) = parse_fetched(reply, worker_token)? {
-            return Ok(Some(fetched));
+        if cancel.is_cancelled() {
+            return Ok(None);
         }
-        // Drop the slot before BZPOPMIN; we'll grab a fresh one for the
-        // blocking call so the second EVALSHA below isn't competing with
-        // ourselves for the same in-use connection.
-        drop(conn);
+        // First: try non-blocking move-to-active via Lua.
+        let next_due = match self
+            .move_to_active(queue, worker_token, lock_duration, rate_limit)
+            .await?
+        {
+            Moved::Job(f) => return Ok(Some(*f)),
+            Moved::Empty { next_due } => next_due,
+            Moved::RateLimited { retry_in } => {
+                // Sleep until the window reopens (shutdown interrupts it)
+                // rather than polling every `block_for`: nothing can start
+                // before then, whatever the marker says.
+                let wait = retry_in.max(MIN_BLOCK);
+                tracing::debug!(queue, wait_ms = wait.as_millis() as u64, "rate limited");
+                crate::telemetry::rate_limited(queue);
+                tokio::select! {
+                    _ = cancel.cancelled() => {}
+                    _ = tokio::time::sleep(wait) => {}
+                }
+                return Ok(None);
+            }
+        };
+        let block_for = block_time(block_for, next_due);
 
         // BZPOPMIN(marker) for up to `block_for`. Crucially, this is done
-        // on a **dedicated pool slot** rather than the shared
-        // [`ConnectionManager`]. Redis is single-threaded, so a blocking
-        // command holds the connection head-of-line — multiple workers
-        // sharing one multiplexed conn would serialize on each other and
-        // every non-blocking command would queue behind them. Holding one
-        // pool slot for at most `block_for` is the right trade.
+        // on a **dedicated pool slot** rather than a shared multiplexed
+        // connection. Redis is single-threaded, so a blocking command
+        // holds the connection head-of-line — multiple workers sharing one
+        // multiplexed conn would serialize on each other and every
+        // non-blocking command would queue behind them. Holding one pool
+        // slot for at most `block_for` is the right trade.
+        let keys = self.keys(queue);
+        let span = tracing::debug_span!(
+            "oxn.block",
+            queue,
+            block_ms = block_for.as_millis() as u64,
+            next_due_ms = next_due.map(|d| d.as_millis() as u64),
+            woke = tracing::field::Empty,
+            elapsed_us = tracing::field::Empty,
+        );
+        let start = std::time::Instant::now();
         let mut blocking = self.conn().await?;
-        let secs = block_for.as_secs_f64().max(0.0);
-        let _: Option<(String, String, f64)> = redis::cmd("BZPOPMIN")
-            .arg(keys.marker())
-            .arg(secs)
-            .query_async(&mut *blocking)
-            .await
-            .ok()
-            .flatten();
+        let mut bzpopmin = redis::cmd("BZPOPMIN");
+        bzpopmin.arg(keys.marker()).arg(block_for.as_secs_f64());
+        // Redis fires blocking timeouts on its own clock tick (`hz`, 10 by
+        // default: every 100ms), so a BZPOPMIN timing out when a delayed
+        // job falls due returns up to ~100ms late on a quiet server. When
+        // this wait is for a due job, a local timer wakes the queue at the
+        // due time instead (best effort; the timeout stays as a backstop).
+        let wake_at = next_due
+            .filter(|d| *d <= block_for)
+            .map(|d| tokio::time::Instant::now() + d + Duration::from_millis(1));
+        // Cancellation is honored here, while only *waiting*: no job has
+        // been taken yet, so giving up loses nothing.
+        let popped = {
+            let pop = bzpopmin
+                .query_async::<Option<(String, String, f64)>>(&mut *blocking)
+                .instrument(span.clone());
+            tokio::pin!(pop);
+            let mut woke_queue = false;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break None,
+                    r = &mut pop => break Some(r),
+                    _ = sleep_until_opt(wake_at), if !woke_queue => {
+                        woke_queue = true;
+                        self.wake_queue(&keys).await;
+                    }
+                }
+            }
+        };
+        span.record("elapsed_us", start.elapsed().as_micros() as u64);
+        let Some(popped) = popped else {
+            // The connection still has a BZPOPMIN in flight; returning it
+            // to the pool would make its next user wait behind the block.
+            // Detach it instead (dropping it closes the socket, which also
+            // unblocks the client server-side).
+            span.record("woke", "cancelled");
+            let _ = PooledConn::take(blocking);
+            return Ok(None);
+        };
         drop(blocking);
+        span.record("woke", popped.ok().flatten().is_some());
+        drop(span);
 
-        let mut conn = self.conn().await?;
-        let reply: redis::Value = self
-            .scripts
-            .move_to_active
-            .key(keys.wait())
-            .key(keys.paused())
-            .key(keys.active())
-            .key(keys.prioritized())
-            .key(keys.delayed())
-            .key(keys.events())
-            .key(keys.meta())
-            .key(keys.marker())
-            .key(keys.job_hash_prefix())
-            .arg(worker_token)
-            .arg(lock_duration.as_millis() as i64)
-            .arg(now_ms())
-            .arg(self.max_stream_length as i64)
-            .invoke_async(&mut *conn)
-            .await?;
-        parse_fetched(reply, worker_token)
+        // Not cancellable: if this takes a job we must hand it to the
+        // caller, who releases it if shutdown began meanwhile.
+        match self
+            .move_to_active(queue, worker_token, lock_duration, rate_limit)
+            .await?
+        {
+            Moved::Job(f) => Ok(Some(*f)),
+            Moved::Empty { .. } | Moved::RateLimited { .. } => Ok(None),
+        }
+    }
+
+    async fn delay(&self, queue: &str, id: &JobId, token: &str, until_ms: i64) -> Result<()> {
+        let keys = self.keys(queue);
+        self.eval_transition("move_to_delayed", queue, id.as_str(), |retry| {
+            let mut inv = self.scripts.move_to_delayed.prepare_invoke();
+            inv.key(keys.active())
+                .key(keys.delayed())
+                .key(keys.job_hash(id.as_str()))
+                .key(keys.job_lock(id.as_str()))
+                .key(keys.events())
+                .key(keys.marker())
+                .arg(id.as_str())
+                .arg(token)
+                .arg(until_ms)
+                .arg("")
+                .arg(self.max_stream_length as i64)
+                .arg(1)
+                .arg("")
+                .arg(i32::from(retry));
+            inv
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn release(&self, queue: &str, id: &JobId, token: &str) -> Result<()> {
+        let keys = self.keys(queue);
+        self.eval_transition("release", queue, id.as_str(), |retry| {
+            let mut inv = self.scripts.release.prepare_invoke();
+            inv.key(keys.active())
+                .key(keys.wait())
+                .key(keys.paused())
+                .key(keys.prioritized())
+                .key(keys.priority_counter())
+                .key(keys.meta())
+                .key(keys.marker())
+                .key(keys.events())
+                .key(keys.job_hash(id.as_str()))
+                .key(keys.job_lock(id.as_str()))
+                .arg(id.as_str())
+                .arg(token)
+                .arg(self.max_stream_length as i64)
+                .arg(i32::from(retry));
+            inv
+        })
+        .await?;
+        Ok(())
     }
 
     async fn complete(
@@ -495,80 +913,86 @@ impl Backend for RedisBackend {
         removal: crate::options::Removal,
     ) -> Result<()> {
         let keys = self.keys(queue);
-        let mut conn = self.conn().await?;
         let remove = encode_removal(&removal);
-        let _: redis::Value = self
-            .scripts
-            .move_to_finished
-            .key(keys.active())
-            .key(keys.completed())
-            .key(keys.job_hash(id.as_str()))
-            .key(keys.job_lock(id.as_str()))
-            .key(keys.events())
-            .arg(id.as_str())
-            .arg(token)
-            .arg("completed")
-            .arg(return_value_json.unwrap_or_default())
-            .arg("")
-            .arg(now_ms())
-            .arg(remove)
-            .arg(self.max_stream_length as i64)
-            .invoke_async(&mut *conn)
-            .await?;
-        Ok(())
-    }
-
-    async fn fail(
-        &self,
-        queue: &str,
-        id: &JobId,
-        token: &str,
-        reason: &str,
-        retry_at_ms: Option<i64>,
-        removal: crate::options::Removal,
-    ) -> Result<()> {
-        let keys = self.keys(queue);
-        let mut conn = self.conn().await?;
-
-        if let Some(ts) = retry_at_ms {
-            let _: redis::Value = self
-                .scripts
-                .move_to_delayed
-                .key(keys.active())
-                .key(keys.delayed())
+        let ret = return_value_json.unwrap_or_default();
+        self.eval_transition("move_to_finished", queue, id.as_str(), |retry| {
+            let mut inv = self.scripts.move_to_finished.prepare_invoke();
+            inv.key(keys.active())
+                .key(keys.completed())
                 .key(keys.job_hash(id.as_str()))
                 .key(keys.job_lock(id.as_str()))
                 .key(keys.events())
-                .key(keys.marker())
+                .key(keys.job_hash_prefix())
                 .arg(id.as_str())
                 .arg(token)
-                .arg(ts)
-                .arg(reason)
+                .arg("completed")
+                .arg(ret.as_str())
+                .arg("")
+                .arg(now_ms())
+                .arg(remove.as_str())
                 .arg(self.max_stream_length as i64)
-                .invoke_async(&mut *conn)
-                .await?;
+                .arg("")
+                .arg(i32::from(retry));
+            inv
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn fail(&self, queue: &str, id: &JobId, token: &str, failure: Failure<'_>) -> Result<()> {
+        let Failure {
+            reason,
+            retry_at_ms,
+            removal,
+            trace,
+        } = failure;
+        let keys = self.keys(queue);
+
+        if let Some(ts) = retry_at_ms {
+            self.eval_transition("move_to_delayed", queue, id.as_str(), |retry| {
+                let mut inv = self.scripts.move_to_delayed.prepare_invoke();
+                inv.key(keys.active())
+                    .key(keys.delayed())
+                    .key(keys.job_hash(id.as_str()))
+                    .key(keys.job_lock(id.as_str()))
+                    .key(keys.events())
+                    .key(keys.marker())
+                    .arg(id.as_str())
+                    .arg(token)
+                    .arg(ts)
+                    .arg(reason)
+                    .arg(self.max_stream_length as i64)
+                    .arg(0)
+                    .arg(trace.unwrap_or(""))
+                    .arg(i32::from(retry));
+                inv
+            })
+            .await?;
             return Ok(());
         }
 
         let remove = encode_removal(&removal);
-        let _: redis::Value = self
-            .scripts
-            .move_to_finished
-            .key(keys.active())
-            .key(keys.failed())
-            .key(keys.job_hash(id.as_str()))
-            .key(keys.job_lock(id.as_str()))
-            .key(keys.events())
-            .arg(id.as_str())
-            .arg(token)
-            .arg("failed")
-            .arg("")
-            .arg(reason)
-            .arg(now_ms())
-            .arg(remove)
-            .arg(self.max_stream_length as i64)
-            .invoke_async(&mut *conn)
-            .await?;
+        self.eval_transition("move_to_finished", queue, id.as_str(), |retry| {
+            let mut inv = self.scripts.move_to_finished.prepare_invoke();
+            inv.key(keys.active())
+                .key(keys.failed())
+                .key(keys.job_hash(id.as_str()))
+                .key(keys.job_lock(id.as_str()))
+                .key(keys.events())
+                .key(keys.job_hash_prefix())
+                .arg(id.as_str())
+                .arg(token)
+                .arg("failed")
+                .arg("")
+                .arg(reason)
+                .arg(now_ms())
+                .arg(remove.as_str())
+                .arg(self.max_stream_length as i64)
+                .arg(trace.unwrap_or(""))
+                .arg(i32::from(retry));
+            inv
+        })
+        .await?;
         Ok(())
     }
 
@@ -580,73 +1004,59 @@ impl Backend for RedisBackend {
         duration: Duration,
     ) -> Result<()> {
         let keys = self.keys(queue);
-        let mut conn = self.conn().await?;
-        let reply: i64 = self
-            .scripts
-            .extend_lock
-            .key(keys.job_lock(id.as_str()))
+        let mut inv = self.scripts.extend_lock.prepare_invoke();
+        inv.key(keys.job_lock(id.as_str()))
             .arg(token)
-            .arg(duration.as_millis() as i64)
-            .invoke_async(&mut *conn)
+            .arg(duration.as_millis() as i64);
+        let mut conn = self.conn().await?;
+        self.eval(&mut conn, "extend_lock", queue, Some(id.as_str()), &inv)
             .await?;
-        if reply < 0 {
-            return Err(Error::Script(crate::error::ScriptError::from_code(reply)));
-        }
         Ok(())
     }
 
-    async fn scan_stalled(&self, queue: &str, max_stalled: u32) -> Result<Vec<JobId>> {
+    async fn scan_stalled(&self, queue: &str, max_stalled: u32) -> Result<StalledScan> {
         let keys = self.keys(queue);
-        let mut conn = self.conn().await?;
-        let moved: Vec<String> = self
-            .scripts
-            .scan_stalled
-            .key(keys.active())
+        let mut inv = self.scripts.scan_stalled.prepare_invoke();
+        inv.key(keys.active())
             .key(keys.wait())
             .key(keys.stalled())
             .key(keys.stalled_check())
             .key(keys.events())
             .key(keys.job_hash_prefix())
+            .key(keys.marker())
+            .key(keys.paused())
+            .key(keys.prioritized())
+            .key(keys.priority_counter())
+            .key(keys.meta())
+            .key(keys.failed())
             .arg(now_ms())
             .arg(max_stalled as i64)
-            .arg(self.max_stream_length as i64)
-            .invoke_async(&mut *conn)
+            .arg(self.max_stream_length as i64);
+        let mut conn = self.conn().await?;
+        let reply = self
+            .eval(&mut conn, "scan_stalled", queue, None, &inv)
             .await?;
-        Ok(moved.into_iter().map(JobId::new).collect())
+        let (moved, failed): (Vec<String>, Vec<String>) = redis::from_redis_value(&reply)?;
+        Ok(StalledScan {
+            requeued: moved.into_iter().map(JobId::new).collect(),
+            failed: failed
+                .chunks_exact(4)
+                .map(|f| StalledJob {
+                    id: JobId::new(f[0].clone()),
+                    name: f[1].clone(),
+                    attempts_made: f[2].parse().unwrap_or(0),
+                    attempts: f[3].parse().unwrap_or(1),
+                })
+                .collect(),
+        })
     }
 
     async fn pause(&self, queue: &str) -> Result<()> {
-        let keys = self.keys(queue);
-        let mut conn = self.conn().await?;
-        let _: redis::Value = self
-            .scripts
-            .pause
-            .key(keys.wait())
-            .key(keys.paused())
-            .key(keys.meta())
-            .key(keys.events())
-            .arg("pause")
-            .arg(self.max_stream_length as i64)
-            .invoke_async(&mut *conn)
-            .await?;
-        Ok(())
+        self.pause_or_resume(queue, "pause").await
     }
 
     async fn resume(&self, queue: &str) -> Result<()> {
-        let keys = self.keys(queue);
-        let mut conn = self.conn().await?;
-        let _: redis::Value = self
-            .scripts
-            .pause
-            .key(keys.wait())
-            .key(keys.paused())
-            .key(keys.meta())
-            .key(keys.events())
-            .arg("resume")
-            .arg(self.max_stream_length as i64)
-            .invoke_async(&mut *conn)
-            .await?;
-        Ok(())
+        self.pause_or_resume(queue, "resume").await
     }
 
     async fn is_paused(&self, queue: &str) -> Result<bool> {
@@ -657,33 +1067,66 @@ impl Backend for RedisBackend {
     }
 
     async fn drain(&self, queue: &str, include_delayed: bool) -> Result<()> {
+        // One batch per script call so a huge backlog never blocks Redis;
+        // each batch deletes the jobs' hashes and keys, not just the ids.
         let keys = self.keys(queue);
-        let mut conn = self.conn().await?;
-        let mut pipe = redis::pipe();
-        pipe.atomic()
-            .del(keys.wait())
-            .del(keys.paused())
-            .del(keys.prioritized());
-        if include_delayed {
-            pipe.del(keys.delayed());
+        let mut inv = self.scripts.drain.prepare_invoke();
+        inv.key(keys.wait())
+            .key(keys.paused())
+            .key(keys.prioritized())
+            .key(keys.delayed())
+            .key(keys.marker())
+            .key(keys.job_hash_prefix())
+            .arg(if include_delayed { 1 } else { 0 });
+        let mut total = 0u64;
+        loop {
+            let mut conn = self.conn().await?;
+            let reply = self.eval(&mut conn, "drain", queue, None, &inv).await?;
+            let n: u64 = redis::from_redis_value(&reply)?;
+            total += n;
+            if n < SCRIPT_BATCH {
+                break;
+            }
         }
-        let _: () = pipe.query_async(&mut *conn).await?;
-        Ok(())
+        self.emit(
+            queue,
+            &[("event", "drained"), ("count", &total.to_string())],
+        )
+        .await
     }
 
     async fn obliterate(&self, queue: &str, force: bool) -> Result<()> {
+        let span = tracing::debug_span!(
+            "oxn.obliterate",
+            queue,
+            force,
+            deleted = tracing::field::Empty
+        );
         let keys = self.keys(queue);
+        // 1. Atomically: refuse if jobs are active (unless forced), else
+        //    pause so no worker can take a job while we delete.
+        let mut inv = self.scripts.obliterate_begin.prepare_invoke();
+        inv.key(keys.active())
+            .key(keys.meta())
+            .arg(if force { 1 } else { 0 });
         let mut conn = self.conn().await?;
-        if !force {
-            let active: usize = conn.llen(keys.active()).await?;
-            if active > 0 {
-                return Err(Error::Config(format!(
-                    "obliterate: {active} active jobs — pass force=true to proceed"
-                )));
-            }
+        let reply = self
+            .eval(&mut conn, "obliterate_begin", queue, None, &inv)
+            .await?;
+        let active: u64 = redis::from_redis_value(&reply)?;
+        if active > 0 {
+            return Err(Error::Config(format!(
+                "obliterate: {active} active jobs — pass force=true to proceed"
+            )));
         }
-        let pattern = keys.scan_pattern();
+        // 2. Delete every key under the queue in pages. The SCAN pattern is
+        //    glob-escaped: queue names may contain `*`, `?` and `[`, and an
+        //    unescaped `oxn:*:*` would match every queue under the prefix.
+        //    `meta` holds the pause flag, so it goes last.
+        let pattern = format!("{}*", glob_escape(&keys.job_hash_prefix()));
+        let meta = keys.meta();
         let mut cursor: u64 = 0;
+        let mut deleted = 0usize;
         loop {
             let (next, page): (u64, Vec<String>) = redis::cmd("SCAN")
                 .arg(cursor)
@@ -693,7 +1136,9 @@ impl Backend for RedisBackend {
                 .arg(500)
                 .query_async(&mut *conn)
                 .await?;
+            let page: Vec<String> = page.into_iter().filter(|k| *k != meta).collect();
             if !page.is_empty() {
+                deleted += page.len();
                 let _: () = conn.del(page).await?;
             }
             if next == 0 {
@@ -701,55 +1146,65 @@ impl Backend for RedisBackend {
             }
             cursor = next;
         }
+        let _: () = conn.del(&meta).await?;
         let _: () = conn.srem(format!("{}:queues", self.prefix), queue).await?;
         // Drop the in-process cache entry so a future `add()` re-SADDs the
         // queue back into the registry. Without this, the cache lies and the
         // dashboard's queue listing won't show a re-created queue.
         self.registered_queues.remove(queue);
+        span.record("deleted", deleted + 1);
         Ok(())
     }
 
     async fn promote(&self, queue: &str, id: &JobId) -> Result<()> {
         let keys = self.keys(queue);
-        let mut conn = self.conn().await?;
-        let _: redis::Value = self
-            .scripts
-            .promote
-            .key(keys.delayed())
+        let mut inv = self.scripts.promote.prepare_invoke();
+        inv.key(keys.delayed())
             .key(keys.wait())
             .key(keys.events())
             .key(keys.marker())
+            .key(keys.job_hash(id.as_str()))
+            .key(keys.paused())
+            .key(keys.prioritized())
+            .key(keys.priority_counter())
+            .key(keys.meta())
             .arg(id.as_str())
-            .arg(self.max_stream_length as i64)
-            .invoke_async(&mut *conn)
+            .arg(self.max_stream_length as i64);
+        let mut conn = self.conn().await?;
+        self.eval(&mut conn, "promote", queue, Some(id.as_str()), &inv)
             .await?;
         Ok(())
     }
 
     async fn promote_all(&self, queue: &str) -> Result<u64> {
         let keys = self.keys(queue);
-        let mut conn = self.conn().await?;
-        let moved: i64 = self
-            .scripts
-            .promote_all
-            .key(keys.delayed())
+        let mut inv = self.scripts.promote_all.prepare_invoke();
+        inv.key(keys.delayed())
             .key(keys.wait())
             .key(keys.events())
             .key(keys.marker())
             .key(keys.meta())
             .key(keys.paused())
-            .arg(self.max_stream_length as i64)
-            .invoke_async(&mut *conn)
-            .await?;
-        Ok(moved.max(0) as u64)
+            .key(keys.prioritized())
+            .key(keys.priority_counter())
+            .key(keys.job_hash_prefix())
+            .arg(self.max_stream_length as i64);
+        // One batch per script call so a huge delayed set never blocks Redis.
+        let mut total = 0u64;
+        loop {
+            let mut conn = self.conn().await?;
+            let reply = self
+                .eval(&mut conn, "promote_all", queue, None, &inv)
+                .await?;
+            let n: u64 = redis::from_redis_value(&reply)?;
+            total += n;
+            if n < SCRIPT_BATCH {
+                return Ok(total);
+            }
+        }
     }
 
-    async fn clean(
-        &self,
-        queue: &str,
-        state: JobState,
-        limit: u64,
-    ) -> Result<u64> {
+    async fn clean(&self, queue: &str, state: JobState, limit: u64) -> Result<u64> {
         let keys = self.keys(queue);
         let zset = match state {
             JobState::Completed => keys.completed(),
@@ -761,63 +1216,271 @@ impl Backend for RedisBackend {
                 return Err(Error::Config(format!(
                     "clean({state}): list-backed states cannot be cleaned via this API; \
                      use drain() or obliterate() instead"
-                )))
+                )));
             }
         };
-        let mut conn = self.conn().await?;
-        let removed: i64 = self
-            .scripts
-            .clean
-            .key(zset)
-            .key(keys.events())
-            .key(keys.job_hash_prefix())
-            .arg(limit as i64)
-            .arg(self.max_stream_length as i64)
-            .invoke_async(&mut *conn)
+        // `limit == 0` means everything; either way work in batches of at
+        // most SCRIPT_BATCH so no single script call runs long.
+        let mut removed = 0u64;
+        loop {
+            let want = if limit == 0 {
+                SCRIPT_BATCH
+            } else {
+                (limit - removed).min(SCRIPT_BATCH)
+            };
+            if want == 0 {
+                break;
+            }
+            let mut inv = self.scripts.clean.prepare_invoke();
+            inv.key(&zset)
+                .key(keys.events())
+                .key(keys.job_hash_prefix())
+                .arg(want);
+            let mut conn = self.conn().await?;
+            let reply = self.eval(&mut conn, "clean", queue, None, &inv).await?;
+            let n: u64 = redis::from_redis_value(&reply)?;
+            removed += n;
+            if n < want {
+                break;
+            }
+        }
+        if removed > 0 {
+            self.emit(
+                queue,
+                &[("event", "cleaned"), ("count", &removed.to_string())],
+            )
             .await?;
-        Ok(removed.max(0) as u64)
+        }
+        Ok(removed)
     }
 
     async fn retry(&self, queue: &str, id: &JobId) -> Result<()> {
         let keys = self.keys(queue);
-        let mut conn = self.conn().await?;
-        let _: redis::Value = self
-            .scripts
-            .retry
-            .key(keys.failed())
+        let mut inv = self.scripts.retry.prepare_invoke();
+        inv.key(keys.failed())
             .key(keys.wait())
             .key(keys.job_hash(id.as_str()))
             .key(keys.events())
             .key(keys.marker())
+            .key(keys.paused())
+            .key(keys.prioritized())
+            .key(keys.priority_counter())
+            .key(keys.meta())
+            .key(keys.waiting_children())
             .arg(id.as_str())
-            .arg(self.max_stream_length as i64)
-            .invoke_async(&mut *conn)
+            .arg(self.max_stream_length as i64);
+        let mut conn = self.conn().await?;
+        self.eval(&mut conn, "retry", queue, Some(id.as_str()), &inv)
             .await?;
         Ok(())
     }
 
     async fn remove(&self, queue: &str, id: &JobId) -> Result<()> {
         let keys = self.keys(queue);
-        let mut conn = self.conn().await?;
-        let _: redis::Value = self
-            .scripts
-            .remove
-            .key(keys.wait())
-            .key(keys.paused())
-            .key(keys.active())
-            .key(keys.delayed())
-            .key(keys.prioritized())
-            .key(keys.completed())
-            .key(keys.failed())
-            .key(keys.job_hash(id.as_str()))
-            .key(keys.job_lock(id.as_str()))
-            .key(keys.job_logs(id.as_str()))
-            .key(keys.events())
+        let mut inv = self.scripts.remove.prepare_invoke();
+        inv.key(keys.job_hash(id.as_str()))
             .arg(id.as_str())
-            .arg(self.max_stream_length as i64)
-            .invoke_async(&mut *conn)
+            .arg(self.max_stream_length as i64);
+        let mut conn = self.conn().await?;
+        self.eval(&mut conn, "remove", queue, Some(id.as_str()), &inv)
             .await?;
         Ok(())
+    }
+
+    async fn add_flow(
+        &self,
+        nodes: Vec<FlowJobInsert>,
+        parent: Option<&JobRef>,
+    ) -> Result<Vec<JobId>> {
+        let Some(root) = nodes.first() else {
+            return Ok(Vec::new());
+        };
+        let root_queue = root.queue.clone();
+        let mut queues: Vec<&str> = nodes.iter().map(|n| n.queue.as_str()).collect();
+        queues.sort_unstable();
+        queues.dedup();
+        for q in queues {
+            self.register_queue(q).await?;
+        }
+        let json = nodes
+            .iter()
+            .map(|n| {
+                let i = &n.insert;
+                Ok(serde_json::json!({
+                    "base": format!("{}:{}", self.prefix, n.queue),
+                    "name": i.name,
+                    "data": i.data,
+                    "opts": opts_to_json(&i.opts)?,
+                    "ts": i.timestamp_ms,
+                    "delay": i.opts.delay.map(|d| d.as_millis() as i64).unwrap_or(0),
+                    "priority": i.opts.priority,
+                    "lifo": if i.opts.lifo { 1 } else { 0 },
+                    "id": i.opts.id.as_deref().unwrap_or(""),
+                    "parent": n.parent.map(|p| p as i64).unwrap_or(-1),
+                    "fpof": i32::from(n.fail_parent_on_failure),
+                    "idof": i32::from(n.ignore_dependency_on_failure),
+                    "kids": n.children,
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let external = parent
+            .map(|p| self.keys(&p.queue).job_hash(p.id.as_str()))
+            .unwrap_or_default();
+        let mut inv = self.scripts.flow.prepare_invoke();
+        inv.arg(self.max_stream_length as i64)
+            .arg(external)
+            .arg(serde_json::to_string(&json)?);
+        let mut conn = self.conn().await?;
+        let reply = self
+            .eval(&mut conn, "flow", &root_queue, None, &inv)
+            .await?;
+        let ids: Vec<String> = redis::from_redis_value(&reply)?;
+        Ok(ids.into_iter().map(JobId::new).collect())
+    }
+
+    async fn wait_for_children(&self, queue: &str, id: &JobId, token: &str) -> Result<bool> {
+        let keys = self.keys(queue);
+        let reply = self
+            .eval_transition("move_to_waiting_children", queue, id.as_str(), |retry| {
+                let mut inv = self.scripts.move_to_waiting_children.prepare_invoke();
+                inv.key(keys.active())
+                    .key(keys.job_hash(id.as_str()))
+                    .key(keys.job_lock(id.as_str()))
+                    .key(keys.waiting_children())
+                    .arg(id.as_str())
+                    .arg(token)
+                    .arg(self.max_stream_length as i64)
+                    .arg(i32::from(retry));
+                inv
+            })
+            .await?;
+        Ok(redis::from_redis_value::<i64>(&reply)? == 1)
+    }
+
+    async fn schedule_tick(&self, queue: &str, tick: SchedulerTick) -> Result<TickOutcome> {
+        self.register_queue(queue).await?;
+        let keys = self.keys(queue);
+        let SchedulerTick {
+            scheduler_id,
+            fire_at_ms,
+            repeat,
+            register,
+            insert,
+        } = tick;
+        let job_id = |t: i64| JobId::new(format!("sched-{scheduler_id}-{t}"));
+        let id = job_id(fire_at_ms);
+        let mut opts = insert.opts;
+        opts.id = Some(id.as_str().to_string());
+        let delay_ms = (fire_at_ms - insert.timestamp_ms).max(0);
+        opts.delay = (delay_ms > 0).then(|| Duration::from_millis(delay_ms as u64));
+        opts.deduplication = None;
+        let record = serde_json::json!({
+            "id": scheduler_id,
+            "repeat": repeat,
+            "name": insert.name,
+        });
+        let mut inv = self.scripts.schedule.prepare_invoke();
+        inv.key(keys.schedulers())
+            .key(keys.meta())
+            .key(keys.id_counter())
+            .key(keys.wait())
+            .key(keys.paused())
+            .key(keys.delayed())
+            .key(keys.prioritized())
+            .key(keys.priority_counter())
+            .key(keys.events())
+            .key(keys.marker())
+            .key(keys.job_hash_prefix())
+            .key(keys.scheduler_ticks(&scheduler_id))
+            .arg(scheduler_id.as_str())
+            .arg(fire_at_ms)
+            .arg(serde_json::to_string(&record)?)
+            .arg(i32::from(register))
+            .arg(id.as_str())
+            .arg(insert.name.as_str())
+            .arg(insert.data.as_str())
+            .arg(opts_to_json(&opts)?)
+            .arg(insert.timestamp_ms)
+            .arg(delay_ms)
+            .arg(opts.priority)
+            .arg(i32::from(opts.lifo))
+            .arg(self.max_stream_length as i64);
+        let mut conn = self.conn().await?;
+        let reply = self
+            .eval(&mut conn, "schedule", queue, Some(id.as_str()), &inv)
+            .await?;
+        let (status, latest): (String, i64) = redis::from_redis_value(&reply)?;
+        Ok(match status.as_str() {
+            "added" => TickOutcome::Added(id),
+            "removed" => TickOutcome::Removed,
+            _ => TickOutcome::Exists(job_id(latest)),
+        })
+    }
+
+    async fn schedulers(&self, queue: &str) -> Result<Vec<SchedulerInfo>> {
+        let keys = self.keys(queue);
+        let mut conn = self.conn().await?;
+        let map: std::collections::HashMap<String, String> =
+            conn.hgetall(keys.schedulers()).await?;
+        let mut out: Vec<SchedulerInfo> = map
+            .values()
+            .filter_map(|json| serde_json::from_str(json).ok())
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    async fn remove_scheduler(&self, queue: &str, id: &str) -> Result<bool> {
+        let keys = self.keys(queue);
+        let mut inv = self.scripts.remove_scheduler.prepare_invoke();
+        inv.key(keys.schedulers())
+            .key(keys.wait())
+            .key(keys.paused())
+            .key(keys.delayed())
+            .key(keys.prioritized())
+            .key(keys.events())
+            .key(keys.job_hash_prefix())
+            .key(keys.scheduler_ticks(id))
+            .key(keys.active())
+            .arg(id)
+            .arg(now_ms())
+            .arg(self.max_stream_length as i64);
+        let mut conn = self.conn().await?;
+        let reply = self
+            .eval(&mut conn, "remove_scheduler", queue, None, &inv)
+            .await?;
+        Ok(redis::from_redis_value::<i64>(&reply)? >= 1)
+    }
+
+    async fn dependencies(&self, queue: &str, id: &JobId) -> Result<Dependencies> {
+        let keys = self.keys(queue);
+        let mut conn = self.conn().await?;
+        let (pending, processed, failed): (
+            Vec<String>,
+            std::collections::HashMap<String, String>,
+            std::collections::HashMap<String, String>,
+        ) = redis::pipe()
+            .smembers(keys.job_deps(id.as_str()))
+            .hgetall(keys.job_processed(id.as_str()))
+            .hgetall(format!("{}:failed", keys.job_hash(id.as_str())))
+            .query_async(&mut *conn)
+            .await?;
+        let to_ref = |key: &str| child_ref(&self.prefix, key);
+        let mut deps = Dependencies {
+            pending: pending.iter().filter_map(|k| to_ref(k)).collect(),
+            processed: processed
+                .into_iter()
+                .filter_map(|(k, v)| Some((to_ref(&k)?, v)))
+                .collect(),
+            failed: failed
+                .into_iter()
+                .filter_map(|(k, v)| Some((to_ref(&k)?, v)))
+                .collect(),
+        };
+        deps.pending.sort_by(job_ref_order);
+        deps.processed.sort_by(|a, b| job_ref_order(&a.0, &b.0));
+        deps.failed.sort_by(|a, b| job_ref_order(&a.0, &b.0));
+        Ok(deps)
     }
 
     async fn get(&self, queue: &str, id: &JobId) -> Result<Option<RawJob>> {
@@ -867,95 +1530,100 @@ impl Backend for RedisBackend {
         })
     }
 
-    async fn list(
-        &self,
-        queue: &str,
-        state: JobState,
-        range: JobRange,
-    ) -> Result<Vec<RawJob>> {
+    async fn list(&self, queue: &str, state: JobState, range: JobRange) -> Result<Vec<RawJob>> {
         let keys = self.keys(queue);
         let mut conn = self.conn().await?;
-        let start = range.start as isize;
-        let end = range.end as isize;
         let ids: Vec<String> = match state {
-            JobState::Waiting => {
-                if range.descending {
-                    let n: isize = conn.llen(keys.wait()).await?;
-                    let s = (n - end - 1).max(0);
-                    let e = n - start - 1;
-                    conn.lrange(keys.wait(), s, e).await?
-                } else {
-                    conn.lrange(keys.wait(), start, end).await?
-                }
-            }
-            JobState::Paused => conn.lrange(keys.paused(), start, end).await?,
-            JobState::Active => conn.lrange(keys.active(), start, end).await?,
+            JobState::Waiting => list_ids(&mut *conn, keys.wait(), range).await?,
+            JobState::Paused => list_ids(&mut *conn, keys.paused(), range).await?,
+            JobState::Active => list_ids(&mut *conn, keys.active(), range).await?,
             JobState::Delayed => zrange(&mut *conn, keys.delayed(), range).await?,
             JobState::Prioritized => zrange(&mut *conn, keys.prioritized(), range).await?,
             JobState::WaitingChildren => zrange(&mut *conn, keys.waiting_children(), range).await?,
             JobState::Completed => zrange(&mut *conn, keys.completed(), range).await?,
             JobState::Failed => zrange(&mut *conn, keys.failed(), range).await?,
         };
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One pipelined round trip for every hash. The state is the
+        // container we listed; no per-job lookup needed.
+        let mut pipe = redis::pipe();
+        for id in &ids {
+            pipe.hgetall(keys.job_hash(id));
+        }
+        let maps: Vec<std::collections::HashMap<String, String>> =
+            pipe.query_async(&mut *conn).await?;
         let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(raw) = self.get(queue, &JobId::new(id)).await? {
-                out.push(raw);
+        for (id, map) in ids.into_iter().zip(maps) {
+            // A job can finish between reading the container and its hash.
+            if !map.is_empty() {
+                out.push(hash_to_raw(JobId::new(id), map, Some(state))?);
             }
         }
         Ok(out)
     }
 
     async fn log(&self, queue: &str, id: &JobId, line: &str) -> Result<()> {
-        let keys = self.keys(queue);
-        let mut conn = self.conn().await?;
-        let _: () = conn.rpush(keys.job_logs(id.as_str()), line).await?;
-        Ok(())
+        self.job_update(queue, id, "log", line).await
     }
 
     async fn get_logs(&self, queue: &str, id: &JobId, range: JobRange) -> Result<Vec<String>> {
         let keys = self.keys(queue);
         let mut conn = self.conn().await?;
-        let v: Vec<String> = conn
-            .lrange(
-                keys.job_logs(id.as_str()),
-                range.start as isize,
-                range.end as isize,
-            )
+        // Lines are appended, oldest first. Newest-first [start, end] is
+        // list indices [-(end+1), -(start+1)], reversed (end < 0: to the
+        // oldest). 0.2 ignored `descending`.
+        let (lo, hi) = if range.descending {
+            let lo = if range.end < 0 { 0 } else { -(range.end + 1) };
+            (lo, -(range.start + 1))
+        } else {
+            (range.start, range.end)
+        };
+        let mut v: Vec<String> = conn
+            .lrange(keys.job_logs(id.as_str()), lo as isize, hi as isize)
             .await?;
+        if range.descending {
+            v.reverse();
+        }
         Ok(v)
     }
 
-    async fn update_progress(
-        &self,
-        queue: &str,
-        id: &JobId,
-        progress_json: &str,
-    ) -> Result<()> {
-        let keys = self.keys(queue);
-        let mut conn = self.conn().await?;
-        let _: () = conn
-            .hset(keys.job_hash(id.as_str()), "progress", progress_json)
-            .await?;
-        // also emit a progress event
-        let _: () = redis::cmd("XADD")
-            .arg(keys.events())
-            .arg("MAXLEN")
-            .arg("~")
-            .arg(self.max_stream_length)
-            .arg("*")
-            .arg("event")
-            .arg("progress")
-            .arg("jobId")
-            .arg(id.as_str())
-            .arg("data")
-            .arg(progress_json)
-            .query_async(&mut *conn)
-            .await?;
-        Ok(())
+    async fn update_progress(&self, queue: &str, id: &JobId, progress_json: &str) -> Result<()> {
+        self.job_update(queue, id, "progress", progress_json).await
     }
 
-    async fn subscribe(&self, queue: &str) -> Result<EventStream> {
-        Ok(self.subscribe_impl(queue.to_string()).boxed())
+    async fn subscribe(&self, queue: &str, from: StreamStart) -> Result<RecordStream> {
+        let key = self.keys(queue).events();
+        // Resolve `Now` to a concrete id *here*, so events emitted between
+        // this call and the first poll are not lost (0.2 read from `$`
+        // lazily on every XREAD).
+        let cursor = match from {
+            StreamStart::Beginning => "0-0".to_string(),
+            StreamStart::After(id) => id,
+            StreamStart::Now => {
+                let mut conn = self.conn().await?;
+                let last: redis::streams::StreamRangeReply = redis::cmd("XREVRANGE")
+                    .arg(&key)
+                    .arg("+")
+                    .arg("-")
+                    .arg("COUNT")
+                    .arg(1)
+                    .query_async(&mut *conn)
+                    .await?;
+                last.ids
+                    .into_iter()
+                    .next()
+                    .map(|e| e.id)
+                    .unwrap_or_else(|| "0-0".to_string())
+            }
+        };
+        Ok(Box::pin(subscription(
+            self.client.clone(),
+            queue.to_string(),
+            key,
+            cursor,
+        )))
     }
 
     async fn list_queues(&self) -> Result<Vec<String>> {
@@ -965,15 +1633,69 @@ impl Backend for RedisBackend {
     }
 }
 
+impl RedisBackend {
+    /// Append one event to the queue's stream from Rust (for operations
+    /// that span several script calls and report once at the end).
+    async fn emit(&self, queue: &str, fields: &[(&str, &str)]) -> Result<()> {
+        let mut cmd = redis::cmd("XADD");
+        cmd.arg(self.keys(queue).events())
+            .arg("MAXLEN")
+            .arg("~")
+            .arg(self.max_stream_length)
+            .arg("*");
+        for (k, v) in fields {
+            cmd.arg(*k).arg(*v);
+        }
+        let mut conn = self.conn().await?;
+        let _: String = cmd.query_async(&mut *conn).await?;
+        Ok(())
+    }
+
+    /// Progress or log write that refuses (`NotFound`) for a missing job
+    /// instead of re-creating its keys.
+    async fn job_update(&self, queue: &str, id: &JobId, kind: &str, value: &str) -> Result<()> {
+        let keys = self.keys(queue);
+        let mut inv = self.scripts.job_update.prepare_invoke();
+        inv.key(keys.job_hash(id.as_str()))
+            .key(keys.job_logs(id.as_str()))
+            .key(keys.events())
+            .arg(kind)
+            .arg(value)
+            .arg(id.as_str())
+            .arg(self.max_stream_length as i64);
+        let mut conn = self.conn().await?;
+        self.eval(&mut conn, "job_update", queue, Some(id.as_str()), &inv)
+            .await?;
+        Ok(())
+    }
+
+    async fn pause_or_resume(&self, queue: &str, action: &'static str) -> Result<()> {
+        let keys = self.keys(queue);
+        let mut inv = self.scripts.pause.prepare_invoke();
+        inv.key(keys.wait())
+            .key(keys.paused())
+            .key(keys.meta())
+            .key(keys.events())
+            .key(keys.marker())
+            .arg(action)
+            .arg(self.max_stream_length as i64);
+        let mut conn = self.conn().await?;
+        self.eval(&mut conn, "pause", queue, None, &inv).await?;
+        Ok(())
+    }
+}
+
 async fn zrange<C>(conn: &mut C, key: String, range: JobRange) -> Result<Vec<String>>
 where
     C: redis::aio::ConnectionLike + Send,
 {
     use redis::AsyncCommands;
     let v: Vec<String> = if range.descending {
-        conn.zrevrange(key, range.start as isize, range.end as isize).await?
+        conn.zrevrange(key, range.start as isize, range.end as isize)
+            .await?
     } else {
-        conn.zrange(key, range.start as isize, range.end as isize).await?
+        conn.zrange(key, range.start as isize, range.end as isize)
+            .await?
     };
     Ok(v)
 }
@@ -982,61 +1704,91 @@ async fn find_state<C>(conn: &mut C, keys: &KeyBuilder, id: &JobId) -> Result<Op
 where
     C: redis::aio::ConnectionLike + Send,
 {
+    // Every container in one round trip; the first non-nil reply wins.
+    const ORDER: [JobState; 8] = [
+        JobState::Waiting,
+        JobState::Paused,
+        JobState::Active,
+        JobState::Delayed,
+        JobState::Prioritized,
+        JobState::WaitingChildren,
+        JobState::Completed,
+        JobState::Failed,
+    ];
+    let id = id.as_str();
+    let replies: Vec<redis::Value> = redis::pipe()
+        .cmd("LPOS")
+        .arg(keys.wait())
+        .arg(id)
+        .cmd("LPOS")
+        .arg(keys.paused())
+        .arg(id)
+        .cmd("LPOS")
+        .arg(keys.active())
+        .arg(id)
+        .zscore(keys.delayed(), id)
+        .zscore(keys.prioritized(), id)
+        .zscore(keys.waiting_children(), id)
+        .zscore(keys.completed(), id)
+        .zscore(keys.failed(), id)
+        .query_async(conn)
+        .await?;
+    Ok(ORDER
+        .into_iter()
+        .zip(replies)
+        .find_map(|(state, v)| (!matches!(v, redis::Value::Nil)).then_some(state)))
+}
+
+/// Ids from a list-backed container in **processing order**: jobs are
+/// pushed on the left and popped from the right, so "first" (ascending)
+/// means rightmost — the next job to run — and descending means newest.
+async fn list_ids<C>(conn: &mut C, key: String, range: JobRange) -> Result<Vec<String>>
+where
+    C: redis::aio::ConnectionLike + Send,
+{
     use redis::AsyncCommands;
-    macro_rules! lmember {
-        ($k:expr) => {{
-            let v: i64 = conn
-                .lpos::<_, _, Option<i64>>($k, id.as_str(), redis::LposOptions::default())
-                .await?
-                .unwrap_or(-1);
-            v >= 0
-        }};
+    if range.descending {
+        return Ok(conn
+            .lrange(key, range.start as isize, range.end as isize)
+            .await?);
     }
-    if lmember!(keys.wait()) {
-        return Ok(Some(JobState::Waiting));
+    let len: i64 = conn.llen(&key).await?;
+    let (start, end) = (
+        range.start.max(0),
+        if range.end < 0 {
+            len + range.end
+        } else {
+            range.end.min(len - 1)
+        },
+    );
+    if len == 0 || start > end {
+        return Ok(Vec::new());
     }
-    if lmember!(keys.paused()) {
-        return Ok(Some(JobState::Paused));
-    }
-    if lmember!(keys.active()) {
-        return Ok(Some(JobState::Active));
-    }
-    if conn
-        .zscore::<_, _, Option<f64>>(keys.delayed(), id.as_str())
-        .await?
-        .is_some()
-    {
-        return Ok(Some(JobState::Delayed));
-    }
-    if conn
-        .zscore::<_, _, Option<f64>>(keys.prioritized(), id.as_str())
-        .await?
-        .is_some()
-    {
-        return Ok(Some(JobState::Prioritized));
-    }
-    if conn
-        .zscore::<_, _, Option<f64>>(keys.waiting_children(), id.as_str())
-        .await?
-        .is_some()
-    {
-        return Ok(Some(JobState::WaitingChildren));
-    }
-    if conn
-        .zscore::<_, _, Option<f64>>(keys.completed(), id.as_str())
-        .await?
-        .is_some()
-    {
-        return Ok(Some(JobState::Completed));
-    }
-    if conn
-        .zscore::<_, _, Option<f64>>(keys.failed(), id.as_str())
-        .await?
-        .is_some()
-    {
-        return Ok(Some(JobState::Failed));
-    }
-    Ok(None)
+    let mut ids: Vec<String> = conn
+        .lrange(key, (len - 1 - end) as isize, (len - 1 - start) as isize)
+        .await?;
+    ids.reverse();
+    Ok(ids)
+}
+
+/// `{prefix}:{queue}:{id}` → the job it names (queue names and ids never
+/// contain `:`).
+fn child_ref(prefix: &str, key: &str) -> Option<JobRef> {
+    let rest = key.strip_prefix(prefix)?.strip_prefix(':')?;
+    let (queue, id) = rest.split_once(':')?;
+    (!id.contains(':')).then(|| JobRef::new(queue, id))
+}
+
+/// Queue, then numeric ids in numeric order.
+fn job_ref_order(a: &JobRef, b: &JobRef) -> std::cmp::Ordering {
+    let key = |r: &JobRef| {
+        (
+            r.queue.clone(),
+            r.id.as_str().len(),
+            r.id.as_str().to_string(),
+        )
+    };
+    key(a).cmp(&key(b))
 }
 
 fn hash_to_raw(
@@ -1047,7 +1799,7 @@ fn hash_to_raw(
     let take = |m: &mut std::collections::HashMap<String, String>, k: &str| m.remove(k);
     let opts = match take(&mut map, "opts") {
         Some(s) => opts_from_json(&s)?,
-        None => JobOptions::default(),
+        None => ResolvedJobOptions::default(),
     };
     let stacktrace = take(&mut map, "stacktrace")
         .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
@@ -1071,19 +1823,34 @@ fn hash_to_raw(
         return_value_json: take(&mut map, "returnvalue"),
         lock_token: take(&mut map, "lockToken"),
         state,
+        parent: take(&mut map, "parent").and_then(|s| serde_json::from_str(&s).ok()),
     })
 }
 
-fn parse_fetched(reply: redis::Value, token: &str) -> Result<Option<Fetched>> {
+fn parse_fetched(reply: redis::Value, token: &str) -> Result<Moved> {
     use redis::Value;
     let arr = match reply {
-        Value::Nil => return Ok(None),
-        Value::Array(a) if a.is_empty() => return Ok(None),
+        Value::Nil => return Ok(Moved::Empty { next_due: None }),
+        Value::Array(a) if a.is_empty() => return Ok(Moved::Empty { next_due: None }),
+        // [ 'rl', retryInMs ] — the queue's rate limit is exhausted.
+        Value::Array(a) if a.len() == 2 && matches!(a[1], Value::Int(_)) => {
+            let ms: u64 = redis::from_redis_value(&a[1])?;
+            return Ok(Moved::RateLimited {
+                retry_in: Duration::from_millis(ms),
+            });
+        }
+        // [ nextDueMs ] — nothing ready, a delayed job is due in that long.
+        Value::Array(a) if a.len() == 1 => {
+            let ms: u64 = redis::from_redis_value(&a[0])?;
+            return Ok(Moved::Empty {
+                next_due: Some(Duration::from_millis(ms)),
+            });
+        }
         Value::Array(a) => a,
         other => {
             return Err(Error::Config(format!(
                 "moveToActive: unexpected reply shape: {other:?}"
-            )))
+            )));
         }
     };
     // Script shape: [ id, hashFieldsArray ]
@@ -1097,55 +1864,135 @@ fn parse_fetched(reply: redis::Value, token: &str) -> Result<Option<Fetched>> {
         map.insert(k, v);
     }
     let raw = hash_to_raw(JobId::new(id), map, Some(JobState::Active))?;
-    Ok(Some(Fetched {
+    Ok(Moved::Job(Box::new(Fetched {
         job: raw,
         token: token.to_string(),
-    }))
+    })))
 }
 
-impl RedisBackend {
-    fn subscribe_impl(&self, queue: String) -> impl Stream<Item = Result<Event>> + Send + 'static {
-        use futures::stream;
-        let backend = self.clone();
-        let keys = self.keys(&queue);
-        let events_key = keys.events();
-        stream::unfold(
-            (backend, events_key, "$".to_string()),
-            move |(backend, key, last_id)| async move {
-                let mut conn = match backend.conn().await {
-                    Ok(c) => c,
-                    Err(e) => return Some((Err(e), (backend, key, last_id))),
-                };
-                let reply: redis::streams::StreamReadReply = match redis::cmd("XREAD")
-                    .arg("BLOCK")
-                    .arg(5000)
-                    .arg("COUNT")
-                    .arg(100)
-                    .arg("STREAMS")
-                    .arg(&key)
-                    .arg(&last_id)
-                    .query_async(&mut *conn)
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => return Some((Err(e.into()), (backend, key, last_id))),
-                };
-                let mut last = last_id.clone();
-                if let Some(s) = reply.keys.first() {
-                    if let Some(e) = s.ids.first() {
-                        last = e.id.clone();
-                        let evt = parse_stream_entry(&e.map);
-                        return Some((Ok(evt), (backend, key, last)));
+/// Entries per `XREAD`; a burst is consumed in batches, not one per trip.
+const XREAD_COUNT: usize = 500;
+/// How long one `XREAD` blocks before looping (keeps dead peers detectable).
+const XREAD_BLOCK_MS: u64 = 5_000;
+/// Reconnect backoff bounds after a subscriber connection fails.
+const BACKOFF_MIN: Duration = Duration::from_millis(100);
+const BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+struct Sub {
+    client: redis::Client,
+    queue: String,
+    key: String,
+    cursor: String,
+    conn: Option<redis::aio::MultiplexedConnection>,
+    buf: std::collections::VecDeque<EventRecord>,
+    backoff: Duration,
+    failed: bool,
+}
+
+/// The event subscription: a dedicated connection (named
+/// `oxn-events:{queue}` in `CLIENT LIST`) blocked in `XREAD` from `cursor`.
+/// Reads whole batches; on a connection error yields one `Err`, waits with
+/// exponential backoff, reconnects and continues from the same cursor, so
+/// nothing is lost or repeated. Dropping the stream closes the connection.
+fn subscription(
+    client: redis::Client,
+    queue: String,
+    key: String,
+    cursor: String,
+) -> impl Stream<Item = Result<EventRecord>> + Send + 'static {
+    let sub = Sub {
+        client,
+        queue,
+        key,
+        cursor,
+        conn: None,
+        buf: std::collections::VecDeque::new(),
+        backoff: BACKOFF_MIN,
+        failed: false,
+    };
+    futures::stream::unfold(sub, |mut sub| async move {
+        loop {
+            if let Some(rec) = sub.buf.pop_front() {
+                return Some((Ok(rec), sub));
+            }
+            if sub.failed {
+                tokio::time::sleep(sub.backoff).await;
+                sub.backoff = (sub.backoff * 2).min(BACKOFF_MAX);
+                sub.failed = false;
+            }
+            if sub.conn.is_none() {
+                match connect_subscriber(&sub.client, &sub.queue).await {
+                    Ok(c) => sub.conn = Some(c),
+                    Err(e) => {
+                        sub.failed = true;
+                        return Some((Err(e), sub));
                     }
                 }
-                Some((Ok(Event::Unknown), (backend, key, last)))
-            },
-        )
-        .filter(|r| {
-            let keep = !matches!(r, Ok(Event::Unknown));
-            futures::future::ready(keep)
-        })
-    }
+            }
+            let Some(conn) = sub.conn.as_mut() else {
+                continue; // unreachable: connected just above
+            };
+            let reply: redis::RedisResult<Option<redis::streams::StreamReadReply>> =
+                redis::cmd("XREAD")
+                    .arg("BLOCK")
+                    .arg(XREAD_BLOCK_MS)
+                    .arg("COUNT")
+                    .arg(XREAD_COUNT)
+                    .arg("STREAMS")
+                    .arg(&sub.key)
+                    .arg(&sub.cursor)
+                    .query_async(conn)
+                    .await;
+            match reply {
+                Err(e) => {
+                    tracing::warn!(queue = %sub.queue, error = %e, cursor = %sub.cursor,
+                        "event subscription lost its connection; reconnecting");
+                    sub.conn = None;
+                    sub.failed = true;
+                    return Some((Err(e.into()), sub));
+                }
+                Ok(None) => continue, // BLOCK timed out with nothing new
+                Ok(Some(r)) => {
+                    sub.backoff = BACKOFF_MIN;
+                    for entry in r.keys.into_iter().flat_map(|k| k.ids) {
+                        sub.cursor = entry.id.clone();
+                        let event = parse_stream_entry(&entry.map);
+                        if matches!(event, Event::Unknown) {
+                            continue;
+                        }
+                        let at_ms = entry
+                            .id
+                            .split('-')
+                            .next()
+                            .and_then(|ms| ms.parse().ok())
+                            .unwrap_or(0);
+                        sub.buf.push_back(EventRecord {
+                            id: entry.id,
+                            at_ms,
+                            event,
+                        });
+                    }
+                }
+            }
+        }
+    })
+}
+
+async fn connect_subscriber(
+    client: &redis::Client,
+    queue: &str,
+) -> Result<redis::aio::MultiplexedConnection> {
+    let mut conn = client.get_multiplexed_async_connection().await?;
+    let name: String = format!("oxn-events:{queue}")
+        .chars()
+        .map(|c| if c.is_ascii_graphic() { c } else { '_' })
+        .collect();
+    let _: () = redis::cmd("CLIENT")
+        .arg("SETNAME")
+        .arg(name)
+        .query_async(&mut conn)
+        .await?;
+    Ok(conn)
 }
 
 fn parse_stream_entry(map: &std::collections::HashMap<String, redis::Value>) -> Event {
@@ -1158,13 +2005,22 @@ fn parse_stream_entry(map: &std::collections::HashMap<String, redis::Value>) -> 
         }
     }
     let event = s(map, "event").unwrap_or_default();
-    let id = s(map, "jobId").map(JobId::new).unwrap_or_else(|| JobId::new(""));
+    let id = s(map, "jobId")
+        .map(JobId::new)
+        .unwrap_or_else(|| JobId::new(""));
     match event.as_str() {
         "added" => Event::Added {
             id,
             name: s(map, "name").unwrap_or_default(),
         },
-        "waiting" => Event::Waiting { id },
+        "waiting" => Event::Waiting {
+            id,
+            prev: s(map, "prev"),
+        },
+        "waiting-children" => Event::WaitingChildren {
+            id,
+            prev: s(map, "prev"),
+        },
         "active" => Event::Active {
             id,
             prev: s(map, "prev"),
@@ -1176,11 +2032,13 @@ fn parse_stream_entry(map: &std::collections::HashMap<String, redis::Value>) -> 
         "failed" => Event::Failed {
             id,
             reason: s(map, "failedReason").unwrap_or_default(),
-            attempts_made: s(map, "attemptsMade").and_then(|x| x.parse().ok()).unwrap_or(0),
+            attempts_made: s(map, "attemptsMade")
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(0),
         },
         "delayed" => Event::Delayed {
             id,
-            delay_ms: s(map, "delay").and_then(|x| x.parse().ok()).unwrap_or(0),
+            due_at_ms: s(map, "delay").and_then(|x| x.parse().ok()).unwrap_or(0),
         },
         "progress" => Event::Progress {
             id,
@@ -1191,10 +2049,7 @@ fn parse_stream_entry(map: &std::collections::HashMap<String, redis::Value>) -> 
         "resumed" => Event::Resumed,
         "drained" => Event::Drained,
         "removed" => Event::Removed { id },
-        "duplicated" => Event::Duplicated {
-            id,
-            dedup_id: s(map, "dedupId").unwrap_or_default(),
-        },
+        "duplicated" => Event::Duplicated { id },
         "deduplicated" => Event::Deduplicated {
             id,
             dedup_id: s(map, "dedupId").unwrap_or_default(),
@@ -1203,5 +2058,115 @@ fn parse_stream_entry(map: &std::collections::HashMap<String, redis::Value>) -> 
             count: s(map, "count").and_then(|c| c.parse().ok()).unwrap_or(0),
         },
         _ => Event::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ScriptError;
+
+    #[test]
+    fn removal_json_matches_what_the_lua_prelude_parses() {
+        // oxnPolicyFromOpts in common.lua reads these exact shapes out of
+        // the job's stored opts; a serde change here would silently turn
+        // every stall-failure policy into "keep".
+        let j = |r: Removal| serde_json::to_value(r).unwrap();
+        assert_eq!(j(Removal::Keep), serde_json::json!("Keep"));
+        assert_eq!(j(Removal::Remove), serde_json::json!("Remove"));
+        assert_eq!(j(Removal::KeepLast(5)), serde_json::json!({"KeepLast": 5}));
+        assert_eq!(
+            j(Removal::KeepFor(Duration::from_millis(1500))),
+            serde_json::json!({"KeepFor": {"secs": 1, "nanos": 500_000_000}})
+        );
+    }
+
+    #[test]
+    fn glob_escape_neutralizes_metacharacters() {
+        assert_eq!(glob_escape("oxn:emails:"), "oxn:emails:");
+        assert_eq!(glob_escape("oxn:*:"), "oxn:\\*:");
+        assert_eq!(glob_escape("a?b[c]d\\e"), "a\\?b\\[c\\]d\\\\e");
+    }
+
+    #[test]
+    fn batch_size_matches_the_lua_prelude() {
+        let prelude = include_str!("lua/includes/common.lua");
+        assert!(
+            prelude.contains(&format!("local OXN_BATCH = {SCRIPT_BATCH}")),
+            "SCRIPT_BATCH and OXN_BATCH diverged"
+        );
+    }
+
+    #[test]
+    fn block_time_waits_for_the_next_due_job_but_never_forever() {
+        let s = Duration::from_secs;
+        let ms = Duration::from_millis;
+        assert_eq!(block_time(s(5), None), s(5));
+        assert_eq!(block_time(s(5), Some(ms(400))), ms(400));
+        assert_eq!(block_time(ms(50), Some(s(10))), ms(50));
+        // BZPOPMIN 0 = block forever: never send it.
+        assert_eq!(block_time(Duration::ZERO, None), MIN_BLOCK);
+        assert_eq!(block_time(s(5), Some(Duration::ZERO)), MIN_BLOCK);
+    }
+
+    #[test]
+    fn parse_fetched_shapes() {
+        use redis::Value;
+        assert!(matches!(
+            parse_fetched(Value::Array(vec![Value::BulkString(b"rl".to_vec()), Value::Int(420)]), "t").unwrap(),
+            Moved::RateLimited { retry_in } if retry_in == Duration::from_millis(420)
+        ));
+        assert!(matches!(
+            parse_fetched(Value::Array(vec![]), "t").unwrap(),
+            Moved::Empty { next_due: None }
+        ));
+        assert!(matches!(
+            parse_fetched(Value::Array(vec![Value::Int(250)]), "t").unwrap(),
+            Moved::Empty { next_due: Some(d) } if d == Duration::from_millis(250)
+        ));
+        let job = Value::Array(vec![
+            Value::BulkString(b"7".to_vec()),
+            Value::Array(vec![
+                Value::BulkString(b"name".to_vec()),
+                Value::BulkString(b"n".to_vec()),
+                Value::BulkString(b"attemptsMade".to_vec()),
+                Value::BulkString(b"2".to_vec()),
+            ]),
+        ]);
+        match parse_fetched(job, "tok").unwrap() {
+            Moved::Job(f) => {
+                assert_eq!(f.job.id.as_str(), "7");
+                assert_eq!(f.job.attempts_made, 2);
+                assert_eq!(f.token, "tok");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_job_maps_to_not_found_with_context() {
+        match script_error(-1, "retry", "emails", Some("42")) {
+            Error::NotFound(m) => assert_eq!(m, "job `42` in queue `emails`"),
+            e => panic!("unexpected {e:?}"),
+        }
+        assert!(
+            matches!(script_error(-1, "clean", "q", None), Error::NotFound(m) if m.contains("clean"))
+        );
+    }
+
+    #[test]
+    fn other_codes_map_to_script_errors() {
+        for (code, want) in [
+            (-2, ScriptError::LockNotFound),
+            (-3, ScriptError::NotInExpectedState),
+            (-6, ScriptError::LockMismatch),
+            (-7, ScriptError::JobLocked),
+            (-99, ScriptError::Unknown(-99)),
+        ] {
+            match script_error(code, "s", "q", Some("1")) {
+                Error::Script(e) => assert_eq!(e, want, "code {code}"),
+                e => panic!("code {code}: unexpected {e:?}"),
+            }
+        }
     }
 }

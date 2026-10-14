@@ -25,10 +25,10 @@ pub mod axum;
 pub mod actix;
 
 #[cfg(feature = "dashboard-axum")]
-pub use self::axum::router as axum_router;
+pub use self::axum::{router as axum_router, router_with as axum_router_with};
 
 #[cfg(feature = "dashboard-actix")]
-pub use self::actix::scope as actix_scope;
+pub use self::actix::{scope as actix_scope, scope_with as actix_scope_with};
 
 use std::sync::Arc;
 

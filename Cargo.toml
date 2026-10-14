@@ -1,14 +1,36 @@
 [package]
 name = "oxn"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Redis-backed async job queue for Rust, with optional web dashboard."
+description = "Redis-backed async job queue for Rust: typed jobs, flows, distributed schedulers, rate limits, metrics, an HTTP API and a web dashboard."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/monzeromer-lab/oxn"
 readme = "README.md"
 keywords = ["queue", "redis", "jobs", "async", "tokio"]
 categories = ["asynchronous", "database"]
+# The published crate: the library, its examples and docs. The workspace's
+# test kit, load harness, browser tests and scripts stay in the repo.
+include = [
+    "/src/**/*",
+    "/build.rs",
+    "/examples/**/*",
+    "/Cargo.toml",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+    "/docs/MIGRATION-0.3.md",
+]
+
+[workspace]
+members = [".", "testkit", "loadtest"]
+
+# Building this repo only — profiles in a library's manifest never apply to
+# crates that depend on it. Full debug info made every integration-test
+# binary ~140 MB; line tables keep file:line in backtraces at ~38 MB.
+[profile.dev]
+debug = "line-tables-only"
 
 [features]
 default = ["redis-backend"]
@@ -36,11 +58,18 @@ tls-native = [
 scheduler = ["dep:cron", "dep:chrono"]
 flow = []
 metrics = ["dep:metrics"]
+sentry = ["dep:sentry-core"]
 
-# Dashboards (mutually compatible, but most users will pick one)
-dashboard = []
-dashboard-axum = ["dashboard", "dep:axum", "dep:tower", "dep:tower-http"]
-dashboard-actix = ["dashboard", "dep:actix-web"]
+# HTTP API (`oxn::api`): the framework-neutral core, and its adapters.
+api = []
+api-axum = ["api", "dep:axum", "dep:tower", "dep:tower-http"]
+api-actix = ["api", "dep:actix-web"]
+
+# Dashboards: the API plus the bundled UI (mutually compatible, but most
+# users will pick one)
+dashboard = ["api"]
+dashboard-axum = ["dashboard", "api-axum"]
+dashboard-actix = ["dashboard", "api-actix"]
 
 # Convenience bundle
 full = [
@@ -97,6 +126,11 @@ chrono = { version = "0.4", optional = true, default-features = false, features 
 # Metrics
 metrics = { version = "0.24", optional = true }
 
+# Error tracking. `sentry-core` without its client: the app's own `sentry`
+# crate supplies the client, so the range lets Cargo reuse the app's version
+# (0.47+ needs Rust 1.88, above our MSRV, hence the upper bound).
+sentry-core = { version = ">=0.36, <0.47", optional = true, default-features = false, features = ["client"] }
+
 # Dashboard — axum
 axum = { version = "0.7", optional = true, default-features = false, features = [
     "tokio",
@@ -122,7 +156,10 @@ uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 tokio-util = "0.7"
 redis = { version = "0.27", default-features = false, features = ["tokio-comp"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+jsonschema = { version = "0.49", default-features = false }
+sentry = { version = ">=0.36, <0.47", default-features = false, features = ["test"] }
+oxn-testkit = { path = "testkit" }
 
 [[example]]
 name = "basic"
@@ -133,6 +170,36 @@ required-features = ["redis-backend"]
 name = "delayed"
 path = "examples/delayed.rs"
 required-features = ["redis-backend"]
+
+[[example]]
+name = "api_axum"
+path = "examples/api_axum.rs"
+required-features = ["redis-backend", "api-axum"]
+
+[[example]]
+name = "api_actix"
+path = "examples/api_actix.rs"
+required-features = ["redis-backend", "api-actix"]
+
+[[example]]
+name = "flow"
+path = "examples/flow.rs"
+required-features = ["redis-backend", "flow"]
+
+[[example]]
+name = "graceful_shutdown"
+path = "examples/graceful_shutdown.rs"
+required-features = ["redis-backend"]
+
+[[example]]
+name = "rate_limit"
+path = "examples/rate_limit.rs"
+required-features = ["redis-backend"]
+
+[[example]]
+name = "e2e_dashboard"
+path = "examples/e2e_dashboard.rs"
+required-features = ["redis-backend", "dashboard-axum", "flow", "scheduler"]
 
 [[example]]
 name = "dashboard_axum"

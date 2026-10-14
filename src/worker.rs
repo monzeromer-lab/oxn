@@ -11,26 +11,154 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::future::BoxFuture;
 use futures::FutureExt;
-use serde::de::DeserializeOwned;
+use futures::future::BoxFuture;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use uuid::Uuid;
 
-use crate::backend::{Backend, Fetched};
+use crate::backend::{Backend, Failure, Fetched};
 use crate::error::{Error, Result};
 use crate::job::Job;
 use crate::options::WorkerOptions;
-use crate::queue::{decode_job, Queue};
+use crate::queue::{Queue, decode_job};
+use crate::report::{FailureKind, JobFailure, JobInfo, ReportConfig, Reporter};
 
 /// Boxed future returned by a handler.
 pub type HandlerFuture<R> = Pin<Box<dyn Future<Output = Result<R>> + Send + 'static>>;
 
-type HandlerFn<D, R> = Arc<
-    dyn Fn(Job<D>) -> HandlerFuture<R> + Send + Sync + 'static,
->;
+type HandlerFn<D, R> = Arc<dyn Fn(Job<D>, JobContext) -> HandlerFuture<R> + Send + Sync + 'static>;
+
+/// Per-job handle given to handlers built with [`Worker::builder_with_ctx`].
+///
+/// Cheap to clone. Lets a handler report progress, write log lines, learn
+/// that its lock was lost (another worker or the stalled scanner now owns
+/// the job, so its result will be discarded), and wind down cooperatively
+/// when the worker is shutting down.
+#[derive(Clone)]
+pub struct JobContext {
+    inner: Arc<CtxInner>,
+}
+
+struct CtxInner {
+    backend: Arc<dyn Backend>,
+    queue: String,
+    id: crate::job::JobId,
+    attempt: u32,
+    lock_lost: CancellationToken,
+    shutdown: CancellationToken,
+}
+
+impl std::fmt::Debug for JobContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobContext")
+            .field("queue", &self.inner.queue)
+            .field("job_id", &self.inner.id)
+            .field("attempt", &self.inner.attempt)
+            .field("lock_lost", &self.lock_lost())
+            .field("shutdown_requested", &self.shutdown_requested())
+            .finish()
+    }
+}
+
+impl JobContext {
+    /// The job's id.
+    pub fn job_id(&self) -> &crate::job::JobId {
+        &self.inner.id
+    }
+
+    /// The queue the job belongs to.
+    pub fn queue(&self) -> &str {
+        &self.inner.queue
+    }
+
+    /// Which attempt this is (1-based; postponements and stalls don't
+    /// count).
+    pub fn attempt(&self) -> u32 {
+        self.inner.attempt
+    }
+
+    /// Record progress (a percentage via `u8`/`f64`, or any
+    /// [`crate::Progress`]); emits a `progress` event.
+    pub async fn progress(&self, progress: impl Into<crate::Progress>) -> Result<()> {
+        let json = serde_json::to_string(&progress.into())?;
+        self.inner
+            .backend
+            .update_progress(&self.inner.queue, &self.inner.id, &json)
+            .await
+    }
+
+    /// Append a line to the job's log (shown in the dashboard).
+    pub async fn log(&self, line: impl AsRef<str>) -> Result<()> {
+        self.inner
+            .backend
+            .log(&self.inner.queue, &self.inner.id, line.as_ref())
+            .await
+    }
+
+    /// `true` once a lock renewal found the lock gone or held by another
+    /// token: this worker no longer owns the job and its outcome will be
+    /// discarded. Stop expensive work.
+    pub fn lock_lost(&self) -> bool {
+        self.inner.lock_lost.is_cancelled()
+    }
+
+    /// Resolves when [`Self::lock_lost`] becomes true.
+    pub async fn lock_lost_signal(&self) {
+        self.inner.lock_lost.cancelled().await;
+    }
+
+    /// `true` once the worker was asked to shut down. The handler may keep
+    /// going until `shutdown_timeout`, but should checkpoint and return.
+    pub fn shutdown_requested(&self) -> bool {
+        self.inner.shutdown.is_cancelled()
+    }
+
+    /// Resolves when [`Self::shutdown_requested`] becomes true.
+    pub async fn cancelled(&self) {
+        self.inner.shutdown.cancelled().await;
+    }
+
+    /// This job as a [`JobRef`](crate::JobRef) — the parent to pass to
+    /// `FlowProducer::add_under` when adding children at run time.
+    pub fn as_parent(&self) -> crate::job::JobRef {
+        crate::job::JobRef::new(self.inner.queue.clone(), self.inner.id.clone())
+    }
+
+    /// This job's children by outcome (pending, completed with return
+    /// values, ignored failures). Empty for a job without children.
+    pub async fn dependencies(&self) -> Result<crate::backend::Dependencies> {
+        self.inner
+            .backend
+            .dependencies(&self.inner.queue, &self.inner.id)
+            .await
+    }
+
+    /// The return values of this job's completed children, decoded as `T`
+    /// (use `serde_json::Value` for children of mixed types).
+    pub async fn children_values<T: DeserializeOwned>(
+        &self,
+    ) -> Result<Vec<(crate::job::JobRef, T)>> {
+        self.dependencies()
+            .await?
+            .processed
+            .into_iter()
+            .map(|(child, json)| Ok((child, serde_json::from_str(&json)?)))
+            .collect()
+    }
+}
+
+/// The two shutdown signals a running job observes.
+#[derive(Clone)]
+struct Signals {
+    /// Worker cancellation: stop fetching, tell handlers to wind down.
+    shutdown: CancellationToken,
+    /// `shutdown_timeout` elapsed: drop handlers and release their jobs.
+    abort: CancellationToken,
+}
 
 /// A worker polling a queue and dispatching jobs to a handler.
 pub struct Worker<D, R = ()>
@@ -44,6 +172,7 @@ where
     opts: WorkerOptions,
     handler: HandlerFn<D, R>,
     cancel: CancellationToken,
+    report: ReportConfig,
     _data: PhantomData<fn() -> (D, R)>,
 }
 
@@ -95,7 +224,36 @@ where
         F: Fn(Job<D>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<R>> + Send + 'static,
     {
-        WorkerBuilder::new(queue, handler)
+        WorkerBuilder::from_handler(Arc::new(move |job, _ctx| handler(job).boxed()), queue)
+    }
+
+    /// Like [`Self::builder`], but the handler also receives a
+    /// [`JobContext`] for progress, logs, lost-lock and shutdown signals.
+    ///
+    /// ```no_run
+    /// # use oxn::{Queue, Worker, Job, Error};
+    /// # use oxn::worker::JobContext;
+    /// # async fn demo(queue: Queue<String>) -> oxn::Result<()> {
+    /// let worker = Worker::builder_with_ctx(queue, |job: Job<String>, ctx: JobContext| async move {
+    ///     ctx.log(format!("processing {}", job.data)).await?;
+    ///     for pct in [25u8, 50, 75, 100] {
+    ///         if ctx.shutdown_requested() || ctx.lock_lost() {
+    ///             break; // checkpoint and return early
+    ///         }
+    ///         ctx.progress(pct).await?;
+    ///     }
+    ///     Ok::<_, Error>(())
+    /// })
+    /// .build();
+    /// worker.run().await
+    /// # }
+    /// ```
+    pub fn builder_with_ctx<F, Fut>(queue: Queue<D>, handler: F) -> WorkerBuilder<D, R>
+    where
+        F: Fn(Job<D>, JobContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R>> + Send + 'static,
+    {
+        WorkerBuilder::from_handler(Arc::new(move |job, ctx| handler(job, ctx).boxed()), queue)
     }
 
     /// Worker id, used as the prefix for lock tokens.
@@ -109,11 +267,16 @@ where
         self.cancel.clone()
     }
 
-    /// Drive the worker until its [`CancellationToken`] fires.
+    /// Drive the worker until its [`CancellationToken`] fires, then shut
+    /// down gracefully.
     ///
-    /// This future completes once the cancel token has been triggered **and**
-    /// in-flight jobs have either finished or exceeded
-    /// [`WorkerOptions::shutdown_timeout`].
+    /// When the token fires the worker stops taking new jobs (an idle
+    /// worker stops waiting immediately) and lets running handlers finish,
+    /// renewing their locks, for up to [`WorkerOptions::shutdown_timeout`].
+    /// Handlers still running after that are dropped and their jobs are
+    /// **released** back to the queue — attempt refunded, priority and
+    /// pause state respected — rather than failed. The stalled-job scanner
+    /// is stopped and joined before this future resolves.
     ///
     /// # Examples
     ///
@@ -144,19 +307,27 @@ where
             opts,
             handler,
             cancel,
+            report,
             _data,
         } = self;
+        crate::telemetry::describe();
+        let reporter = Arc::new(Reporter::new(report));
 
         let semaphore = Arc::new(Semaphore::new(opts.concurrency));
         let token_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // `cancel` (the caller's token) means "stop taking new jobs".
+        // `abort` means "stop running handlers"; it only fires once
+        // `shutdown_timeout` has elapsed with handlers still running.
+        let abort = CancellationToken::new();
 
         // Stalled-job scanner.
-        if opts.run_stalled_scanner {
+        let scanner = opts.run_stalled_scanner.then(|| {
             let backend = backend.clone();
             let queue = queue.clone();
             let interval = opts.stalled_interval;
             let max_stalled = opts.max_stalled;
             let c = cancel.clone();
+            let reporter = reporter.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -164,79 +335,156 @@ where
                     tokio::select! {
                         _ = c.cancelled() => break,
                         _ = tick.tick() => {
-                            if let Err(e) = backend.scan_stalled(&queue, max_stalled).await {
-                                tracing::warn!(queue = %queue, error = %e, "stalled scan failed");
+                            match backend.scan_stalled(&queue, max_stalled).await {
+                                Ok(scan) => {
+                                    crate::telemetry::stalled(&queue, scan.len());
+                                    for job in &scan.failed {
+                                        reporter.stalled(&queue, job);
+                                    }
+                                }
+                                Err(e) => tracing::warn!(queue = %queue, error = %e, "stalled scan failed"),
                             }
                         }
                     }
                 }
-            });
-        }
+            })
+        });
 
         // Main fetch loop.
         'main: loop {
-            tokio::select! {
+            let permit = tokio::select! {
                 _ = cancel.cancelled() => break 'main,
-                permit = semaphore.clone().acquire_owned() => {
-                    let permit = match permit {
-                        Ok(p) => p,
-                        Err(_) => break 'main,
+                permit = semaphore.clone().acquire_owned() => match permit {
+                    Ok(p) => p,
+                    Err(_) => break 'main,
+                },
+            };
+            let token = format!(
+                "{}:{}",
+                id,
+                token_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            let fetch_span = tracing::debug_span!(
+                "oxn.fetch",
+                queue = %queue,
+                worker = %id,
+                token = %token,
+                job_id = tracing::field::Empty,
+                outcome = tracing::field::Empty,
+            );
+            // Not raced against `cancel`: the backend honors it only while
+            // waiting, so a job it already took is never dropped on the
+            // floor (it would stay locked until the stalled scanner).
+            let fetched = backend
+                .fetch_next(
+                    &queue,
+                    &token,
+                    opts.lock_duration,
+                    opts.drain_delay,
+                    &cancel,
+                    opts.rate_limit,
+                )
+                .instrument(fetch_span.clone())
+                .await;
+            match fetched {
+                Ok(Some(Fetched { job: raw, token })) if cancel.is_cancelled() => {
+                    // Shutdown began while this fetch was taking the job:
+                    // give it back untouched rather than start new work.
+                    fetch_span.record("job_id", raw.id.as_str());
+                    fetch_span.record("outcome", "released-on-shutdown");
+                    let r = backend.release(&queue, &raw.id, &token).await;
+                    log_transition(&queue, "released", &r);
+                    drop(permit);
+                    break 'main;
+                }
+                Ok(Some(Fetched { job: raw, token })) => {
+                    fetch_span.record("job_id", raw.id.as_str());
+                    fetch_span.record("outcome", "job");
+                    let backend = backend.clone();
+                    let queue = queue.clone();
+                    let handler = handler.clone();
+                    let opts = opts.clone();
+                    let reporter = reporter.clone();
+                    let signals = Signals {
+                        shutdown: cancel.clone(),
+                        abort: abort.clone(),
                     };
-                    let token = format!(
-                        "{}:{}",
-                        id,
-                        token_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    tokio::spawn(async move {
+                        process_one::<D, R>(
+                            backend, queue, raw, token, handler, opts, signals, reporter,
+                        )
+                        .await;
+                        drop(permit);
+                    });
+                }
+                Ok(None) => {
+                    fetch_span.record(
+                        "outcome",
+                        if cancel.is_cancelled() {
+                            "cancelled"
+                        } else {
+                            "idle"
+                        },
                     );
-                    let fetched = tokio::select! {
-                        _ = cancel.cancelled() => { drop(permit); break 'main; }
-                        r = backend.fetch_next(&queue, &token, opts.lock_duration, opts.drain_delay) => r,
-                    };
-                    match fetched {
-                        Ok(Some(Fetched { job: raw, token })) => {
-                            let backend = backend.clone();
-                            let queue = queue.clone();
-                            let handler = handler.clone();
-                            let opts = opts.clone();
-                            let cancel = cancel.clone();
-                            tokio::spawn(async move {
-                                process_one::<D, R>(
-                                    backend,
-                                    queue,
-                                    raw,
-                                    token,
-                                    handler,
-                                    opts,
-                                    cancel,
-                                )
-                                .await;
-                                drop(permit);
-                            });
-                        }
-                        Ok(None) => {
-                            // Idle: drop permit, spin. BZPOPMIN already blocked inside fetch_next.
-                            drop(permit);
-                        }
-                        Err(e) => {
-                            tracing::warn!(queue = %queue, error = %e, "fetch_next failed");
-                            drop(permit);
-                            tokio::time::sleep(Duration::from_millis(250)).await;
-                        }
+                    drop(permit);
+                }
+                Err(e) => {
+                    fetch_span.record("outcome", "error");
+                    crate::telemetry::fetch_error(&queue);
+                    tracing::warn!(queue = %queue, worker = %id, error = %e, "fetch_next failed");
+                    drop(permit);
+                    tokio::select! {
+                        _ = cancel.cancelled() => break 'main,
+                        _ = tokio::time::sleep(Duration::from_millis(250)) => {}
                     }
                 }
             }
         }
 
-        // Graceful shutdown: wait for in-flight jobs up to the timeout by
-        // blocking on the semaphore reaching full capacity again.
-        let total = opts.concurrency;
-        let drain = async {
-            let _ = semaphore.acquire_many(total as u32).await;
-        };
-        let _ = tokio::time::timeout(opts.shutdown_timeout, drain).await;
+        // Graceful shutdown. Stop fetching (done), let in-flight handlers
+        // finish — their locks keep being renewed — for up to
+        // `shutdown_timeout`, then abort the rest. Aborted jobs are released
+        // back to the queue (attempt refunded), never failed.
+        let total = opts.concurrency as u32;
+        let in_flight = total as usize - semaphore.available_permits();
+        tracing::debug!(queue = %queue, worker = %id, in_flight, "oxn.shutdown: waiting for in-flight jobs");
+        let started = std::time::Instant::now();
+        let drained = tokio::time::timeout(opts.shutdown_timeout, semaphore.acquire_many(total))
+            .await
+            .is_ok();
+        let aborted = total as usize - semaphore.available_permits();
+        if !drained {
+            tracing::warn!(
+                queue = %queue,
+                worker = %id,
+                aborted,
+                "oxn.shutdown: shutdown_timeout elapsed; aborting and releasing remaining jobs"
+            );
+            abort.cancel();
+            // Releasing is a single short script per job; bound it anyway.
+            let _ = tokio::time::timeout(RELEASE_GRACE, semaphore.acquire_many(total)).await;
+        }
+        if let Some(scanner) = scanner {
+            let _ = scanner.await;
+        }
+        tracing::debug!(
+            queue = %queue,
+            worker = %id,
+            drained,
+            aborted = if drained { 0 } else { aborted },
+            still_running = total as usize - semaphore.available_permits(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "oxn.shutdown: done"
+        );
         Ok(())
     }
 }
 
+/// After aborting handlers at shutdown, how long to wait for their jobs to
+/// be released before `run()` returns anyway.
+const RELEASE_GRACE: Duration = Duration::from_secs(5);
+
+#[allow(clippy::too_many_arguments)]
 async fn process_one<D, R>(
     backend: Arc<dyn Backend>,
     queue: String,
@@ -244,7 +492,58 @@ async fn process_one<D, R>(
     token: String,
     handler: HandlerFn<D, R>,
     opts: WorkerOptions,
-    cancel: CancellationToken,
+    signals: Signals,
+    reporter: Arc<Reporter>,
+) where
+    D: DeserializeOwned + Send + Sync + 'static,
+    R: Serialize + Send + 'static,
+{
+    let span = tracing::debug_span!(
+        "oxn.process",
+        queue = %queue,
+        job_id = %raw.id,
+        attempt = raw.attempts_made,
+        attempts_total = raw.opts.attempts,
+        token = %token,
+        outcome = tracing::field::Empty,
+        transition = tracing::field::Empty,
+        elapsed_us = tracing::field::Empty,
+    );
+    let started = std::time::Instant::now();
+    let wait = (raw.attempts_made <= 1).then(|| {
+        let due = raw.timestamp_ms + raw.opts.delay.map_or(0, |d| d.as_millis() as i64);
+        Duration::from_millis((chrono_like_now_ms() - due).max(0) as u64)
+    });
+    crate::telemetry::started(&queue, wait);
+    let q = queue.clone();
+    process_one_inner(
+        backend,
+        queue,
+        raw,
+        token,
+        handler,
+        opts,
+        signals,
+        &reporter,
+        span.clone(),
+    )
+    .instrument(span.clone())
+    .await;
+    crate::telemetry::finished(&q);
+    span.record("elapsed_us", started.elapsed().as_micros() as u64);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_one_inner<D, R>(
+    backend: Arc<dyn Backend>,
+    queue: String,
+    raw: crate::backend::RawJob,
+    token: String,
+    handler: HandlerFn<D, R>,
+    opts: WorkerOptions,
+    signals: Signals,
+    reporter: &Reporter,
+    span: tracing::Span,
 ) where
     D: DeserializeOwned + Send + Sync + 'static,
     R: Serialize + Send + 'static,
@@ -258,19 +557,34 @@ async fn process_one<D, R>(
     // trip to re-read the job hash for them.
     let remove_on_complete = raw.opts.remove_on_complete;
     let remove_on_fail = raw.opts.remove_on_fail;
+    let name = raw.name.clone();
+    let report = reporter.job(JobInfo {
+        queue: &queue,
+        id: &id,
+        name: &name,
+        attempt: attempts_made,
+        attempts: attempts_total,
+    });
     let job: Job<D> = match decode_job::<D>(raw) {
         Ok(j) => j,
         Err(e) => {
-            let _ = backend
+            span.record("outcome", "decode-error");
+            span.record("transition", "failed");
+            tracing::warn!(error = %e, "payload decode failed");
+            let reason = format!("decode error: {e}");
+            let trace = format!("attempt {attempts_made}: {reason}");
+            let r = backend
                 .fail(
                     &queue,
                     &id,
                     &token,
-                    &format!("decode error: {e}"),
-                    None,
-                    remove_on_fail,
+                    Failure::new(&reason).removal(remove_on_fail).trace(&trace),
                 )
                 .await;
+            report.transition("failed", &r);
+            if r.is_ok() {
+                report.failed(FailureKind::Decode, &reason, Some(&e), None);
+            }
             return;
         }
     };
@@ -279,101 +593,250 @@ async fn process_one<D, R>(
     renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     renew.tick().await; // consume the zero-tick
 
-    let mut handler_fut: BoxFuture<'static, Result<R>> = (handler)(job).boxed();
+    let lock_lost = CancellationToken::new();
+    let ctx = JobContext {
+        inner: Arc::new(CtxInner {
+            backend: backend.clone(),
+            queue: queue.clone(),
+            id: id.clone(),
+            attempt: attempts_made,
+            lock_lost: lock_lost.clone(),
+            shutdown: signals.shutdown.clone(),
+        }),
+    };
+    let abort = signals.abort;
+    tracing::trace!("handler started");
+    let ran = std::time::Instant::now();
+    // A panic — while building the future or while polling it — becomes
+    // `Error::Panicked`, handled like any returned error. Uncaught, it would
+    // unwind this task and leave the job locked until its lock expired.
+    // Both run with the job's Sentry hub current (feature `sentry`).
+    let mut handler_fut: BoxFuture<'static, Result<R>> = match report.run_sync(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (handler)(job, ctx.clone())))
+    }) {
+        Ok(fut) => report.bind(
+            std::panic::AssertUnwindSafe(fut)
+                .catch_unwind()
+                .map(|r| r.unwrap_or_else(|p| Err(Error::Panicked(panic_message(p.as_ref())))))
+                .boxed(),
+        ),
+        Err(p) => {
+            let msg = panic_message(p.as_ref());
+            futures::future::ready(Err(Error::Panicked(msg))).boxed()
+        }
+    };
     let outcome: Result<R> = loop {
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => {
-                break Err(Error::Closed);
+            _ = abort.cancelled() => {
+                // shutdown_timeout elapsed: drop the handler and hand the
+                // job back. It did not fail; it was interrupted.
+                drop(handler_fut);
+                crate::telemetry::ran(&queue, "aborted", ran.elapsed());
+                span.record("outcome", "aborted");
+                span.record("transition", "released");
+                tracing::debug!("handler aborted by shutdown_timeout; releasing job");
+                let r = backend.release(&queue, &id, &token).await;
+                report.transition("released", &r);
+                return;
             }
-            _ = renew.tick() => {
-                if let Err(e) = backend.extend_lock(&queue, &id, &token, opts.lock_duration).await {
-                    tracing::warn!(job = %id, error = %e, "lock renew failed");
+            _ = renew.tick(), if !lock_lost.is_cancelled() => {
+                match backend.extend_lock(&queue, &id, &token, opts.lock_duration).await {
+                    Ok(()) => tracing::trace!("lock extended"),
+                    Err(e) if e.is_lock_lost() => {
+                        // Someone else owns the job now; renewing is pointless
+                        // and the handler should know its result won't count.
+                        tracing::warn!(job = %id, error = %e, "lock lost; signalling handler");
+                        lock_lost.cancel();
+                    }
+                    Err(e) => tracing::warn!(job = %id, error = %e, "lock renew failed"),
                 }
             }
             r = &mut handler_fut => break r,
         }
     };
+    crate::telemetry::ran(&queue, outcome_label(&outcome), ran.elapsed());
+    span.record("outcome", outcome_label(&outcome));
+    tracing::debug!(outcome = outcome_label(&outcome), "handler finished");
+    let trace = outcome
+        .as_ref()
+        .err()
+        .map(|e| failure_trace(attempts_made, e));
+    let trace = trace.as_deref();
 
     match outcome {
         Ok(ret) => {
             let json = serde_json::to_string(&ret).ok();
-            if let Err(e) = backend
+            span.record("transition", "completed");
+            let r = backend
                 .complete(&queue, &id, &token, json, remove_on_complete)
-                .await
-            {
-                tracing::error!(job = %id, error = %e, "complete failed");
-            }
-        }
-        Err(Error::Delayed { delay_ms }) => {
-            let retry_at = chrono_like_now_ms() + delay_ms as i64;
-            if let Err(e) = backend
-                .fail(
-                    &queue,
-                    &id,
-                    &token,
-                    "delayed by handler",
-                    Some(retry_at),
-                    remove_on_fail,
-                )
-                .await
-            {
-                tracing::error!(job = %id, error = %e, "delay requeue failed");
-            }
-        }
-        Err(Error::RateLimited { delay_ms }) => {
-            let retry_at = chrono_like_now_ms() + delay_ms as i64;
-            if let Err(e) = backend
-                .fail(
-                    &queue,
-                    &id,
-                    &token,
-                    "rate limited",
-                    Some(retry_at),
-                    remove_on_fail,
-                )
-                .await
-            {
-                tracing::error!(job = %id, error = %e, "rate-limit requeue failed");
-            }
-        }
-        Err(Error::Unrecoverable(msg)) => {
-            if let Err(e) = backend
-                .fail(&queue, &id, &token, &msg, None, remove_on_fail)
-                .await
-            {
-                tracing::error!(job = %id, error = %e, "fail permanent failed");
-            }
-        }
-        Err(err) => {
-            // `attempts_made` has already been incremented by `fetch_next`
-            // before the handler ran, so it counts the current attempt.
-            // We still have another attempt if `attempts_made < total`.
-            if attempts_made < attempts_total {
-                let delay = backoff
-                    .map(|b| b.compute(attempts_made))
-                    .unwrap_or(Duration::ZERO);
-                let retry_at = chrono_like_now_ms() + delay.as_millis() as i64;
-                if let Err(e) = backend
+                .await;
+            if matches!(
+                r,
+                Err(Error::Script(crate::error::ScriptError::PendingChildren))
+            ) {
+                // A parent can't complete before its children: the handler
+                // added children and returned Ok instead of WaitingChildren.
+                let reason = "handler returned Ok while child jobs are still pending \
+                              (return Error::WaitingChildren to wait for them)";
+                let trace = format!("attempt {attempts_made}: {reason}");
+                span.record("transition", "failed");
+                let r = backend
                     .fail(
                         &queue,
                         &id,
                         &token,
-                        &err.to_string(),
-                        Some(retry_at),
-                        remove_on_fail,
+                        Failure::new(reason).removal(remove_on_fail).trace(&trace),
                     )
-                    .await
-                {
-                    tracing::error!(job = %id, error = %e, "retry requeue failed");
+                    .await;
+                report.transition("failed", &r);
+                if r.is_ok() {
+                    report.failed(FailureKind::PendingChildren, reason, None, None);
                 }
-            } else if let Err(e) = backend
-                .fail(&queue, &id, &token, &err.to_string(), None, remove_on_fail)
-                .await
-            {
-                tracing::error!(job = %id, error = %e, "final fail failed");
+            } else {
+                report.transition("completed", &r);
             }
         }
+        // Park until the children added under this job resolve; the
+        // attempt is refunded.
+        Err(Error::WaitingChildren) => {
+            span.record("transition", "waiting-children");
+            let r = backend.wait_for_children(&queue, &id, &token).await;
+            report.transition("waiting-children", &r.map(|_| ()));
+        }
+        // Postponements, not failures: the attempt is refunded and no
+        // failedReason is recorded.
+        Err(Error::Delayed { delay_ms }) | Err(Error::RateLimited { delay_ms }) => {
+            let until = chrono_like_now_ms() + delay_ms as i64;
+            span.record("transition", "postponed");
+            let r = backend.delay(&queue, &id, &token, until).await;
+            report.transition("postponed", &r);
+        }
+        Err(err) => {
+            let kind = match &err {
+                Error::Unrecoverable(_) => FailureKind::Unrecoverable,
+                Error::Panicked(_) => FailureKind::Panicked,
+                _ => FailureKind::Error,
+            };
+            // An unrecoverable error stores its message alone as the reason.
+            let reason = match &err {
+                Error::Unrecoverable(msg) => msg.clone(),
+                other => other.to_string(),
+            };
+            // `attempts_made` has already been incremented by `fetch_next`
+            // before the handler ran, so it counts the current attempt.
+            // We still have another attempt if `attempts_made < total`.
+            let retry_at = (kind != FailureKind::Unrecoverable && attempts_made < attempts_total)
+                .then(|| {
+                    let delay = backoff
+                        .map(|b| b.compute(attempts_made))
+                        .unwrap_or(Duration::ZERO);
+                    tracing::debug!(backoff_ms = delay.as_millis() as u64, error = %err, "scheduling retry");
+                    chrono_like_now_ms() + delay.as_millis() as i64
+                });
+            let to = if retry_at.is_some() {
+                "retry-delayed"
+            } else {
+                "failed"
+            };
+            span.record("transition", to);
+            let r = backend
+                .fail(
+                    &queue,
+                    &id,
+                    &token,
+                    failure(&reason, retry_at, remove_on_fail, trace),
+                )
+                .await;
+            report.transition(to, &r);
+            if r.is_ok() {
+                report.failed(kind, &reason, Some(&err), retry_at);
+            }
+        }
+    }
+}
+
+/// The [`Failure`] for one attempt: retry at `retry_at` or fail for good.
+fn failure<'a>(
+    reason: &'a str,
+    retry_at: Option<i64>,
+    removal: crate::options::Removal,
+    trace: Option<&'a str>,
+) -> Failure<'a> {
+    let mut f = Failure::new(reason).removal(removal);
+    f.retry_at_ms = retry_at;
+    f.trace = trace;
+    f
+}
+
+/// Longest stack-trace entry stored for one attempt.
+const MAX_TRACE_BYTES: usize = 4096;
+
+/// `attempt N: <error>` plus one `  caused by: …` line per source, capped
+/// at [`MAX_TRACE_BYTES`].
+fn failure_trace(attempt: u32, err: &Error) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!("attempt {attempt}: {err}");
+    let mut src = std::error::Error::source(err);
+    // `Error::Handler` displays its inner error already; start below it.
+    if let (Error::Handler(_), Some(s)) = (err, src) {
+        src = s.source();
+    }
+    while let Some(s) = src {
+        let _ = write!(out, "\n  caused by: {s}");
+        src = s.source();
+    }
+    if out.len() > MAX_TRACE_BYTES {
+        let mut cut = MAX_TRACE_BYTES;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push('…');
+    }
+    out
+}
+
+/// The message a panic carried, as `panic!` formats it.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "(non-string panic payload)".to_string()
+    }
+}
+
+fn outcome_label<R>(r: &Result<R>) -> &'static str {
+    match r {
+        Err(Error::Panicked(_)) => "panicked",
+        Ok(_) => "ok",
+        Err(Error::Delayed { .. }) => "delayed",
+        Err(Error::RateLimited { .. }) => "rate-limited",
+        Err(Error::WaitingChildren) => "waiting-children",
+        Err(Error::Unrecoverable(_)) => "unrecoverable",
+        Err(Error::Closed) => "cancelled",
+        Err(_) => "error",
+    }
+}
+
+/// Report how the backend answered a state transition.
+///
+/// A lost lock is expected under contention (the stalled scanner or another
+/// worker took the job over) and is a warning: this worker's outcome is
+/// discarded and the job's new owner decides its fate. Anything else is an
+/// error — the outcome was not recorded and nobody else owns the job yet.
+pub(crate) fn log_transition(queue: &str, to: &'static str, r: &Result<()>) {
+    crate::telemetry::transition(queue, to, r);
+    match r {
+        Ok(()) => tracing::debug!(to, "transition applied"),
+        Err(e) if e.is_lock_lost() => tracing::warn!(
+            to,
+            error = %e,
+            "transition rejected: lock lost, outcome discarded (the job now belongs to another worker or the stalled scanner)"
+        ),
+        Err(e) => tracing::error!(to, error = %e, "transition rejected"),
     }
 }
 
@@ -395,6 +858,7 @@ where
     handler: HandlerFn<D, R>,
     cancel: Option<CancellationToken>,
     id: Option<String>,
+    report: ReportConfig,
 }
 
 impl<D, R> std::fmt::Debug for WorkerBuilder<D, R>
@@ -414,18 +878,14 @@ where
     D: Serialize + DeserializeOwned + Send + Sync + 'static,
     R: Serialize + Send + 'static,
 {
-    fn new<F, Fut>(queue: Queue<D>, handler: F) -> Self
-    where
-        F: Fn(Job<D>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<R>> + Send + 'static,
-    {
-        let handler: HandlerFn<D, R> = Arc::new(move |job| handler(job).boxed());
+    fn from_handler(handler: HandlerFn<D, R>, queue: Queue<D>) -> Self {
         Self {
             queue,
             opts: WorkerOptions::default(),
             handler,
             cancel: None,
             id: None,
+            report: ReportConfig::default(),
         }
     }
 
@@ -466,16 +926,24 @@ where
         self
     }
 
-    /// Maximum time a blocking fetch waits before it loops back to try
-    /// another non-blocking attempt. Lower values poll more often; higher
-    /// values reduce Redis chatter.
+    /// Longest an idle worker blocks waiting for work before re-checking.
+    ///
+    /// This is a safety net, not a polling interval: new, promoted,
+    /// retried and resumed jobs wake blocked workers immediately, and a
+    /// worker never blocks past the due time of the next delayed job.
+    /// Default 5s; `0` is treated as 1ms.
     #[must_use]
     pub fn drain_delay(mut self, d: Duration) -> Self {
         self.opts.drain_delay = d;
         self
     }
 
-    /// How many times a job may stall before it's force-failed.
+    /// How many times a job may stall (its lock lapsed: the worker died,
+    /// hung past `lock_duration`, or lost Redis) and still be retried. A
+    /// stalled job goes back to the head of its queue without using up one
+    /// of its `attempts`; one more stall than this fails it into `failed`
+    /// (reason "job stalled more than allowable limit", with its
+    /// `remove_on_fail` policy applied). Default 1.
     #[must_use]
     pub fn max_stalled(mut self, n: u32) -> Self {
         self.opts.max_stalled = n;
@@ -496,8 +964,9 @@ where
         self
     }
 
-    /// How long [`Worker::run`] waits for in-flight jobs to drain after
-    /// cancellation before returning.
+    /// How long [`Worker::run`] lets in-flight handlers finish after
+    /// cancellation; jobs still running then are released back to the
+    /// queue, not failed.
     #[must_use]
     pub fn shutdown_timeout(mut self, d: Duration) -> Self {
         self.opts.shutdown_timeout = d;
@@ -519,6 +988,35 @@ where
         self
     }
 
+    /// Call `hook` for every failed attempt, once Redis has recorded it:
+    /// with the job, the error, whether it will be retried. Use it to send
+    /// failures to an error tracker or a pager. Call it several times to add
+    /// several hooks.
+    ///
+    /// Hooks run on the worker's task, so they must not block: hand slow
+    /// work to a channel or a spawned task. A hook that panics is logged
+    /// and ignored. Postponements (`Error::Delayed`, `RateLimited`,
+    /// `WaitingChildren`) are not failures and are not reported. See
+    /// [`crate::report`].
+    #[must_use]
+    pub fn on_failure<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(&JobFailure<'_>) + Send + Sync + 'static,
+    {
+        self.report.hooks.push(Arc::new(hook));
+        self
+    }
+
+    /// What this worker reports to Sentry (feature `sentry`). Without this
+    /// call, [`SentryOptions::default`](crate::sentry::SentryOptions):
+    /// final failures and lost outcomes. See [`crate::sentry`].
+    #[cfg(feature = "sentry")]
+    #[must_use]
+    pub fn sentry(mut self, opts: crate::sentry::SentryOptions) -> Self {
+        self.report.sentry = opts;
+        self
+    }
+
     /// Build the worker. Does **not** start the loop — call [`Worker::run`].
     pub fn build(self) -> Worker<D, R> {
         Worker {
@@ -528,7 +1026,69 @@ where
             opts: self.opts,
             handler: self.handler,
             cancel: self.cancel.unwrap_or_default(),
+            report: self.report,
             _data: PhantomData,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panic_messages_are_extracted_like_panic_formats_them() {
+        let msg = |f: fn()| {
+            let p = std::panic::catch_unwind(f).unwrap_err();
+            panic_message(p.as_ref())
+        };
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // keep test output quiet
+        assert_eq!(msg(|| panic!("static")), "static");
+        assert_eq!(msg(|| panic!("formatted {}", 7)), "formatted 7");
+        assert_eq!(
+            msg(|| std::panic::panic_any(1u8)),
+            "(non-string panic payload)"
+        );
+        std::panic::set_hook(prev);
+        assert_eq!(
+            Error::Panicked("x".into()).to_string(),
+            "handler panicked: x"
+        );
+        assert_eq!(
+            outcome_label::<()>(&Err(Error::Panicked("x".into()))),
+            "panicked"
+        );
+    }
+
+    #[test]
+    fn failure_traces_follow_the_source_chain_and_are_bounded() {
+        #[derive(Debug)]
+        struct E(&'static str, Option<Box<E>>);
+        impl std::fmt::Display for E {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for E {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|e| e as _)
+            }
+        }
+        let err = Error::handler(E(
+            "outer",
+            Some(Box::new(E("middle", Some(Box::new(E("root", None)))))),
+        ));
+        assert_eq!(
+            failure_trace(2, &err),
+            "attempt 2: handler error: outer\n  caused by: middle\n  caused by: root"
+        );
+        assert_eq!(
+            failure_trace(1, &Error::unrecoverable("x")),
+            "attempt 1: unrecoverable: x"
+        );
+        let long = failure_trace(1, &Error::unrecoverable("é".repeat(5000)));
+        assert!(long.len() <= MAX_TRACE_BYTES + '…'.len_utf8());
+        assert!(long.ends_with('…'));
     }
 }

@@ -9,7 +9,7 @@
 //! `redis::Script::invoke_async` is lazy: on the first call it tries
 //! `EVALSHA`, gets `NOSCRIPT`, then runs `SCRIPT LOAD` and retries. Against
 //! a managed Redis sitting behind a TLS-terminating proxy
-//! (DigitalOcean Managed Redis, AWS ElastiCache Serverless, Upstash, …)
+//! (DigitalOcean Managed Redis, Upstash, Redis Cloud, …)
 //! that one-time `SCRIPT LOAD` round-trip can stall for **seconds** —
 //! enough to make the first `Queue::add()` of a fresh process visibly hang.
 //!
@@ -21,23 +21,45 @@ use redis::Script;
 
 use crate::error::Result;
 
-/// Source-of-truth array of every Lua script body we ship.
+/// Every script body is the helpers it uses from `includes/common.lua`
+/// (such as `oxnWake`) followed by the script itself — assembled by
+/// `build.rs`, which leaves out the helpers a script doesn't reference.
+macro_rules! script {
+    ($name:literal) => {
+        (
+            $name,
+            include_str!(concat!(env!("OUT_DIR"), "/lua/", $name, ".lua")),
+        )
+    };
+}
+
+/// Source-of-truth table of every Lua script we ship, as `(name, body)`.
 ///
 /// Indexes line up with the field declarations in [`Scripts`]. Anything
-/// added here must be added to `Scripts::new` in the same position.
-const ALL_SCRIPTS: &[&str] = &[
-    include_str!("lua/add_job.lua"),
-    include_str!("lua/move_to_active.lua"),
-    include_str!("lua/move_to_finished.lua"),
-    include_str!("lua/move_to_delayed.lua"),
-    include_str!("lua/extend_lock.lua"),
-    include_str!("lua/scan_stalled.lua"),
-    include_str!("lua/pause.lua"),
-    include_str!("lua/promote.lua"),
-    include_str!("lua/retry.lua"),
-    include_str!("lua/remove.lua"),
-    include_str!("lua/clean.lua"),
-    include_str!("lua/promote_all.lua"),
+/// added here must be added to `Scripts::new` in the same position. The
+/// name is what tracing spans and test tooling report instead of the SHA.
+pub(super) const ALL_SCRIPTS: &[(&str, &str)] = &[
+    script!("add_job"),
+    script!("move_to_active"),
+    script!("move_to_finished"),
+    script!("move_to_delayed"),
+    script!("extend_lock"),
+    script!("scan_stalled"),
+    script!("pause"),
+    script!("promote"),
+    script!("retry"),
+    script!("remove"),
+    script!("clean"),
+    script!("promote_all"),
+    script!("release"),
+    script!("drain"),
+    script!("obliterate_begin"),
+    script!("add_bulk"),
+    script!("job_update"),
+    script!("flow"),
+    script!("move_to_waiting_children"),
+    script!("schedule"),
+    script!("remove_scheduler"),
 ];
 
 pub(super) struct Scripts {
@@ -53,23 +75,42 @@ pub(super) struct Scripts {
     pub remove: Script,
     pub clean: Script,
     pub promote_all: Script,
+    pub release: Script,
+    pub drain: Script,
+    pub obliterate_begin: Script,
+    pub add_bulk: Script,
+    pub job_update: Script,
+    pub flow: Script,
+    pub move_to_waiting_children: Script,
+    pub schedule: Script,
+    pub remove_scheduler: Script,
 }
 
 impl Scripts {
     pub fn new() -> Self {
+        let s = |i: usize| Script::new(ALL_SCRIPTS[i].1);
         Self {
-            add_job: Script::new(ALL_SCRIPTS[0]),
-            move_to_active: Script::new(ALL_SCRIPTS[1]),
-            move_to_finished: Script::new(ALL_SCRIPTS[2]),
-            move_to_delayed: Script::new(ALL_SCRIPTS[3]),
-            extend_lock: Script::new(ALL_SCRIPTS[4]),
-            scan_stalled: Script::new(ALL_SCRIPTS[5]),
-            pause: Script::new(ALL_SCRIPTS[6]),
-            promote: Script::new(ALL_SCRIPTS[7]),
-            retry: Script::new(ALL_SCRIPTS[8]),
-            remove: Script::new(ALL_SCRIPTS[9]),
-            clean: Script::new(ALL_SCRIPTS[10]),
-            promote_all: Script::new(ALL_SCRIPTS[11]),
+            add_job: s(0),
+            move_to_active: s(1),
+            move_to_finished: s(2),
+            move_to_delayed: s(3),
+            extend_lock: s(4),
+            scan_stalled: s(5),
+            pause: s(6),
+            promote: s(7),
+            retry: s(8),
+            remove: s(9),
+            clean: s(10),
+            promote_all: s(11),
+            release: s(12),
+            drain: s(13),
+            obliterate_begin: s(14),
+            add_bulk: s(15),
+            job_update: s(16),
+            flow: s(17),
+            move_to_waiting_children: s(18),
+            schedule: s(19),
+            remove_scheduler: s(20),
         }
     }
 
@@ -82,7 +123,7 @@ impl Scripts {
     where
         C: redis::aio::ConnectionLike + Send,
     {
-        for body in ALL_SCRIPTS {
+        for (_, body) in ALL_SCRIPTS {
             let _: String = redis::cmd("SCRIPT")
                 .arg("LOAD")
                 .arg(*body)
@@ -90,5 +131,80 @@ impl Scripts {
                 .await?;
         }
         Ok(())
+    }
+}
+
+/// `(name, sha1)` for every embedded Lua script.
+///
+/// Lets tooling that watches Redis (`MONITOR`, slowlog, the test kit's
+/// command tap) translate `EVALSHA <sha>` back into a readable script name.
+pub fn script_hashes() -> Vec<(&'static str, String)> {
+    ALL_SCRIPTS
+        .iter()
+        .map(|(name, body)| (*name, Script::new(body).get_hash().to_string()))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_script_carries_the_common_prelude() {
+        for (name, body) in ALL_SCRIPTS {
+            assert!(
+                body.starts_with("-- common.lua"),
+                "{name} lacks the prelude"
+            );
+            assert!(
+                body.contains(&format!("-- {name}.lua")) || body.contains(&format!("-- {name}")),
+                "{name} body missing"
+            );
+        }
+    }
+
+    /// The build keeps only the helpers a script references: every
+    /// `oxn…` / `OXN_…` name a script uses must be defined in its body.
+    #[test]
+    fn every_helper_a_script_uses_is_defined_in_it() {
+        for (name, body) in ALL_SCRIPTS {
+            let words: std::collections::BTreeSet<&str> = body
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|w| {
+                    w.strip_prefix("oxn")
+                        .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_uppercase()))
+                        || w.starts_with("OXN_")
+                })
+                .collect();
+            for w in words {
+                let defined = body.contains(&format!("local function {w}("))
+                    || body.contains(&format!("local {w} ="));
+                assert!(defined, "{name} uses {w} without defining it");
+            }
+        }
+    }
+
+    #[test]
+    fn hot_path_scripts_carry_only_a_few_helpers() {
+        let count = |n: &str| {
+            let body = ALL_SCRIPTS.iter().find(|(x, _)| *x == n).unwrap().1;
+            body.matches("\nlocal function ").count()
+        };
+        // The whole prelude has ~22; the hot paths need a handful.
+        assert!(count("move_to_active") <= 6, "{}", count("move_to_active"));
+        assert!(count("add_job") <= 6, "{}", count("add_job"));
+    }
+
+    #[test]
+    fn script_names_are_unique_and_hashes_stable() {
+        let hashes = script_hashes();
+        assert_eq!(hashes.len(), ALL_SCRIPTS.len());
+        let mut names: Vec<_> = hashes.iter().map(|(n, _)| *n).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), ALL_SCRIPTS.len(), "duplicate script name");
+        for (_, sha) in &hashes {
+            assert_eq!(sha.len(), 40);
+        }
     }
 }

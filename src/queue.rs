@@ -8,8 +8,9 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
+use tracing::Instrument;
 
 use crate::backend::{Backend, JobInsert, JobRange, RawJob, StateCounts};
 use crate::error::{Error, Result};
@@ -75,17 +76,22 @@ where
     ///
     /// Use this when you want to share a single backend (and its pool)
     /// across multiple queues, or when plugging in a custom backend.
+    ///
+    /// Fails with [`Error::Config`] if `name` is not a valid queue name
+    /// (see [`crate::validate::queue_name`]).
     pub fn from_backend(
         name: impl Into<String>,
         backend: Arc<dyn Backend>,
         opts: QueueOptions,
-    ) -> Self {
-        Self {
-            name: name.into(),
+    ) -> Result<Self> {
+        let name = name.into();
+        crate::validate::queue_name(&name)?;
+        Ok(Self {
+            name,
             opts,
             backend,
             _data: PhantomData,
-        }
+        })
     }
 
     /// Name the queue was constructed with.
@@ -126,22 +132,24 @@ where
     /// # Ok(()) }
     /// ```
     pub async fn add(&self, data: D, opts: JobOptions) -> Result<JobId> {
-        let opts = merge_opts(&self.opts.default_job_options, opts);
-        let insert = JobInsert {
-            name: opts
-                .name
-                .clone()
-                .unwrap_or_else(|| self.name.clone()),
-            data: serde_json::to_string(&data)?,
-            opts,
-            timestamp_ms: now_ms(),
-        };
-        self.backend.add(&self.name, insert).await
+        let insert = self.insert(&data, opts)?;
+        let span =
+            tracing::debug_span!("oxn.add", queue = %self.name, job_id = tracing::field::Empty);
+        let id = self
+            .backend
+            .add(&self.name, insert)
+            .instrument(span.clone())
+            .await?;
+        span.record("job_id", id.as_str());
+        crate::telemetry::added(&self.name, 1);
+        Ok(id)
     }
 
-    /// Bulk submission. For the Redis backend this is pipelined when the
-    /// backend provides a pipelined override; otherwise it falls back to
-    /// sequential `add`s.
+    /// Bulk submission. Every job is validated first; then the Redis
+    /// backend adds them with one script call per chunk of up to 1,000
+    /// jobs. Each chunk is applied without other clients interleaving
+    /// (Redis scripts are isolated, not rolled back); ids come back in
+    /// submission order. Other backends may fall back to sequential `add`s.
     ///
     /// # Examples
     ///
@@ -160,21 +168,46 @@ where
     pub async fn add_bulk(&self, jobs: Vec<(D, JobOptions)>) -> Result<Vec<JobId>> {
         let inserts = jobs
             .into_iter()
-            .map(|(d, opts)| {
-                let opts = merge_opts(&self.opts.default_job_options, opts);
-                let name = opts
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| self.name.clone());
-                Ok(JobInsert {
-                    name,
-                    data: serde_json::to_string(&d)?,
-                    opts,
-                    timestamp_ms: now_ms(),
-                })
-            })
+            .map(|(d, opts)| self.insert(&d, opts))
             .collect::<Result<Vec<_>>>()?;
-        self.backend.add_bulk(&self.name, inserts).await
+        let ids = self.backend.add_bulk(&self.name, inserts).await?;
+        crate::telemetry::added(&self.name, ids.len());
+        Ok(ids)
+    }
+
+    /// A job as it is submitted: options merged with the queue's defaults
+    /// and validated, payload encoded, timestamped now.
+    pub(crate) fn insert(&self, data: &D, opts: JobOptions) -> Result<JobInsert> {
+        let opts = opts.resolve_with(&self.opts.default_job_options);
+        if let Some(id) = &opts.id {
+            crate::validate::job_id(id)?;
+        }
+        Ok(JobInsert {
+            name: opts.name.clone().unwrap_or_else(|| self.name.clone()),
+            data: serde_json::to_string(data)?,
+            opts,
+            timestamp_ms: now_ms(),
+        })
+    }
+
+    /// The job schedulers registered on this queue (see
+    /// `scheduler::JobScheduler`), with the fire time of each one's next
+    /// tick.
+    pub async fn schedulers(&self) -> Result<Vec<crate::backend::SchedulerInfo>> {
+        self.backend.schedulers(&self.name).await
+    }
+
+    /// Remove a scheduler and its pending tick. Every running instance of
+    /// it stops at its next tick. Returns whether it existed.
+    pub async fn remove_scheduler(&self, id: &str) -> Result<bool> {
+        self.backend.remove_scheduler(&self.name, id).await
+    }
+
+    /// A flow parent's children by outcome: pending, completed (with their
+    /// return values) and ignored failures. Empty for a job without
+    /// children.
+    pub async fn dependencies(&self, id: &JobId) -> Result<crate::backend::Dependencies> {
+        self.backend.dependencies(&self.name, id).await
     }
 
     /// Stop accepting new active jobs; existing ones continue.
@@ -204,16 +237,25 @@ where
     }
 
     /// Promote a delayed job to `wait`.
+    ///
+    /// Errors with [`Error::NotFound`] for an unknown id and
+    /// [`Error::Script`]`(NotInExpectedState)` if the job isn't delayed.
     pub async fn promote(&self, id: &JobId) -> Result<()> {
         self.backend.promote(&self.name, id).await
     }
 
     /// Retry a failed job.
+    ///
+    /// Errors with [`Error::NotFound`] for an unknown id and
+    /// [`Error::Script`]`(NotInExpectedState)` if the job isn't failed.
     pub async fn retry(&self, id: &JobId) -> Result<()> {
         self.backend.retry(&self.name, id).await
     }
 
-    /// Remove a job.
+    /// Remove a job and everything attached to it.
+    ///
+    /// Errors with [`Error::NotFound`] for an unknown id and
+    /// [`Error::Script`]`(JobLocked)` while a worker is processing it.
     pub async fn remove(&self, id: &JobId) -> Result<()> {
         self.backend.remove(&self.name, id).await
     }
@@ -232,6 +274,11 @@ where
     }
 
     /// List jobs in a specific state. `range.end = -1` means "to the end".
+    ///
+    /// Ascending ranges are in processing order for `Waiting` / `Paused` /
+    /// `Active` (next job to run first) and ascending score for the zsets
+    /// (next due, highest priority, oldest finished first); set
+    /// `descending` for newest-first.
     pub async fn list(&self, state: JobState, range: JobRange) -> Result<Vec<Job<D>>> {
         let raw = self.backend.list(&self.name, state, range).await?;
         raw.into_iter().map(decode_job).collect()
@@ -240,25 +287,6 @@ where
     /// Attach a local event subscriber.
     pub fn events(&self) -> QueueEvents {
         QueueEvents::new(self.name.clone(), self.backend.clone())
-    }
-}
-
-pub(crate) fn merge_opts(default: &JobOptions, override_: JobOptions) -> JobOptions {
-    JobOptions {
-        id: override_.id.or_else(|| default.id.clone()),
-        name: override_.name.or_else(|| default.name.clone()),
-        delay: override_.delay.or(default.delay),
-        priority: if override_.priority != 0 {
-            override_.priority
-        } else {
-            default.priority
-        },
-        attempts: override_.attempts.max(1),
-        backoff: override_.backoff.or(default.backoff),
-        deduplication: override_.deduplication.or_else(|| default.deduplication.clone()),
-        remove_on_complete: override_.remove_on_complete,
-        remove_on_fail: override_.remove_on_fail,
-        lifo: override_.lifo,
     }
 }
 
@@ -295,8 +323,7 @@ where
         stacktrace: raw.stacktrace,
         progress,
         return_value,
-        #[cfg(feature = "flow")]
-        parent: None,
+        parent: raw.parent,
         lock_token: raw.lock_token,
     })
 }
@@ -382,7 +409,7 @@ where
     /// ```
     #[must_use]
     pub fn remove_on_complete(mut self, r: Removal) -> Self {
-        self.opts.default_job_options.remove_on_complete = r;
+        self.opts.default_job_options.remove_on_complete = Some(r);
         self
     }
 
@@ -390,7 +417,7 @@ where
     /// this queue when it fails permanently.
     #[must_use]
     pub fn remove_on_fail(mut self, r: Removal) -> Self {
-        self.opts.default_job_options.remove_on_fail = r;
+        self.opts.default_job_options.remove_on_fail = Some(r);
         self
     }
 
@@ -413,6 +440,7 @@ where
     /// Build the queue. Establishes the backend connection if needed.
     #[allow(clippy::redundant_closure_for_method_calls)]
     pub async fn build(self) -> Result<Queue<D>> {
+        crate::validate::queue_name(&self.name)?;
         let backend = match self.backend {
             Some(b) => b,
             None => {
@@ -435,51 +463,6 @@ where
                 }
             }
         };
-        Ok(Queue::from_backend(self.name, backend, self.opts))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::job::Backoff;
-    use std::time::Duration;
-
-    #[test]
-    fn merge_prefers_override_but_falls_back() {
-        let default = JobOptions::new()
-            .attempts(2)
-            .priority(1)
-            .backoff(Backoff::ONE_SECOND);
-        let merged = merge_opts(
-            &default,
-            JobOptions::new()
-                .id("abc")
-                .delay(Duration::from_millis(300))
-                .attempts(5),
-        );
-        assert_eq!(merged.id.as_deref(), Some("abc"));
-        assert_eq!(merged.attempts, 5);
-        assert_eq!(merged.delay, Some(Duration::from_millis(300)));
-        // override_ priority 0 should fall back to default's 1
-        assert_eq!(merged.priority, 1);
-        // backoff should inherit
-        assert!(merged.backoff.is_some());
-    }
-
-    #[test]
-    fn merge_respects_override_priority_when_nonzero() {
-        let default = JobOptions::new().priority(1);
-        let merged = merge_opts(&default, JobOptions::new().priority(9));
-        assert_eq!(merged.priority, 9);
-    }
-
-    #[test]
-    fn merge_inherits_dedup_when_override_is_none() {
-        let default =
-            JobOptions::new().deduplicate("abc", std::time::Duration::from_secs(10));
-        let merged = merge_opts(&default, JobOptions::new());
-        let d = merged.deduplication.unwrap();
-        assert_eq!(d.id, "abc");
+        Queue::from_backend(self.name, backend, self.opts)
     }
 }

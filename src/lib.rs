@@ -68,14 +68,21 @@
 //! Your handler returns `Result<R, Error>`. A few [`Error`] variants have
 //! special meaning when returned from a handler:
 //!
-//! | Return value                                 | Worker does                                     |
-//! | -------------------------------------------- | ----------------------------------------------- |
-//! | `Ok(value)`                                  | Mark job `completed`, record return value       |
-//! | `Err(Error::Delayed { delay_ms })`           | Move job to `delayed`, due at now + delay       |
-//! | `Err(Error::RateLimited { delay_ms })`       | Same as `Delayed`, but emitted as a rate event  |
-//! | `Err(Error::Unrecoverable(msg))`             | Skip retries, go straight to `failed`           |
-//! | `Err(other)` with attempts remaining         | Requeue to `delayed` using the configured `Backoff` |
-//! | `Err(other)` with no attempts remaining      | Move to `failed` with `reason = msg`            |
+//! | Return value                            | Worker does                                                   |
+//! | --------------------------------------- | ------------------------------------------------------------- |
+//! | `Ok(value)`                             | Mark job `completed`, record return value                     |
+//! | `Err(Error::Delayed { delay_ms })`      | Postpone: `delayed` until now + delay, attempt refunded       |
+//! | `Err(Error::RateLimited { delay_ms })`  | Same postponement, reported as `rate-limited` in metrics      |
+//! | `Err(Error::WaitingChildren)`           | Park in `waiting-children` until its children resolve, attempt refunded |
+//! | `Err(Error::Unrecoverable(msg))`        | Skip retries, go straight to `failed`                         |
+//! | `Err(other)` or a panic, attempts left  | Requeue to `delayed` using the configured `Backoff`           |
+//! | `Err(other)` or a panic, none left      | Move to `failed` with `reason = msg`                          |
+//!
+//! Postponements record no failure. For progress, logs, lock-loss and
+//! shutdown signals, build the worker with [`Worker::builder_with_ctx`] and
+//! use the [`JobContext`] it passes to the handler. To send failures to an
+//! error tracker, see [`report`] (any tracker, via
+//! `WorkerBuilder::on_failure`) and the `sentry` feature.
 //!
 //! ## Feature flags
 //!
@@ -86,20 +93,23 @@
 //! | `tls-native`       | `rediss://` URL support via native-tls (OpenSSL/SChannel).    |
 //! | `scheduler`        | `JobScheduler` — cron and fixed-interval repeats.             |
 //! | `flow`             | `FlowProducer` — parent/child DAGs.                           |
-//! | `metrics`          | Emits counters/histograms via the `metrics` crate.            |
-//! | `dashboard-axum`   | `dashboard::axum_router` — mount on any axum app.             |
+//! | `metrics`          | `oxn_*` counters/histograms via the `metrics` crate (`oxn::metrics`). |
+//! | `sentry`           | Job failures reported to Sentry, a Sentry scope per handler (`oxn::sentry`). |
+//! | `api-axum`         | `api::axum_router` — the `/v1` HTTP API on any axum app.      |
+//! | `api-actix`        | `api::actix_scope` — the same API on any actix-web app.       |
+//! | `dashboard-axum`   | `dashboard::axum_router` — the API plus the bundled UI.       |
 //! | `dashboard-actix`  | `dashboard::actix_scope` — mount on any actix-web app.        |
-//! | `full`             | All of the above (rustls TLS), with `dashboard-axum` selected.|
+//! | `full`             | All of the above except `sentry` (rustls TLS), with `dashboard-axum` selected.|
 //!
 //! ## TLS (managed Redis)
 //!
-//! Connecting to managed Redis services (DigitalOcean Managed Redis, AWS
-//! ElastiCache Serverless, Upstash, Redis Cloud, …) typically requires TLS
-//! and a `rediss://` URL. Enable the `tls` feature:
+//! Connecting to managed Redis services (DigitalOcean Managed Redis,
+//! Upstash, Redis Cloud, …) typically requires TLS and a `rediss://` URL.
+//! Enable the `tls` feature:
 //!
 //! ```toml
 //! [dependencies]
-//! oxn = { version = "0.2", features = ["tls"] }
+//! oxn = { version = "0.3", features = ["tls"] }
 //! ```
 //!
 //! Then build the queue exactly the same way:
@@ -121,22 +131,28 @@
 //!
 //! ```toml
 //! [dependencies]
-//! oxn = { version = "0.2", features = ["scheduler", "flow", "dashboard-axum"] }
+//! oxn = { version = "0.3", features = ["scheduler", "flow", "dashboard-axum"] }
 //! ```
 //!
 //! ## Recent releases
 //!
-//! - **0.2.2** — bulk dashboard ops: `Backend::clean(state, limit)` and
-//!   `Backend::promote_all` plus matching `POST /clean/{state}` and
-//!   `POST /promote-all` routes. State-aware buttons in the bundled UI.
-//!   Subscriber decodes `Event::Cleaned` (was silently ignored).
-//! - **0.2.1** — documentation refresh of the dashboard work. No code
-//!   changes.
-//! - **0.2.0** — job-detail drawer + per-job logs endpoint;
-//!   `QueueBuilder::remove_on_complete` / `remove_on_fail` shortcuts;
-//!   pool keepalive task to survive managed-Redis idle FINs;
-//!   `BZPOPMIN` moved to a regular pool slot to stop blocking-call
-//!   head-of-line starvation; honored `cfg.pool_size`.
+//! - **0.3.0** — correctness release: every bug from the 0.2.2 review
+//!   fixed (queue defaults, instant pickup, graceful shutdown, no leaked
+//!   keys, lossless events, stalled-job lifecycle, …); flows, schedulers,
+//!   rate limiting and metrics implemented for real; a [`JobContext`] for
+//!   handlers; failure reporting to Sentry or any error tracker; a standalone `/v1` HTTP API (`oxn::api`) with optional auth;
+//!   a redesigned, responsive dashboard. Breaking: see
+//!   `docs/MIGRATION-0.3.md`.
+//! - **0.2.2** — bulk dashboard ops (`clean`, `promote_all`).
+//! - **0.2.0 / 0.2.1** — job-detail drawer and logs endpoint; pool
+//!   keepalive; `BZPOPMIN` on a regular pool slot.
+//!
+//! ## Redis Cluster
+//!
+//! Not supported. Every key of a queue must live on one node: scripts touch
+//! several keys per call and flows span queues. Cluster-mode endpoints
+//! (Redis Cluster, ElastiCache Serverless, cluster-mode ElastiCache or
+//! MemoryDB) will not work; use a single, non-clustered primary.
 //!
 //! See `CHANGELOG.md` in the repo for the full per-version history.
 //!
@@ -168,6 +184,8 @@ pub mod events;
 pub mod job;
 pub mod options;
 pub mod queue;
+pub mod report;
+pub mod validate;
 pub mod worker;
 
 #[cfg(feature = "flow")]
@@ -178,21 +196,35 @@ pub mod flow;
 #[cfg_attr(docsrs, doc(cfg(feature = "scheduler")))]
 pub mod scheduler;
 
+#[cfg(feature = "api")]
+#[cfg_attr(docsrs, doc(cfg(feature = "api")))]
+pub mod api;
+
 #[cfg(feature = "dashboard")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dashboard")))]
 pub mod dashboard;
 
+#[cfg(feature = "metrics")]
+#[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
+pub mod metrics;
+
+#[cfg(feature = "sentry")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sentry")))]
+pub mod sentry;
+mod telemetry;
+
 pub mod prelude;
 
 pub use crate::error::{Error, Result};
-pub use crate::events::{Event, QueueEvents};
-pub use crate::job::{Backoff, Job, JobId, JobState, Progress};
-pub use crate::options::{JobOptions, QueueOptions, WorkerOptions};
+pub use crate::events::{Event, EventRecord, QueueEvents, StreamStart};
+pub use crate::job::{Backoff, Job, JobId, JobRef, JobState, Progress};
+pub use crate::options::{JobOptions, QueueOptions, ResolvedJobOptions, WorkerOptions};
 pub use crate::queue::Queue;
-pub use crate::worker::Worker;
+pub use crate::report::{FailureKind, JobFailure};
+pub use crate::worker::{JobContext, Worker};
 
 #[cfg(feature = "flow")]
-pub use crate::flow::{FlowNode, FlowProducer};
+pub use crate::flow::{FlowJob, FlowNode, FlowProducer, OnFailure};
 
 #[cfg(feature = "scheduler")]
 pub use crate::scheduler::{JobScheduler, RepeatOptions};

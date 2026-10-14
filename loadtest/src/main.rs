@@ -1,0 +1,187 @@
+//! `oxn-load` — load, soak and chaos harness for oxn.
+//!
+//! ```text
+//! scripts/test-redis.sh start                       # dedicated Redis on :6390
+//! cargo run -p oxn-load --release -- run --scenario smoke
+//! cargo run -p oxn-load --release -- run --scenario latency
+//! cargo run -p oxn-load --release -- run --scenario kill-worker
+//! cargo run -p oxn-load --release -- run --scenario throughput --jobs 200000
+//! cargo run -p oxn-load --release -- run --chaos "5s:script-flush,10s:client-kill=0.5"
+//! ```
+//!
+//! Every run prints a live per-second table, then verifies each job against
+//! its plan and writes `<target dir>/oxn-reports/load/<scenario>-<ts>.{md,json}`.
+//! The exit code is non-zero when anything is wrong, so a run doubles as a
+//! CI gate.
+
+mod api;
+mod chaos;
+mod config;
+mod flow;
+mod ledger;
+mod report;
+mod run;
+mod sched;
+mod stats;
+mod workload;
+
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "oxn-load", about = "Load, soak and chaos harness for oxn")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Run a scenario and write a report.
+    Run(Box<config::RunArgs>),
+    /// Flow fan-out: parents × children with per-flow verification.
+    Flow(Box<flow::FlowArgs>),
+    /// Many instances of many schedulers: one run per tick, no gaps.
+    Schedule(Box<sched::SchedArgs>),
+    /// Internal: the HTTP API server child (used by `--via-api`).
+    #[command(hide = true)]
+    ApiServe {
+        #[arg(long)]
+        redis: String,
+    },
+    /// Internal: a worker child process (used by `--processes true`).
+    #[command(hide = true)]
+    Worker {
+        #[arg(long)]
+        redis: String,
+        #[arg(long)]
+        queue: String,
+        #[arg(long)]
+        index: u32,
+        #[arg(long)]
+        concurrency: usize,
+        #[arg(long)]
+        lock_ms: u64,
+        #[arg(long)]
+        drain_delay_ms: Option<u64>,
+        #[arg(long, default_value_t = 200_000)]
+        max_stream_len: u64,
+        #[arg(long, default_value_t = 1)]
+        max_stalled: u32,
+        #[arg(long)]
+        ctx_ops: bool,
+        #[arg(long, value_parser = config::parse_rate_limit)]
+        rate_limit: Option<(u32, u64)>,
+    },
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Planned handler panics (`--panic-rate`) would flood stderr; oxn
+    // catches them and the ledger checks their outcome.
+    std::panic::set_hook(Box::new(|info| {
+        let msg = info.to_string();
+        if !msg.contains("planned panic") {
+            eprintln!("{msg}");
+        }
+    }));
+    if let Ok(f) = std::env::var("OXN_LOG") {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(f))
+            .with_writer(std::io::stderr)
+            .init();
+    }
+    match Cli::parse().cmd {
+        Cmd::Worker {
+            redis,
+            queue,
+            index,
+            concurrency,
+            lock_ms,
+            drain_delay_ms,
+            max_stream_len,
+            max_stalled,
+            ctx_ops,
+            rate_limit,
+        } => {
+            workload::MAX_STREAM_LEN.store(max_stream_len, std::sync::atomic::Ordering::Relaxed);
+            let spec = workload::WorkerSpec {
+                index,
+                concurrency,
+                lock_ms,
+                drain_delay_ms,
+                shutdown_timeout_ms: 10_000,
+                max_stalled,
+                ctx_ops,
+                rate_limit,
+            };
+            workload::child_worker_main(redis, queue, spec).await
+        }
+        Cmd::ApiServe { redis } => api::serve(redis).await,
+        Cmd::Schedule(args) => {
+            let o = sched::run(*args).await?;
+            let path = sched::write(&o)?;
+            println!();
+            println!(
+                "{} schedule — {} ticks, {} duplicate runs, {} missing, lateness p99 {:.1}ms",
+                if o.passed { "PASS" } else { "FAIL" },
+                o.ticks_run,
+                o.duplicate_runs,
+                o.missing_ticks,
+                o.lateness.p99_ms
+            );
+            for f in &o.failures {
+                println!("  - {f}");
+            }
+            println!("report: {}", path.display());
+            if !o.passed {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Cmd::Flow(args) => {
+            let outcome = flow::run(*args).await?;
+            let path = flow::write(&outcome)?;
+            let h = &outcome.release_latency;
+            println!();
+            println!(
+                "{} flow — {} flows, {:.0} handler runs/s, parent release p50 {:.1}ms p99 {:.1}ms",
+                if outcome.passed { "PASS" } else { "FAIL" },
+                outcome.args.flows,
+                outcome.jobs_per_s,
+                h.p50_ms,
+                h.p99_ms
+            );
+            for f in &outcome.failures {
+                println!("  - {f}");
+            }
+            println!("report: {}", path.display());
+            if !outcome.passed {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Cmd::Run(args) => {
+            let cfg = config::Config::resolve(&args)?;
+            let outcome = run::run(cfg).await?;
+            let path = report::write(&outcome)?;
+            println!();
+            println!(
+                "{} {} — {} jobs, {:.0} ok/s, pickup p50 {:.1}ms p99 {:.1}ms",
+                if outcome.passed { "PASS" } else { "FAIL" },
+                outcome.config.slug(),
+                outcome.added,
+                outcome.throughput_ok_per_s,
+                outcome.pickup.p50_ms,
+                outcome.pickup.p99_ms
+            );
+            for f in &outcome.failures {
+                println!("  - {f}");
+            }
+            println!("report: {}", path.display());
+            if !outcome.passed {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+    }
+}

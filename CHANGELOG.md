@@ -6,7 +6,442 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [SemVer](https://semver.org/) (pre-1.0: minor bumps
 may break public API, patch bumps are fixes/additions only).
 
-## [0.2.2] — Unreleased
+## [0.3.0] — Unreleased
+
+0.3.0 is a correctness release: every bug found in the 0.2.2 review is
+fixed with a regression test, and the repo gains `oxn-testkit` (step
+recorder + invariant checker) and `oxn-load` (load/soak/chaos harness).
+It contains breaking changes: **see [docs/MIGRATION-0.3.md](docs/MIGRATION-0.3.md)**
+for a checklist and before/after code.
+
+### Changed (breaking)
+
+- **Rejected operations now return errors (B1).** Lua scripts' negative
+  return codes used to be ignored everywhere except `extend_lock`, so
+  `retry`, `promote`, `remove`, `complete` and `fail` reported `Ok` even
+  when nothing happened. They now return:
+  - `Error::NotFound` — the job doesn't exist (`retry`, `promote`,
+    `remove`, and `complete`/`fail` when the job was deleted mid-flight);
+  - `Error::Script(NotInExpectedState)` — `retry` on a job that isn't
+    failed, `promote` on a job that isn't delayed;
+  - `Error::Script(LockMismatch | LockNotFound)` — `complete`/`fail`/
+    `extend_lock` with a token that no longer owns the job;
+  - `Error::Script(JobLocked)` (new, code `-7`) — `remove` on an active
+    job whose lock is held. It used to delete the job out from under the
+    worker processing it.
+- **Queue defaults are honored (B2).** `JobOptions` fields are now all
+  `Option`s: `None` means "use the queue's `default_job_options`, then the
+  built-in default". In 0.2, `attempts`, `remove_on_complete`,
+  `remove_on_fail` and `lifo` were always taken from the per-job options,
+  so `QueueBuilder::remove_on_complete(Removal::Remove)` and a default
+  `attempts(n)` had no effect on jobs added with `JobOptions::new()`. An
+  explicit value now always wins, even one equal to the built-in default
+  (`.priority(0)` overrides a queue default priority). `id` is never
+  inherited.
+  - New `ResolvedJobOptions` (the merged result) is what is stored and what
+    `Job::opts`, `RawJob::opts` and `JobInsert::opts` expose; its fields are
+    plain values (`attempts: u32`, …). Its JSON matches 0.2's `JobOptions`,
+    so existing job records keep loading.
+  - New `JobOptions::resolve_with(&defaults)` / `resolve()`.
+  - *Migration:* reading `opts.attempts` etc. off a `Job` is unchanged;
+    code that read fields off a `JobOptions` value it built must handle
+    `Option`s; code constructing `JobInsert` for a custom backend call
+    must resolve first (`opts.resolve()`).
+- **Queue names and explicit job ids are validated (B6).** Both become parts
+  of Redis keys, so a `:` in either, or a job id equal to a queue-level key
+  (`wait`, `meta`, `events`, …), silently aliased another key. Queue names
+  must be non-empty with no `:`, whitespace or control characters; explicit
+  job ids additionally must not be all digits (reserved for auto ids) or a
+  reserved key name. Violations return `Error::Config` before anything is
+  written. `Queue::from_backend` now returns `Result<Queue<D>>`.
+  Scheduler job ids change from `sched:{id}:{ts}` to `sched-{id}-{ts}`.
+- `Event::Duplicated` loses its meaningless `dedup_id` field: it is emitted
+  when an explicit job id already exists (see below), while
+  `Event::Deduplicated` covers dedup-id collisions.
+- **Events:** new `QueueEvents::records(StreamStart)` yields
+  `EventRecord { id, at_ms, event }` for resumable consumers
+  (`StreamStart::{Now, Beginning, After(id)}`). `Event::Delayed`'s
+  `delay_ms` (which always held an absolute timestamp) is renamed
+  `due_at_ms`; `Event::Waiting` gains `prev` (`Some("active")` for a job
+  released by a shutting-down worker).
+- **`Backend` trait (custom backends):** `fetch_next` takes a
+  `&CancellationToken` and must honor it only while *waiting* (B4); new
+  required method `release(queue, id, token)` hands an active job back
+  without an outcome (B4); `subscribe` takes a `StreamStart` and returns
+  `EventRecord`s (B8); new required `delay(queue, id, token, until_ms)`
+  for postponements (B9); `fail(queue, id, token, Failure)` takes a
+  `Failure { reason, retry_at_ms, removal, trace }` (builder:
+  `Failure::new(reason).retry_at(ms).removal(r).trace(t)`) (B12b);
+  `fetch_next` takes a trailing `Option<RateLimit>` (B12d); new
+  `add_flow`, `wait_for_children` and `dependencies` with default
+  implementations that refuse (B13); `schedule_tick`, `schedulers` and
+  `remove_scheduler` (B14); `scan_stalled` returns a `StalledScan`
+  (`requeued` ids and the `failed` jobs, with name and attempts) instead
+  of the requeued ids only.
+- Scheduler (B14): `RepeatOptions::Cron` is a struct variant
+  `{ expr, schedule }`; `every(d)` ticks are aligned to the Unix epoch
+  instead of `d` after each enqueue; `run` keeps the *next* tick queued
+  ahead instead of adding each tick when it fires.
+- Flows (B13): `FlowProducer::add` returns a `FlowJob` tree instead of the
+  root's `JobId`; `FlowNode` gains `on_failure`; `ParentRef` is now
+  `JobRef` (alias kept) and `Job::parent`, `Error::WaitingChildren` and
+  `Event::WaitingChildren` exist without the `flow` feature; `Queue::remove`
+  of a parent removes its children too.
+- Dashboard (axum and actix) maps `NotFound` → **404** and state/lock
+  conflicts → **409**, with `{"error": "..."}` bodies, instead of `204`.
+- New `Error::is_conflict()` and `Error::is_lock_lost()` helpers.
+
+### Fixed
+
+- `oxn_jobs_stalled_total` counted only the stalled jobs that were
+  requeued, although it was documented as "requeued or failed". It now
+  counts both.
+- **Workers pick up new work immediately (B3).** A worker that found the
+  queue empty blocked on `BZPOPMIN` for the whole `drain_delay` (5s by
+  default) and nothing woke it: plain and prioritized adds never touched
+  the marker, `resume`/stall requeue didn't either, a burst woke at most
+  one of several blocked workers, and a delayed job woke workers only for
+  them to sleep another full `drain_delay`. Under steady traffic this
+  capped throughput at one burst per `drain_delay` (baseline: pickup p50
+  4,047ms / p99 5,001ms). Now:
+  - every path that makes a job ready (add, prioritized add, promote,
+    promote-all, retry, resume, stall requeue, retry backoff) wakes a
+    worker, and `move_to_active` re-arms the marker while work remains,
+    so a burst cascades through every blocked worker;
+  - when nothing is ready, `move_to_active` returns how long until the
+    next delayed job is due and the worker blocks only that long;
+  - `drain_delay(0)` is clamped to 1ms instead of sending `BZPOPMIN 0`
+    (block forever).
+  After: pickup p50 1.7ms / p99 2.0ms on the same scenario.
+- **Graceful shutdown actually drains (B4).** Cancelling a worker used to
+  abort every running handler at once with `Error::Closed`, which went down
+  the normal failure path: the attempt was consumed and a job on its last
+  attempt was failed for good ("backend closed"); `run()` returned within
+  milliseconds whatever `shutdown_timeout` said. Now cancellation stops
+  fetching, handlers keep running (locks renewed) until `shutdown_timeout`,
+  and any still running are aborted and **released** back to the head of
+  their ready container with the attempt refunded (new `release.lua`,
+  emits `waiting` with `prev=active`). A job fetched while shutdown began
+  is released without running. An idle worker blocked in `BZPOPMIN` stops
+  immediately and its pool slot is detached instead of being returned with
+  a block still pending; the stalled scanner is joined before `run()`
+  returns.
+- `Backend::get_logs` ignored `JobRange::descending`: newest-first pages
+  returned the oldest lines (the dashboard's `desc` flag never worked).
+- **Faster hot-path scripts.** Redis runs a script's top level on every
+  `EVALSHA`, so each script re-created all ~22 shared helpers per call
+  (~3.5µs). A `build.rs` now gives each script only the helpers it uses.
+  `move_to_finished` no longer writes fields to a hash that `remove`
+  retention deletes right away, and deletions and requeues no longer
+  decode a job's options JSON to find a dedup pointer or its priority.
+  Hot-path script cost per job 87µs → 71µs; single-add throughput +12%
+  (see `docs/load-results/0.3.0.md`).
+- **A dropped connection no longer loses a job's outcome (B15).**
+  `complete` / `fail` / `delay` / `release` / `wait_for_children` failing
+  on a connection error were logged and never retried: if the call never
+  reached Redis the job stayed active until its lock expired and then ran
+  **again**; if Redis ran it but the reply was lost, the outcome was
+  reported as failed although it was recorded. These transitions now retry
+  connection-level failures (I/O, dropped or refused connection, timeout,
+  pool errors, `LOADING`) for up to `RedisConfig::transition_retry_for`
+  (default 30s, keep it ≤ `lock_duration`), and every lock-consuming
+  script is idempotent per lock token (`doneToken` in the job hash): a
+  retry of a transition that already applied succeeds without applying it
+  twice (attempt refunds and stack-trace entries happen once). A fetch
+  whose reply was lost is retried with the same token and hands back the
+  job it took, instead of leaving it locked until it stalls. New metric
+  `oxn_transition_retries_total{script}`. Under chaos (6 rounds of
+  `CLIENT KILL`, a Redis restart): 0 transition errors, 0 stalls, 0 lost
+  or duplicated jobs.
+- **Delayed jobs start on time on a quiet Redis (B3b).** A worker waiting
+  for a delayed job blocked in `BZPOPMIN` with a timeout of exactly the
+  time until it was due, but Redis fires blocking timeouts on its own
+  `hz` tick (every 100ms by default), so on an idle server delayed jobs
+  and scheduler ticks started 10–90ms late. The worker now also keeps a
+  local timer for the due time and wakes the queue itself (a `ZADD` on the
+  marker from a second pool slot) when it fires: 4–6ms. Schedulers now
+  enqueue the next tick halfway between ticks rather than at the instant
+  one fires, so many schedulers on one grid don't hit Redis exactly when
+  their ticks fall due (50 schedulers × 10 instances: tick lateness p50
+  20ms → 9ms).
+- **Schedulers are safe to run in every process (B14).** Each tick's job
+  id was the wall-clock time of the enqueue, so N processes running the
+  same `JobScheduler` added N jobs per tick (5 instances: 25 jobs for 5
+  ticks); `run` and `enqueue_next` disagreed (one added each tick when it
+  fired, the other one ahead) and intervals drifted per process. Now
+  every instance computes the same fire times — cron is absolute,
+  `every(d)` is aligned to the Unix epoch — tick `T` is the job
+  `sched-{id}-{T}`, and `schedule.lua` keeps each scheduler's latest tick
+  in `{prefix}:{queue}:schedulers`, so a tick is added once even after its
+  job was deleted by retention. The next tick is always queued ahead (it
+  fires if every scheduler process stops); a failed enqueue retries the
+  same tick. Schedulers are listed by `Queue::schedulers()` and removed by
+  `Queue::remove_scheduler` / `JobScheduler::remove`, which deletes every
+  pending tick and stops every running instance. Invalid scheduler ids and
+  zero intervals are refused.
+- **Flows work (B13).** `FlowProducer` added every node as an ordinary
+  job: the parent ran first, child names were mangled to
+  `name@child-of:…`, and nothing linked the jobs. Now `flow.lua` adds the
+  whole tree atomically (across queues of one prefix); a parent waits in
+  `waiting-children` until every child resolves, then becomes ready with
+  its priority, own delay and the pause state honored. Completed
+  children's return values are recorded with the parent
+  (`ctx.children_values()`, `ctx.dependencies()`, `Queue::dependencies`);
+  `Job::parent` is filled. A child's permanent failure (handler or stall
+  limit) keeps the parent waiting by default (retry the child to
+  continue), fails it with `fail_parent_on_failure()` (propagating up the
+  tree), or is skipped with `ignore_dependency_on_failure()`. Deleting a
+  pending child resolves the dependency; removing a parent removes its
+  whole tree (refused with `JobLocked` if any job in it is running).
+  Handlers can add children at run time (`FlowProducer::add_under`) and
+  return `Error::WaitingChildren` to run again after them (attempt
+  refunded); returning `Ok` with children pending fails the job with a
+  clear reason. An explicit id that exists rejects the whole flow
+  (`ScriptError::JobExists`, nothing written). Retrying a parent with
+  pending children puts it back in `waiting-children`.
+- **The `metrics` feature emits metrics (B12e).** It only pulled in the
+  `metrics` crate; nothing was ever recorded. New `oxn::metrics` module
+  documents the series and exports their names and `describe()`. All are
+  labelled `queue`: counters `oxn_jobs_{added,started,completed,failed,
+  retried,postponed,released,stalled}_total`, `oxn_lock_lost_total`,
+  `oxn_transition_errors_total{to}`, `oxn_fetch_errors_total`,
+  `oxn_rate_limited_total`; histograms `oxn_job_duration_seconds{outcome}`
+  and `oxn_job_wait_seconds`; gauge `oxn_jobs_active`. Transitions count
+  only once Redis accepted them (a refused completion counts as
+  `oxn_lock_lost_total`, never as completed). Without the feature the
+  emitters compile to nothing.
+- **`rate_limit(max, per)` limits (B12d).** It was stored and never
+  read. It is now a queue-wide fixed-window limit counted in Redis
+  (`{prefix}:{queue}:limiter`) inside `move_to_active`: at most `max` jobs
+  start per `per` across every worker that sets it (up to `2 × max` across
+  a window boundary). A limited worker sleeps until the window reopens —
+  shutdown interrupts the wait — instead of polling. Configure the same
+  limit on every worker of the queue; a worker without one is not limited.
+- **Handlers get a `JobContext` (B12c).** New
+  `Worker::builder_with_ctx(queue, |job, ctx| …)` (`builder` is
+  unchanged): `ctx.progress(p)` / `ctx.log(line)` report progress (with a
+  `progress` event) and log lines shown in the dashboard;
+  `ctx.lock_lost()` / `lock_lost_signal()` fire when lock renewal finds
+  another owner (renewal then stops; the result would be discarded);
+  `ctx.shutdown_requested()` / `cancelled()` fire as soon as the worker is
+  cancelled so long jobs can checkpoint before `shutdown_timeout`; plus
+  `job_id()`, `queue()`, `attempt()`.
+- `Backend::update_progress` / `log` refuse (`NotFound`) for a job that no
+  longer exists; a plain `HSET` / `RPUSH` used to re-create an orphan hash
+  or `:logs` key.
+- **Failed attempts leave a stack trace (B12b).** `Job::stacktrace` (and
+  the dashboard's "Stack trace" section) was never written. Each real
+  failure — returned error, panic, unrecoverable, decode error, stall
+  limit — now appends `attempt N: <error>` with one `caused by:` line per
+  `source()`, capped at 4KB per entry and the 10 most recent entries.
+  Postponements add nothing; a later success keeps the history; a manual
+  `retry` clears it.
+- **`add_bulk` is real (B12a).** The Redis backend had no override, so
+  `add_bulk` looped `add()`: one round trip and one script call per job,
+  interleavable with other clients (the docs promised a pipelined call).
+  It now sends one `add_bulk.lua` call per chunk of up to 1,000 jobs, each
+  chunk applied without interleaving; ids come back in submission order.
+  Single and bulk adds share one Lua implementation (`oxnAddJob`), so
+  every option (delay, priority, LIFO, explicit-id duplicates, dedup)
+  behaves identically. 200,000 jobs: ~0.06ms per job in bulks of 500 vs
+  0.61ms per single add.
+- **`obliterate` deletes exactly one queue, safely (B11).** It deleted
+  every key matching the unescaped glob `{prefix}:{queue}:*`; queue names
+  may contain `*`, `?` and `[`, so obliterating a queue named `x*`
+  deleted every queue starting with `x` (and `*` every queue under the
+  prefix). The pattern is now glob-escaped. The non-force "no active jobs"
+  check was a separate command from the deletion, so a worker could take
+  a job mid-delete and re-create part of it (keys survived in 3 of 3 stress
+  runs). New `obliterate_begin.lua` checks and pauses the queue in one
+  step; `meta` (holding the pause flag) is deleted last. A refused
+  obliterate changes nothing.
+- **Dashboard stored XSS closed (B10).** Queue names, job ids, job names,
+  failure reasons and state names were interpolated into `innerHTML` and
+  inline `onclick` handlers unescaped (and `escapeAttr` was used inside JS
+  string literals, where the browser decodes `&#39;` back to `'` before
+  the script runs). A failure reason such as `<img src=x onerror=…>` ran
+  script in an operator's browser, with access to every destructive POST
+  route. Every value is now escaped for its context: `esc()` for HTML,
+  `js()` (JSON + attribute escaping) for inline handlers,
+  `encodeURIComponent` for ids in URLs. Verified in a real browser with
+  hostile queue names, ids, names and failure reasons. A test fails on
+  any new raw `${…}` interpolation. (Queue-name validation alone is not
+  enough: `xss<img/src=x/onerror=…>` contains no whitespace or `:`.)
+- **The bundled UI works when nested (B17).** It computed its API base by
+  stripping the last path segment, so a dashboard mounted at `/admin` (as
+  the README shows) requested `/api/...` and could load nothing; it now
+  uses its own path as the base (`/admin`, `/admin/` → `/admin`; `/` →
+  ``). The API tests never loaded the page, which is why this survived.
+- The `dashboard_axum` example binds to `127.0.0.1` (it bound `0.0.0.0`,
+  exposing an unauthenticated admin UI) and reads `REDIS_URL` / `PORT` /
+  `BIND`.
+- **A panicking handler is a failure, not a stuck job (B16).** A panic
+  unwound the task processing the job: no outcome was recorded and the
+  job stayed locked in `active` until its lock expired (30s by default)
+  and the stalled scanner picked it up. The worker now catches panics
+  (while building or polling the handler's future) and handles them like
+  a returned error — retried or failed right away per the job's policy —
+  with failure reason `handler panicked: <message>`. New
+  `Error::Panicked(String)`.
+- **Priority and pause survive every path back to ready (B9).** Delayed
+  jobs coming due (including retry backoffs), `promote`, `promote_all` and
+  `retry` pushed jobs straight onto `wait`: a prioritized job lost its
+  priority and a paused queue received work. They now all go through the
+  same Lua helper as release and stall recovery. `promote_all` works in
+  batches of 1,000.
+- **`Error::Delayed` / `Error::RateLimited` are postponements (B9).** They
+  consumed one of the job's attempts and stamped `failedReason = "delayed
+  by handler"`; a job that postponed itself once lost a real retry. New
+  `Backend::delay` refunds the attempt and records no failure; the
+  `delayed` event carries `postponed=1`.
+- **`list()` order and cost (B9).** List-backed states (`wait`, `paused`,
+  `active`) came back newest-first while documented oldest-first;
+  ascending now means processing order (next to run first, LIFO jobs
+  included). `list()` used to re-derive each job's state with up to eight
+  commands per job; it now pipelines one `HGETALL` per job and takes the
+  state from the container it listed. `get()` finds the state in one
+  pipelined round trip.
+- **The event stream loses nothing (B8).** `QueueEvents::stream()` read
+  from `$` lazily on the first poll, so everything emitted between
+  `stream()` and that poll was lost (the 0.2 probe saw 0 of 40 events);
+  each `XREAD` kept only its first entry; every subscriber held a pool slot
+  blocked in `XREAD` (a pool of one was unusable with one subscriber); and
+  connection errors were retried in a tight loop. Now the cursor is pinned
+  when `stream()` returns, whole batches (500) are consumed per read, each
+  subscriber has its own connection (`CLIENT SETNAME oxn-events:{queue}`)
+  that reconnects with exponential backoff (100ms–5s) and resumes from the
+  same cursor, and dropping the stream closes the connection. Under
+  network and `CLIENT KILL` chaos the subscriber matched the raw stream
+  event-for-event.
+- **Stalled jobs follow a real lifecycle (B7).** A job that stalled more
+  than `max_stalled` times was removed from `active` but never added to
+  `failed`: it lived in no container, could not be listed or retried, and
+  its `remove_on_fail` policy never ran. Now it fails into `failed` with
+  `finishedOn`, reason "job stalled more than allowable limit", its own
+  retention applied, and a `failed` event carrying `attemptsMade` (plus a
+  `stalled` count). A requeued stalled job goes back to the head of its
+  ready container honoring priority and pause (it used to land in `wait`
+  regardless).
+- **A stall no longer uses up an attempt (B7, behaviour change).** Stalls
+  have their own budget (`max_stalled`); the interrupted attempt is
+  refunded, as BullMQ does. Before, whether a job got its full retry
+  budget depended on whether a stall happened before or after its real
+  failures.
+- **Re-adding an explicit job id is idempotent (B6).** It used to
+  overwrite the existing job's hash in place (keeping stale fields such as
+  the old return value) and push the id into `wait` again — a completed job
+  reappeared in two containers, and 20 concurrent adds of one id queued it
+  20 times. An existing id now returns the original job untouched and emits
+  `duplicated`; the id is reusable once its job is removed.
+- **Nothing leaks any more (B5).** Every deletion path now goes through one
+  Lua helper that removes a job's hash, every auxiliary key (`:lock`,
+  `:logs`, `:dependencies`, `:processed`, …) and its dedup pointer:
+  - `KeepLast(n)` / `KeepFor(d)` used to trim only the zset, leaving the
+    trimmed jobs' hashes forever (baseline: 3,877 orphaned hashes out of
+    5,000 jobs). Trims are capped at 1,000 jobs per finish, so switching a
+    huge set to a tight policy converges over a few finishes instead of
+    blocking Redis in one call.
+  - `Removal::Remove` now also deletes `:logs`.
+  - `drain()` deleted the lists but left every job hash; it now deletes
+    the jobs, works in batches of 1,000, and emits one `drained` event.
+  - `clean()` works in batches of 1,000 (no single huge script for
+    `limit = 0`) and emits one `cleaned` event with the total.
+  - A dedup pointer is cleared when its job is removed, so a later add with
+    the same dedup id creates a new job instead of returning a dead id.
+  - The `stalled` set was written and never read; it is no longer used.
+  - A job requeued by the stalled scanner no longer keeps the dead
+    worker's `lockToken`.
+  A 3-minute mixed-retention soak keeps keys and memory flat (memory growth
+  in long runs is the events stream filling up to `max_stream_length`).
+- The worker no longer logs "transition applied" when the backend
+  rejected the transition. A lost lock is logged as a warning ("lock
+  lost, outcome discarded"); any other rejection as an error.
+
+### Added
+
+- **Error tracking.** `WorkerBuilder::on_failure(|f: &JobFailure| …)`
+  reports every failed attempt once Redis has recorded it. A
+  `JobFailure` carries:
+  - the queue, job id and name;
+  - the attempt and the number of attempts allowed;
+  - a `FailureKind`: `Error`, `Panicked`, `Unrecoverable`, `Decode`,
+    `PendingChildren` or `Stalled`;
+  - the reason and the handler's error;
+  - when the job runs again (`None` means it failed for good).
+
+  Jobs that the stalled scanner fails are reported too. A hook that
+  panics is contained. The new **`sentry` feature** reports to the
+  application's Sentry client with no extra code:
+  - **Events:** a final failure is an `error` event whose exception chain
+    starts at the user's own error type. An outcome Redis never recorded is
+    an `error` event. Retries are optional `warning` events.
+  - **Tags and grouping:** events are tagged `oxn.queue`, `oxn.job_name`,
+    `oxn.failure` and `oxn.final`, carry an `oxn job` context, and are
+    grouped per queue and job name.
+  - **A scope per handler:** each handler runs in its own Sentry hub, so
+    its own reports and panics carry the job's tags without mixing between
+    concurrent jobs.
+  - **Versions:** oxn depends on `sentry-core` 0.36 up to, but not
+    including, 0.47 (tested at both ends). It warns when a worker starts
+    with no Sentry client bound, which also happens when Cargo resolved two
+    `sentry-core` copies.
+
+- **A redesigned, responsive dashboard.** Still one embedded HTML file
+  with no build step (~60 KB), mounted as before, now on the `/v1` API.
+  Phones get a queue sheet, scrollable state chips, job cards, a
+  full-screen job view and an Actions menu; tablets a slide-over queue
+  list; desktops a collapsible sidebar, sticky toolbar, dense table and a
+  side drawer. Columns follow the listed state (progress for active jobs,
+  duration for finished ones, the reason for failed ones). Live updates
+  over SSE (with bearer tokens; polling as a fallback), deep links in the
+  URL (back/forward work), job search by id, pagination, light/dark
+  theme, a flow tree, a schedulers tab, confirmations for destructive
+  actions (deleting a queue means typing its name), toasts, and loading /
+  empty / error states. Admin actions appear only when `GET /v1/whoami`
+  (new) says the viewer may use them; a token dialog appears when the API
+  asks for one. Keyboard: `/` open a job by id, `j`/`k` move, Enter
+  open, Esc close; dialogs and the drawer trap focus. No HTML is ever
+  built from strings: every value is set with `textContent` (a test
+  forbids `innerHTML` and its relatives in the page). Tested with
+  Playwright at 375 / 768 / 1280 px against a fixture server
+  (`examples/e2e_dashboard.rs`): every action, hostile payloads in names,
+  data, failure reasons and logs, read-only and token modes, live
+  updates, deep links, keyboard, no sideways scrolling, and axe
+  accessibility scans in light and dark themes (which caught a
+  low-contrast count in the sidebar).
+- **A standalone HTTP API (`oxn::api`, features `api-axum` / `api-actix`).**
+  Everything the dashboard does, versioned under `/v1`: queues, counts,
+  pause/resume/drain/clean/promote-all/obliterate; add and bulk-add jobs
+  (JSON options mapped onto `JobOptions`, validated, unknown fields
+  refused); paginated listing with `total`; a job, its logs, its flow tree;
+  retry/promote/remove; schedulers; live events as server-sent events that
+  resume from `Last-Event-ID`; `/v1/health`; an OpenAPI 3.1 description at
+  `/v1/openapi.json`. One framework-neutral core (`Api::handle`) behind thin
+  axum and actix adapters, so both behave identically. The routers are
+  plain (`.layer` / `.wrap` middleware works); built-in auth is optional:
+  `Auth::Bearer` (read/admin tokens, constant-time), `Auth::Custom`, or
+  `read_only`. Errors are `{"error":{"code","message"}}` with 400/401/403/
+  404/405/409/413/503. Idempotent reads retry once on a dropped
+  connection. The dashboards are now the API plus the UI
+  (`dashboard::axum_router_with` / `actix_scope_with` take an
+  `ApiConfig`); the 0.2 `/api/*` routes remain as deprecated aliases with
+  their 0.2 shapes.
+
+- `docs/MIGRATION-0.3.md`, a 0.2 → 0.3 migration guide.
+- Examples `api_actix`, `flow`, `graceful_shutdown` and `rate_limit`;
+  every example reads `REDIS_URL`.
+- The `LICENSE-MIT` and `LICENSE-APACHE` files the README always pointed
+  to. The published crate now holds only the library, examples and docs
+  (`include` in `Cargo.toml`).
+- Documented: **Redis Cluster is not supported**, including cluster-mode
+  managed endpoints such as ElastiCache Serverless, which the 0.2 docs
+  listed as a target.
+- `oxn-testkit` and `oxn-load` workspace crates (unpublished), CI
+  workflow, `scripts/test-redis.sh`. See `docs/load-results/`.
+- Tracing spans on every Lua call (`oxn.script`), fetch, blocking wait
+  (`oxn.block`, with `next_due_ms`), process and shutdown. `backend::redis::script_hashes()` maps script SHAs to names.
+
+## [0.2.2] — Unreleased (folded into 0.3.0)
 
 ### Added
 
@@ -122,6 +557,7 @@ No functional changes from 0.2.0.
   write after the first call per queue per process via an in-memory
   `DashSet` cache.
 
+[0.3.0]: https://github.com/monzeromer-lab/oxn/compare/v0.2.1...HEAD
 [0.2.2]: https://github.com/monzeromer-lab/oxn/compare/v0.2.1...HEAD
 [0.2.1]: https://github.com/monzeromer-lab/oxn/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/monzeromer-lab/oxn/compare/v0.1.3...v0.2.0

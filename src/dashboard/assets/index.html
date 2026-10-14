@@ -1,385 +1,936 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>oxn dashboard</title>
-  <style>
-    :root {
-      color-scheme: light dark;
-      --bg: #0e0e12; --fg: #eaeaf0; --muted: #8b8ea0;
-      --card: #1a1a22; --accent: #7c8cff; --danger: #f07178;
-      --ok: #7bd389; --warn: #f5c969;
-      --border: #2a2a36;
-    }
-    @media (prefers-color-scheme: light) {
-      :root { --bg:#f7f7fb; --fg:#16161d; --muted:#5b5f75; --card:#fff; --border:#dcdce6; }
-    }
-    * { box-sizing: border-box; }
-    html, body { background: var(--bg); color: var(--fg); margin: 0; font: 14px/1.5 system-ui, -apple-system, sans-serif; }
-    header { padding: 16px 24px; border-bottom: 1px solid var(--border); display:flex; align-items:center; gap:16px; }
-    header h1 { font-size: 16px; margin: 0; letter-spacing: 0.5px; }
-    header .tag { font-size: 11px; color: var(--muted); padding: 2px 8px; border: 1px solid var(--border); border-radius: 10px; }
-    main { display: grid; grid-template-columns: 260px 1fr; min-height: calc(100vh - 58px); }
-    nav { border-right: 1px solid var(--border); padding: 12px 0; overflow-y: auto; }
-    nav .q { padding: 10px 20px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; border-left: 2px solid transparent; }
-    nav .q:hover { background: var(--card); }
-    nav .q.active { border-color: var(--accent); background: var(--card); }
-    nav .q small { color: var(--muted); }
-    nav .q.paused::after { content: 'paused'; font-size: 10px; color: var(--warn); }
-    section { padding: 18px 24px; }
-    .counts { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin-bottom: 16px; }
-    .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; }
-    .card b { font-size: 20px; display: block; }
-    .card small { color: var(--muted); text-transform: uppercase; font-size: 10px; letter-spacing: 0.8px; }
-    .card.selected { border-color: var(--accent); }
-    .card button { cursor: pointer; background: none; border: 0; color: inherit; padding: 0; text-align: left; display: block; width: 100%; }
-    .toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
-    button.btn { background: var(--accent); color: white; border: 0; border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 12px; }
-    button.btn.ghost { background: transparent; color: var(--fg); border: 1px solid var(--border); }
-    button.btn.danger { background: var(--danger); }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { padding: 8px 12px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
-    th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; }
-    tr:hover { background: var(--card); }
-    code { font-family: ui-monospace, SFMono-Regular, monospace; color: var(--accent); }
-    .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; border: 1px solid var(--border); }
-    .pill.completed { color: var(--ok); border-color: var(--ok); }
-    .pill.failed { color: var(--danger); border-color: var(--danger); }
-    .pill.active { color: var(--accent); border-color: var(--accent); }
-    .pill.delayed { color: var(--warn); border-color: var(--warn); }
-    .pill.waiting { color: var(--muted); }
-    .empty { padding: 40px; text-align: center; color: var(--muted); }
-    .reason { color: var(--danger); font-size: 12px; }
-    tr.row { cursor: pointer; }
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>oxn dashboard</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f1f3f6; --fg: #14161c; --muted: #5d6475;
+  --line: #e1e4ea; --line-strong: #cdd2db; --accent: #4f5bd5; --accent-fg: #ffffff;
+  --focus: #4f5bd5; --danger: #c93a3a; --danger-text: #a51d1d; --danger-bg: #fdeeee; --ok: #1f8a4c; --warn: #8a5300;
+  --shadow: 0 1px 2px rgba(16,24,40,.06), 0 4px 16px rgba(16,24,40,.08);
+  --s-waiting: #2f6fdd; --s-active: #c27c0e; --s-completed: #1f8a4c; --s-failed: #c93a3a;
+  --s-delayed: #7b4fd1; --s-prioritized: #0f8a8a; --s-paused: #6b7280; --s-waiting-children: #5b6b86;
+  --radius: 10px; --side: 264px; --top: 56px;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+:root[data-theme="dark"] {
+  --bg: #0f1115; --panel: #171a21; --panel-2: #1e222b; --fg: #e8eaf0; --muted: #9aa1b2;
+  --line: #2a2f3a; --line-strong: #3a4150; --accent: #8b95ff; --accent-fg: #0f1115; --focus: #8b95ff;
+  --danger: #ff7b7b; --danger-text: #ff9a9a; --danger-bg: #3a1d1f; --ok: #5fd08f; --warn: #f0b860;
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+  --s-waiting: #6aa0ff; --s-active: #f0b860; --s-completed: #5fd08f; --s-failed: #ff7b7b;
+  --s-delayed: #b79bff; --s-prioritized: #4fd1d1; --s-paused: #9aa1b2; --s-waiting-children: #9fb0cc;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1115; --panel: #171a21; --panel-2: #1e222b; --fg: #e8eaf0; --muted: #9aa1b2;
+    --line: #2a2f3a; --line-strong: #3a4150; --accent: #8b95ff; --accent-fg: #0f1115; --focus: #8b95ff;
+    --danger: #ff7b7b; --danger-text: #ff9a9a; --danger-bg: #3a1d1f; --ok: #5fd08f; --warn: #f0b860;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+    --s-waiting: #6aa0ff; --s-active: #f0b860; --s-completed: #5fd08f; --s-failed: #ff7b7b;
+    --s-delayed: #b79bff; --s-prioritized: #4fd1d1; --s-paused: #9aa1b2; --s-waiting-children: #9fb0cc;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; -webkit-font-smoothing: antialiased; }
+button, input, select, textarea { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 6px; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.mono { font-family: var(--mono); font-size: 12.5px; }
+.muted { color: var(--muted); }
+.skip { position: absolute; left: 8px; top: -40px; background: var(--accent); color: var(--accent-fg); padding: 8px 12px; border-radius: 8px; z-index: 100; }
+.skip:focus { top: 8px; }
 
-    /* Job detail drawer */
-    .drawer-backdrop {
-      position: fixed; inset: 0; background: rgba(0,0,0,0.45);
-      display: none; z-index: 50;
-    }
-    .drawer-backdrop.open { display: block; }
-    .drawer {
-      position: fixed; top: 0; right: 0; height: 100vh; width: min(640px, 100vw);
-      background: var(--bg); border-left: 1px solid var(--border);
-      z-index: 51; transform: translateX(100%); transition: transform .15s ease-out;
-      display: flex; flex-direction: column;
-    }
-    .drawer.open { transform: translateX(0); }
-    .drawer header {
-      padding: 14px 18px; border-bottom: 1px solid var(--border);
-      display: flex; align-items: center; gap: 10px;
-    }
-    .drawer header h2 { margin: 0; font-size: 14px; }
-    .drawer header .spacer { flex: 1; }
-    .drawer .body { padding: 16px 18px; overflow: auto; flex: 1; }
-    .drawer .body h3 {
-      margin: 18px 0 6px; font-size: 11px; text-transform: uppercase;
-      letter-spacing: 0.8px; color: var(--muted); font-weight: 600;
-    }
-    .drawer .body h3:first-child { margin-top: 0; }
-    .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 18px; font-size: 13px; }
-    .stats .k { color: var(--muted); }
-    .stats .v { word-break: break-all; }
-    pre.code {
-      background: var(--card); border: 1px solid var(--border); border-radius: 6px;
-      padding: 10px 12px; font-size: 12px; overflow: auto; margin: 0;
-      font-family: ui-monospace, SFMono-Regular, monospace; max-height: 280px;
-      white-space: pre-wrap; word-break: break-word;
-    }
-    .logs {
-      background: var(--card); border: 1px solid var(--border); border-radius: 6px;
-      padding: 10px 12px; font-size: 12px; overflow: auto;
-      font-family: ui-monospace, SFMono-Regular, monospace; max-height: 320px;
-      white-space: pre-wrap;
-    }
-    .logs .line { padding: 2px 0; border-bottom: 1px dotted var(--border); }
-    .logs .line:last-child { border-bottom: 0; }
-    .drawer .actions { display: flex; gap: 8px; flex-wrap: wrap; }
-  </style>
+/* buttons */
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 36px; padding: 0 12px; border-radius: 8px; border: 1px solid var(--line-strong); background: var(--panel); cursor: pointer; white-space: nowrap; }
+.btn:hover { background: var(--panel-2); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+.btn.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); }
+.btn.danger:hover { background: var(--danger-bg); }
+.btn.ghost { border-color: transparent; background: transparent; }
+.btn.ghost:hover { background: var(--panel-2); }
+.btn.icon { width: 36px; padding: 0; }
+.btn svg { width: 18px; height: 18px; flex: none; }
+
+/* top bar */
+.top { position: sticky; top: 0; z-index: 30; height: var(--top); display: flex; align-items: center; gap: 8px; padding: 0 12px; padding-top: env(safe-area-inset-top); background: var(--panel); border-bottom: 1px solid var(--line); }
+.brand { font-weight: 650; letter-spacing: .2px; display: flex; align-items: center; gap: 8px; margin-right: 4px; }
+.brand .dot { width: 10px; height: 10px; border-radius: 3px; background: var(--accent); }
+.top .grow { flex: 1; min-width: 0; }
+.qpick { display: none; }
+.live { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); padding: 0 8px; }
+.live i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.live[data-state="live"] i { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
+.live[data-state="polling"] i { background: var(--warn); }
+.live[data-state="offline"] i { background: var(--danger); }
+
+/* layout */
+.layout { display: grid; grid-template-columns: var(--side) minmax(0, 1fr); min-height: calc(100vh - var(--top)); }
+.layout.collapsed { grid-template-columns: 0 minmax(0, 1fr); }
+.layout.collapsed .side { visibility: hidden; }
+.side { position: sticky; top: var(--top); height: calc(100vh - var(--top)); overflow: auto; border-right: 1px solid var(--line); background: var(--panel); padding: 12px; }
+.side h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); margin: 8px 6px; }
+.side input { width: 100%; min-height: 36px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--bg); margin-bottom: 8px; }
+.qlist { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.qbtn { width: 100%; text-align: left; display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; padding: 8px 10px; border-radius: 8px; border: 0; background: transparent; cursor: pointer; }
+.qbtn:hover { background: var(--panel-2); }
+.qbtn[aria-current="true"] { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.qbtn .n { font-weight: 560; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qbtn .c { font-size: 12px; color: var(--muted); grid-column: 1 / -1; display: flex; gap: 10px; }
+.qbtn .c b { font-weight: 560; }
+.pill { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line-strong); color: var(--muted); align-self: center; }
+.pill.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 50%, var(--line)); }
+.main { min-width: 0; padding: 16px 20px 40px; }
+.empty { display: grid; place-items: center; text-align: center; padding: 48px 16px; color: var(--muted); gap: 6px; }
+.empty strong { color: var(--fg); font-size: 15px; }
+
+/* queue header */
+.qhead { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; margin-bottom: 12px; }
+.qhead h1 { font-size: 20px; margin: 0; overflow-wrap: anywhere; }
+.qhead .actions { margin-left: auto; display: flex; flex-wrap: wrap; gap: 6px; }
+.qhead .more { display: none; }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 12px; }
+.tab { border: 0; background: transparent; padding: 10px 12px; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.tab[aria-selected="true"] { color: var(--fg); border-color: var(--accent); font-weight: 560; }
+
+/* state chips */
+.chips { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 6px; scrollbar-width: thin; margin-bottom: 8px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 999px; border: 1px solid var(--line-strong); background: var(--panel); cursor: pointer; white-space: nowrap; }
+.chip i { width: 8px; height: 8px; border-radius: 50%; }
+.chip b { font-weight: 600; font-variant-numeric: tabular-nums; }
+.chip[aria-selected="true"] { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--panel)); }
+
+/* toolbar */
+.toolbar { position: sticky; top: var(--top); z-index: 10; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 0; background: var(--bg); }
+.toolbar .search { display: flex; gap: 6px; flex: 1 1 220px; }
+.toolbar input, .toolbar select, .field input, .field select, .field textarea { min-height: 36px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--panel); }
+.toolbar .search input { flex: 1; min-width: 0; }
+
+/* table / cards */
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
+table.jobs { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.jobs th { text-align: left; font-size: 12px; font-weight: 560; color: var(--muted); padding: 10px 12px; border-bottom: 1px solid var(--line); background: var(--panel-2); white-space: nowrap; }
+.jobs td { padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.jobs tbody tr { cursor: pointer; }
+.jobs tbody tr:hover, .jobs tbody tr.sel { background: var(--panel-2); }
+.jobs tbody tr:last-child td { border-bottom: 0; }
+.jobs .reason { color: var(--danger-text); max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.jobs .id { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
+.bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; min-width: 60px; }
+.bar > i { display: block; height: 100%; background: var(--accent); }
+.skel td i { display: block; height: 12px; border-radius: 4px; background: linear-gradient(90deg, var(--panel-2), var(--line), var(--panel-2)); background-size: 200% 100%; animation: sk 1.2s infinite; }
+@keyframes sk { to { background-position: -200% 0; } }
+@media (prefers-reduced-motion: reduce) { .skel td i { animation: none; } * { transition: none !important; } }
+.pager { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--line); background: var(--panel); }
+.pager .nav { display: flex; gap: 6px; }
+
+.badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--line); white-space: nowrap; }
+.badge i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+
+/* drawer */
+.scrim { position: fixed; inset: 0; background: rgba(10,12,18,.36); z-index: 40; }
+.drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(560px, 100vw); z-index: 50; background: var(--panel); border-left: 1px solid var(--line); box-shadow: var(--shadow); display: flex; flex-direction: column; }
+.drawer header { display: flex; align-items: flex-start; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+.drawer header .t { flex: 1; min-width: 0; }
+.drawer header h2 { margin: 0; font-size: 16px; overflow-wrap: anywhere; }
+.drawer .body { overflow: auto; padding: 14px 16px 32px; display: grid; gap: 16px; }
+.drawer .acts { display: flex; flex-wrap: wrap; gap: 6px; }
+.drawer section h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .7px; color: var(--muted); margin: 0 0 6px; }
+dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 0; }
+dl.kv dt { color: var(--muted); }
+dl.kv dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+pre.json { margin: 0; padding: 10px 12px; border-radius: 8px; background: var(--panel-2); border: 1px solid var(--line); overflow: auto; max-height: 320px; font-family: var(--mono); font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.failure { border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--line)); background: var(--danger-bg); border-radius: 8px; padding: 10px 12px; }
+.failure p { margin: 0 0 6px; color: var(--danger-text); font-weight: 560; overflow-wrap: anywhere; }
+.failure ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 4px; font-family: var(--mono); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.logs { list-style: none; margin: 0; padding: 0; font-family: var(--mono); font-size: 12.5px; display: grid; gap: 4px; }
+.logs li { padding: 4px 8px; border-radius: 6px; background: var(--panel-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+.tree { list-style: none; margin: 0; padding-left: 0; }
+.tree .tree { padding-left: 18px; border-left: 1px dashed var(--line-strong); margin-left: 7px; }
+.tree li { margin: 4px 0; }
+.tree .node { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 3px 6px; border-radius: 6px; border: 0; background: transparent; cursor: pointer; text-align: left; }
+.tree .node:hover { background: var(--panel-2); }
+.tree .node.me { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+
+/* dialogs */
+dialog { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); color: var(--fg); padding: 0; width: min(480px, calc(100vw - 24px)); box-shadow: var(--shadow); }
+dialog::backdrop { background: rgba(10,12,18,.45); }
+dialog form { display: grid; gap: 12px; padding: 18px; }
+dialog h2 { margin: 0; font-size: 17px; }
+dialog p { margin: 0; color: var(--muted); overflow-wrap: anywhere; }
+dialog .row { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.field { display: grid; gap: 4px; }
+.field label { font-size: 12px; color: var(--muted); }
+.field textarea { min-height: 120px; padding: 8px 10px; font-family: var(--mono); font-size: 12.5px; resize: vertical; }
+.check { display: flex; gap: 8px; align-items: center; }
+
+/* toasts */
+.toasts { position: fixed; right: 16px; bottom: 16px; z-index: 70; display: grid; gap: 8px; width: min(380px, calc(100vw - 32px)); }
+.toast { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--ok); border-radius: 10px; box-shadow: var(--shadow); padding: 10px 12px; display: flex; gap: 8px; align-items: flex-start; overflow-wrap: anywhere; }
+.toast.err { border-left-color: var(--danger); }
+.toast span { flex: 1; }
+
+/* sheet (sidebar on small screens) */
+@media (max-width: 899px) {
+  .layout, .layout.collapsed { grid-template-columns: minmax(0, 1fr); }
+  .side { position: fixed; z-index: 45; top: var(--top); left: 0; bottom: 0; width: min(320px, 86vw); height: auto; box-shadow: var(--shadow); transform: translateX(-102%); transition: transform .18s ease; visibility: hidden; }
+  .layout.open .side { transform: none; visibility: visible; }
+  .main { padding: 12px 12px 40px; }
+}
+@media (max-width: 640px) {
+  .brand span { display: none; }
+  .qpick { display: inline-flex; flex: 1; min-width: 0; justify-content: space-between; }
+  .qpick b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .top .grow { display: none; }
+  .side { top: var(--top); left: 0; right: 0; bottom: auto; width: auto; max-height: 70vh; border-radius: 0 0 14px 14px; transform: translateY(-104%); }
+  .layout.open .side { transform: none; }
+  #sideToggle { display: none; }
+  .qhead .more { display: inline-flex; margin-left: auto; }
+  .qhead .actions { margin-left: 0; width: 100%; display: none; }
+  .qhead .actions.open { display: flex; }
+  .toolbar { top: var(--top); }
+  .live b { display: none; }
+  /* jobs as cards */
+  table.jobs, .jobs tbody, .jobs tr, .jobs td { display: block; width: 100%; }
+  .jobs thead { display: none; }
+  /* card: id … attempts / name · time · duration / extra */
+  .jobs tbody tr { padding: 10px 12px; border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; align-items: baseline; row-gap: 2px; }
+  .jobs tbody tr::after { content: ""; order: 1; flex-basis: 100%; height: 0; }
+  .jobs td { padding: 0; border: 0; width: auto; }
+  .jobs td[data-k="id"] { order: 0; flex: 1 1 auto; min-width: 0; font-weight: 560; }
+  .jobs td[data-k="att"] { order: 0; margin-left: auto; padding-left: 8px; white-space: nowrap; color: var(--muted); }
+  .jobs td[data-k="name"], .jobs td[data-k="when"], .jobs td[data-k="dur"] { order: 2; color: var(--muted); font-size: 13px; white-space: nowrap; }
+  .jobs td[data-k="name"] { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .jobs td[data-k="when"]:not(:empty)::before, .jobs td[data-k="dur"]:not(:empty)::before { content: "\00a0·\00a0"; }
+  .jobs td[data-k="extra"] { order: 3; flex-basis: 100%; margin-top: 4px; }
+  .jobs td:empty { display: none; }
+  .jobs .reason { max-width: none; white-space: normal; }
+  .drawer { width: 100vw; border-left: 0; }
+  .toasts { left: 16px; right: 16px; width: auto; }
+}
+</style>
 </head>
 <body>
-  <header>
-    <h1>oxn</h1>
-    <span class="tag" id="base">/</span>
-    <span style="flex:1"></span>
-    <button class="btn ghost" onclick="refresh()">Refresh</button>
-  </header>
-  <main>
-    <nav id="queues"></nav>
-    <section id="detail"><div class="empty">Select a queue to begin.</div></section>
-  </main>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <button class="btn icon ghost" id="sideToggle" aria-label="Show queues" aria-controls="side" aria-expanded="false"></button>
+  <div class="brand"><div class="dot" aria-hidden="true"></div><span>oxn</span></div>
+  <button class="btn qpick" id="qpick" aria-controls="side" aria-expanded="false"><b id="qpickName">Queues</b></button>
+  <div class="grow"></div>
+  <span class="live" id="live" data-state="offline" role="status" aria-live="polite"><i aria-hidden="true"></i><b id="liveText">Connecting</b></span>
+  <button class="btn icon ghost" id="refreshBtn" aria-label="Refresh (r)"></button>
+  <button class="btn icon ghost" id="themeBtn" aria-label="Theme"></button>
+  <button class="btn icon ghost" id="keyBtn" aria-label="API token"></button>
+</header>
+<div class="layout" id="layout">
+  <nav class="side" id="side" aria-label="Queues">
+    <h2 id="qh">Queues</h2>
+    <label class="sr" for="qfilter">Filter queues</label>
+    <input id="qfilter" type="search" placeholder="Filter queues" autocomplete="off">
+    <ul class="qlist" id="qlist" aria-labelledby="qh"></ul>
+  </nav>
+  <main class="main" id="main" tabindex="-1"></main>
+</div>
+<div id="drawerHost"></div>
+<div class="toasts" id="toasts" role="region" aria-label="Notifications" aria-live="polite"></div>
 
-  <div class="drawer-backdrop" id="drawerBackdrop" onclick="closeJob()"></div>
-  <aside class="drawer" id="drawer" aria-hidden="true">
-    <header>
-      <h2 id="drawerTitle">Job</h2>
-      <span class="spacer"></span>
-      <button class="btn ghost" onclick="reloadJob()">Refresh</button>
-      <button class="btn ghost" onclick="closeJob()">Close</button>
-    </header>
-    <div class="body" id="drawerBody"></div>
-  </aside>
-  <script>
-    const STATES = ['waiting','active','delayed','prioritized','completed','failed','paused','waiting-children'];
-    let BASE = '';
-    let selectedQueue = null;
-    let selectedState = 'waiting';
-    let openJobId = null;
+<dialog id="confirmDlg" aria-labelledby="confirmTitle">
+  <form method="dialog">
+    <h2 id="confirmTitle"></h2>
+    <p id="confirmText"></p>
+    <div id="confirmExtra"></div>
+    <div class="row">
+      <button class="btn" value="cancel" formnovalidate>Cancel</button>
+      <button class="btn danger" value="ok" id="confirmOk">Confirm</button>
+    </div>
+  </form>
+</dialog>
+<dialog id="addDlg" aria-labelledby="addTitle">
+  <form method="dialog" id="addForm">
+    <h2 id="addTitle">Add job</h2>
+    <div class="field"><label for="addName">Name (optional)</label><input id="addName" autocomplete="off"></div>
+    <div class="field"><label for="addData">Data (JSON)</label><textarea id="addData" spellcheck="false">{}</textarea></div>
+    <div class="field"><label for="addOpts">Options (JSON, optional)</label><textarea id="addOpts" spellcheck="false" placeholder='{"attempts": 3, "delay_ms": 0, "priority": 0}'></textarea></div>
+    <p id="addErr" role="alert"></p>
+    <div class="row"><button class="btn" value="cancel" formnovalidate>Cancel</button><button class="btn primary" value="ok">Add job</button></div>
+  </form>
+</dialog>
+<dialog id="tokenDlg" aria-labelledby="tokenTitle">
+  <form method="dialog" id="tokenForm">
+    <h2 id="tokenTitle">API token</h2>
+    <p>This API asks for a bearer token. It is kept in this browser tab only, unless you choose to remember it.</p>
+    <div class="field"><label for="tokenIn">Token</label><input id="tokenIn" type="password" autocomplete="current-password"></div>
+    <label class="check"><input type="checkbox" id="tokenRemember"> Remember on this device</label>
+    <div class="row"><button class="btn" value="clear" id="tokenClear" formnovalidate>Sign out</button><button class="btn" value="cancel" formnovalidate>Cancel</button><button class="btn primary" value="ok">Use token</button></div>
+  </form>
+</dialog>
 
-    // Auto-detect base path: this file is served at the dashboard root.
-    (function detectBase() {
-      const p = window.location.pathname;
-      BASE = p.endsWith('/') ? p.slice(0, -1) : p.replace(/\/[^/]+$/, '');
-      document.getElementById('base').textContent = BASE || '/';
+<script>
+(function () {
+  'use strict';
+
+    function dashboardBase(pathname) {
+      return pathname.replace(/\/+$/, '');
+    }
+
+  var STATES = ['waiting', 'active', 'delayed', 'prioritized', 'waiting-children', 'paused', 'completed', 'failed'];
+  var LABEL = { 'waiting': 'Waiting', 'active': 'Active', 'delayed': 'Delayed', 'prioritized': 'Prioritized', 'waiting-children': 'Waiting for children', 'paused': 'Paused', 'completed': 'Completed', 'failed': 'Failed' };
+  var COUNT_KEY = { 'waiting-children': 'waiting_children' };
+  var CLEANABLE = ['completed', 'failed', 'delayed', 'prioritized', 'waiting-children'];
+
+  var S = {
+    base: dashboardBase(window.location.pathname),
+    token: read('session', 'oxn.token') || read('local', 'oxn.token'),
+    access: null, queues: [], filter: '', queue: null, tab: 'jobs',
+    state: 'waiting', offset: 0, limit: 25, order: 'asc', page: null, loading: false, error: null,
+    job: null, jobData: null, sel: -1, live: 'offline', events: null, lastFocus: null
+  };
+
+  // ---------------------------------------------------------------- utils
+  function read(kind, k) { try { return (kind === 'local' ? localStorage : sessionStorage).getItem(k); } catch (e) { return null; } }
+  function write(kind, k, v) { try { var s = kind === 'local' ? localStorage : sessionStorage; if (v == null) s.removeItem(k); else s.setItem(k, v); } catch (e) { /* storage unavailable */ } }
+  function $(id) { return document.getElementById(id); }
+  function el(tag, attrs) {
+    var n = document.createElement(tag);
+    if (attrs) {
+      for (var k in attrs) {
+        var v = attrs[k];
+        if (v == null || v === false) continue;
+        if (k === 'class') n.className = v;
+        else if (k === 'text') n.textContent = v;
+        else if (k.slice(0, 2) === 'on') n.addEventListener(k.slice(2), v);
+        else n.setAttribute(k, v === true ? '' : String(v));
+      }
+    }
+    for (var i = 2; i < arguments.length; i++) add(n, arguments[i]);
+    return n;
+  }
+  function add(n, c) {
+    if (c == null || c === false) return;
+    if (Array.isArray(c)) { c.forEach(function (x) { add(n, x); }); return; }
+    n.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  }
+  function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); return n; }
+  var ICONS = {
+    menu: 'M4 6h16M4 12h16M4 18h16', refresh: 'M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7',
+    sun: 'M12 4V2m0 20v-2m8-8h2M2 12h2m13.7-5.7 1.4-1.4M4.9 19.1l1.4-1.4m0-11.4L4.9 4.9m14.2 14.2-1.4-1.4M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z',
+    moon: 'M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z', auto: 'M12 3a9 9 0 1 0 0 18V3z M12 3a9 9 0 0 1 0 18',
+    key: 'M15 7a4 4 0 1 1-3.9 4.9L3 20v-3h3v-3h3l2.1-2.1A4 4 0 0 1 15 7z', close: 'M6 6l12 12M18 6 6 18',
+    plus: 'M12 5v14M5 12h14', copy: 'M9 9h10v10H9zM5 15V5h10', chevL: 'M15 6l-6 6 6 6', chevR: 'M9 6l6 6-6 6'
+  };
+  function icon(name) {
+    var ns = 'http://www.w3.org/2000/svg';
+    var s = document.createElementNS(ns, 'svg');
+    s.setAttribute('viewBox', '0 0 24 24'); s.setAttribute('fill', 'none'); s.setAttribute('stroke', 'currentColor');
+    s.setAttribute('stroke-width', '2'); s.setAttribute('stroke-linecap', 'round'); s.setAttribute('stroke-linejoin', 'round');
+    s.setAttribute('aria-hidden', 'true');
+    var p = document.createElementNS(ns, 'path'); p.setAttribute('d', ICONS[name]); s.append(p);
+    return s;
+  }
+  var NUM = new Intl.NumberFormat();
+  function num(n) { return NUM.format(n || 0); }
+  function count(c, s) { return c ? c[COUNT_KEY[s] || s] || 0 : 0; }
+  function ago(ms) {
+    if (ms == null) return '';
+    var d = (Date.now() - ms) / 1000, f = d < 0, a = Math.abs(d), t;
+    if (a < 5) return 'just now';
+    if (a < 60) t = Math.round(a) + 's'; else if (a < 3600) t = Math.round(a / 60) + 'm';
+    else if (a < 86400) t = Math.round(a / 3600) + 'h'; else t = Math.round(a / 86400) + 'd';
+    return f ? 'in ' + t : t + ' ago';
+  }
+  function when(ms) { return ms == null ? '' : new Date(ms).toLocaleString(); }
+  function dur(ms) {
+    if (ms == null || ms < 0) return '';
+    if (ms < 1000) return ms + ' ms';
+    if (ms < 60000) return (ms / 1000).toFixed(ms < 10000 ? 2 : 1) + ' s';
+    return Math.floor(ms / 60000) + 'm ' + Math.round(ms % 60000 / 1000) + 's';
+  }
+  function pretty(v) { try { return JSON.stringify(v, null, 2); } catch (e) { return String(v); } }
+  function stateBadge(s) {
+    return el('span', { class: 'badge', style: 'color: var(--s-' + (STATES.indexOf(s) >= 0 ? s : 'paused') + ')' }, el('i'), el('span', { style: 'color: var(--fg)', text: LABEL[s] || s || 'gone' }));
+  }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function isAdmin() { return S.access === 'admin'; }
+  function enc(s) { return encodeURIComponent(s); }
+
+  // ------------------------------------------------------------------ API
+  function ApiError(status, code, message) { this.status = status; this.code = code; this.message = message; }
+  function headers(json) {
+    var h = {};
+    if (S.token) h.authorization = 'Bearer ' + S.token;
+    if (json) h['content-type'] = 'application/json';
+    return h;
+  }
+  function api(method, path, body) {
+    return fetch(S.base + '/v1' + path, { method: method, headers: headers(body !== undefined), body: body === undefined ? undefined : JSON.stringify(body) })
+      .then(function (res) {
+        return res.text().then(function (text) {
+          var data = null;
+          try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
+          if (res.status === 401) { askToken(); throw new ApiError(401, 'unauthorized', 'This API needs a token.'); }
+          if (!res.ok) {
+            var err = data && data.error;
+            throw new ApiError(res.status, err && err.code || 'error', err && err.message || text || res.statusText);
+          }
+          return data;
+        });
+      }, function () { throw new ApiError(0, 'network', 'Cannot reach the server.'); });
+  }
+
+  // --------------------------------------------------------------- toasts
+  function toast(msg, err) {
+    var t = el('div', { class: 'toast' + (err ? ' err' : ''), role: err ? 'alert' : 'status' }, el('span', { text: msg }),
+      el('button', { class: 'btn icon ghost', 'aria-label': 'Dismiss', onclick: function () { t.remove(); } }, icon('close')));
+    $('toasts').append(t);
+    setTimeout(function () { t.remove(); }, err ? 8000 : 4000);
+  }
+  function fail(e) { toast(e && e.message ? e.message : String(e), true); }
+
+  // ------------------------------------------------------------- routing
+  function readHash() {
+    var p = new URLSearchParams(location.hash.slice(1));
+    S.queue = p.get('q') || S.queue;
+    S.tab = p.get('t') === 'schedulers' ? 'schedulers' : 'jobs';
+    var st = p.get('s'); S.state = STATES.indexOf(st) >= 0 ? st : 'waiting';
+    S.offset = Math.max(0, parseInt(p.get('o') || '0', 10) || 0);
+    S.order = p.get('d') === '1' ? 'desc' : 'asc';
+    S.job = p.get('j') ? { queue: p.get('jq') || S.queue, id: p.get('j') } : null;
+  }
+  function writeHash(replace) {
+    var p = new URLSearchParams();
+    if (S.queue) p.set('q', S.queue);
+    if (S.tab !== 'jobs') p.set('t', S.tab);
+    if (S.state !== 'waiting') p.set('s', S.state);
+    if (S.offset) p.set('o', String(S.offset));
+    if (S.order === 'desc') p.set('d', '1');
+    if (S.job) { p.set('j', S.job.id); if (S.job.queue !== S.queue) p.set('jq', S.job.queue); }
+    var h = '#' + p.toString();
+    if (h !== location.hash) history[replace ? 'replaceState' : 'pushState'](null, '', h);
+  }
+  window.addEventListener('popstate', function () { readHash(); renderAll(); load(); syncDrawer(); });
+
+  // --------------------------------------------------------------- queues
+  function loadQueues() {
+    return api('GET', '/queues').then(function (qs) {
+      S.queues = qs;
+      if (!S.queue && qs.length) { S.queue = qs[0].name; writeHash(true); }
+      renderQueues(); renderHead();
+    }).catch(function (e) { if (e.status !== 401) fail(e); });
+  }
+  function current() { for (var i = 0; i < S.queues.length; i++) if (S.queues[i].name === S.queue) return S.queues[i]; return null; }
+  function renderQueues() {
+    var list = clear($('qlist')), f = S.filter.toLowerCase();
+    var qs = S.queues.filter(function (q) { return !f || q.name.toLowerCase().indexOf(f) >= 0; });
+    if (!qs.length) list.append(el('li', { class: 'muted', style: 'padding: 8px 10px', text: S.queues.length ? 'No queue matches.' : 'No queues yet.' }));
+    qs.forEach(function (q) {
+      list.append(el('li', null, el('button', {
+        class: 'qbtn', 'aria-current': q.name === S.queue ? 'true' : 'false',
+        onclick: function () { pickQueue(q.name); }
+      }, el('span', { class: 'n', text: q.name }), q.paused ? el('span', { class: 'pill warn', text: 'paused' }) : el('span'),
+      el('span', { class: 'c' }, el('span', null, el('b', { text: num(q.counts.waiting + q.counts.prioritized) }), ' waiting'),
+        el('span', null, el('b', { text: num(q.counts.active) }), ' active'),
+        q.counts.failed ? el('span', { style: 'color: var(--danger-text)' }, el('b', { text: num(q.counts.failed) }), ' failed') : null))));
+    });
+    $('qpickName').textContent = S.queue || 'Queues';
+  }
+  function pickQueue(name) {
+    S.queue = name; S.offset = 0; S.job = null; S.tab = 'jobs';
+    setSide(false); writeHash(); renderAll(); load(); syncDrawer(); followEvents();
+  }
+  function setSide(open) {
+    var lay = $('layout'), wide = matchMedia('(min-width: 900px)').matches;
+    if (wide) { lay.classList.toggle('collapsed', open === false ? true : !open); lay.classList.remove('open'); }
+    else { lay.classList.toggle('open', !!open); lay.classList.remove('collapsed'); }
+    var shown = wide ? !lay.classList.contains('collapsed') : lay.classList.contains('open');
+    $('sideToggle').setAttribute('aria-expanded', String(shown));
+    $('qpick').setAttribute('aria-expanded', String(shown));
+    $('sideToggle').setAttribute('aria-label', shown ? 'Hide queues' : 'Show queues');
+    if (shown && !wide) $('qfilter').focus();
+  }
+
+  // ------------------------------------------------------------- main view
+  function renderAll() { renderQueues(); renderHead(); }
+  function renderHead() {
+    var main = clear($('main')), q = current();
+    if (!S.queue) {
+      main.append(el('div', { class: 'empty' }, el('strong', { text: S.queues.length ? 'Pick a queue' : 'No queues yet' }),
+        el('span', { text: S.queues.length ? 'Choose one from the list.' : 'Queues appear once a job has been added.' })));
+      return;
+    }
+    var acts = el('div', { class: 'actions' });
+    if (isAdmin()) {
+      acts.append(
+        q && q.paused ? el('button', { class: 'btn', onclick: function () { act('POST', '/resume', 'Queue resumed'); } }, 'Resume')
+          : el('button', { class: 'btn', onclick: function () { act('POST', '/pause', 'Queue paused'); } }, 'Pause'),
+        el('button', { class: 'btn', onclick: promoteAll, disabled: q && !q.counts.delayed }, 'Run delayed now'),
+        el('button', { class: 'btn', onclick: cleanDialog }, 'Clean…'),
+        el('button', { class: 'btn danger', onclick: drainDialog }, 'Drain…'),
+        el('button', { class: 'btn danger', onclick: obliterateDialog }, 'Delete queue…'));
+    }
+    var more = acts.childNodes.length ? el('button', { class: 'btn more', 'aria-expanded': 'false', 'aria-controls': 'qactions',
+      onclick: function () { var o = acts.classList.toggle('open'); more.setAttribute('aria-expanded', String(o)); } }, 'Actions') : null;
+    acts.id = 'qactions';
+    main.append(
+      el('div', { class: 'qhead' }, el('h1', { text: S.queue }), q && q.paused ? el('span', { class: 'pill warn', text: 'paused' }) : null, more, acts),
+      el('div', { class: 'tabs', role: 'tablist', 'aria-label': 'View' },
+        tab('jobs', 'Jobs'), tab('schedulers', 'Schedulers')),
+      el('div', { id: 'view' }));
+    renderView();
+  }
+  function tab(id, label) {
+    return el('button', { class: 'tab', role: 'tab', 'aria-selected': S.tab === id ? 'true' : 'false', id: 'tab-' + id,
+      onclick: function () { S.tab = id; S.offset = 0; writeHash(); renderHead(); load(); } }, label);
+  }
+  function renderView() {
+    var v = $('view'); if (!v) return; clear(v);
+    if (S.tab === 'schedulers') { v.append(el('div', { id: 'sched' })); renderSchedulers(); return; }
+    var q = current(), chips = el('div', { class: 'chips', role: 'tablist', 'aria-label': 'Job state' });
+    STATES.forEach(function (s) {
+      chips.append(el('button', { class: 'chip', role: 'tab', 'aria-selected': S.state === s ? 'true' : 'false',
+        onclick: function () { S.state = s; S.offset = 0; S.sel = -1; writeHash(); renderView(); load(); } },
+      el('i', { style: 'background: var(--s-' + s + ')', 'aria-hidden': 'true' }), LABEL[s], el('b', { text: num(count(q && q.counts, s)) })));
+    });
+    var search = el('input', { id: 'jobSearch', type: 'search', placeholder: 'Job id', 'aria-label': 'Open a job by id (/)', autocomplete: 'off' });
+    var toolbar = el('div', { class: 'toolbar' },
+      el('form', { class: 'search', role: 'search', onsubmit: function (e) { e.preventDefault(); var id = search.value.trim(); if (id) openJob(S.queue, id); } },
+        search, el('button', { class: 'btn', type: 'submit' }, 'Open')),
+      el('button', { class: 'btn', 'aria-label': S.order === 'asc' ? 'Showing oldest first; show newest first' : 'Showing newest first; show oldest first',
+        onclick: function () { S.order = S.order === 'asc' ? 'desc' : 'asc'; S.offset = 0; writeHash(); renderView(); load(); } }, S.order === 'asc' ? 'Oldest first' : 'Newest first'),
+      el('label', { class: 'sr', for: 'pageSize' }, 'Jobs per page'),
+      selectOf('pageSize', [10, 25, 50, 100], S.limit, function (v) { S.limit = +v; S.offset = 0; write('local', 'oxn.limit', v); load(); }),
+      isAdmin() ? el('button', { class: 'btn primary', onclick: addDialog }, icon('plus'), 'Add job') : null);
+    v.append(chips, toolbar, el('div', { class: 'card', id: 'list' }));
+    var on = chips.querySelector('[aria-selected="true"]');
+    if (on && on.scrollIntoView) on.scrollIntoView({ block: 'nearest', inline: 'center' });
+    renderList();
+  }
+  function selectOf(id, opts, cur, onchange) {
+    var s = el('select', { id: id, onchange: function () { onchange(s.value); } });
+    opts.forEach(function (o) { s.append(el('option', { value: o, selected: String(o) === String(cur) }, String(o) + ' / page')); });
+    return s;
+  }
+
+  // ----------------------------------------------------------------- jobs
+  var loadSeq = 0;
+  function load() {
+    if (!S.queue) return Promise.resolve();
+    if (S.tab === 'schedulers') return loadSchedulers();
+    var seq = ++loadSeq; S.loading = true; S.error = null; if (!S.page) renderList();
+    var path = '/queues/' + enc(S.queue) + '/jobs?state=' + enc(S.state) + '&offset=' + S.offset + '&limit=' + S.limit + '&order=' + S.order;
+    return Promise.all([api('GET', path), api('GET', '/queues/' + enc(S.queue)).catch(function () { return null; })])
+      .then(function (r) {
+        if (seq !== loadSeq) return;
+        S.page = r[0]; S.loading = false;
+        if (r[1]) { for (var i = 0; i < S.queues.length; i++) if (S.queues[i].name === r[1].name) S.queues[i] = r[1]; }
+        refreshCounts(); renderList();
+      })
+      .catch(function (e) {
+        if (seq !== loadSeq) return;
+        S.loading = false; S.error = e; S.page = null; renderList();
+      });
+  }
+  function refreshCounts() {
+    var q = current(); if (!q) return;
+    var chips = document.querySelectorAll('.chip b');
+    STATES.forEach(function (s, i) { if (chips[i]) chips[i].textContent = num(count(q.counts, s)); });
+    renderQueues();
+  }
+  function renderList() {
+    var box = $('list'); if (!box) return; clear(box);
+    if (S.error) {
+      box.append(el('div', { class: 'empty', role: 'alert' }, el('strong', { text: 'Could not load jobs' }), el('span', { text: S.error.message }),
+        el('button', { class: 'btn', onclick: load }, 'Try again')));
+      return;
+    }
+    var t = el('table', { class: 'jobs' }, el('caption', { class: 'sr', text: (LABEL[S.state] || S.state) + ' jobs in ' + S.queue }));
+    var cols = columns();
+    t.append(el('thead', null, el('tr', null, el('th', { scope: 'col' }, 'Id'), el('th', { scope: 'col' }, 'Name'),
+      el('th', { scope: 'col' }, 'Attempts'), el('th', { scope: 'col' }, timeLabel()),
+      cols.dur ? el('th', { scope: 'col' }, 'Duration') : null,
+      cols.extra ? el('th', { scope: 'col' }, cols.extra) : null)));
+    var body = el('tbody');
+    if (!S.page) {
+      var n = 4 + (cols.dur ? 1 : 0) + (cols.extra ? 1 : 0);
+      for (var i = 0; i < 6; i++) { var sk = el('tr', { class: 'skel', 'aria-hidden': 'true' }); for (var c = 0; c < n; c++) sk.append(el('td', null, el('i'))); body.append(sk); }
+      t.append(body); box.append(t, el('span', { class: 'sr', role: 'status', text: 'Loading jobs' })); return;
+    }
+    var jobs = S.page.jobs;
+    if (!jobs.length) {
+      box.append(el('div', { class: 'empty' }, el('strong', { text: 'No ' + (LABEL[S.state] || S.state).toLowerCase() + ' jobs' }),
+        el('span', { text: S.offset ? 'Nothing on this page.' : 'Jobs show up here as soon as they get to this state.' })));
+      if (S.offset) box.append(pager());
+      return;
+    }
+    jobs.forEach(function (j, i) {
+      var tr = el('tr', { tabindex: '0', 'aria-label': 'Job ' + j.id + ' ' + j.name, class: i === S.sel ? 'sel' : null,
+        onclick: function () { S.sel = i; openJob(S.queue, j.id); },
+        onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); S.sel = i; openJob(S.queue, j.id); } } },
+      el('td', { 'data-k': 'id', class: 'id', text: j.id }),
+      el('td', { 'data-k': 'name', text: j.name }),
+      el('td', { 'data-k': 'att', text: j.attempts_made + ' / ' + j.attempts_total }),
+      el('td', { 'data-k': 'when', title: when(timeOf(j)), text: ago(timeOf(j)) }),
+      cols.dur ? el('td', { 'data-k': 'dur', text: j.finished_on_ms && j.processed_on_ms ? dur(j.finished_on_ms - j.processed_on_ms) : '' }) : null,
+      cols.extra === 'Reason' ? el('td', { 'data-k': 'extra' }, el('div', { class: 'reason', title: j.failed_reason || '', text: j.failed_reason || '' }))
+        : cols.extra ? el('td', { 'data-k': 'extra' }, progress(j.progress)) : null);
+      body.append(tr);
+    });
+    t.append(body); box.append(t, pager());
+  }
+  // Columns that carry information for the listed state.
+  function columns() {
+    if (S.state === 'completed') return { dur: true, extra: 'Progress' };
+    if (S.state === 'failed') return { dur: true, extra: 'Reason' };
+    if (S.state === 'active') return { dur: false, extra: 'Progress' };
+    return { dur: false, extra: null };
+  }
+  function timeLabel() { return S.state === 'completed' || S.state === 'failed' ? 'Finished' : S.state === 'active' ? 'Started' : 'Added'; }
+  function timeOf(j) { return S.state === 'completed' || S.state === 'failed' ? j.finished_on_ms : S.state === 'active' ? j.processed_on_ms : j.timestamp_ms; }
+  function progress(p) {
+    if (p == null) return null;
+    if (typeof p === 'number') {
+      var pct = Math.max(0, Math.min(100, p));
+      return el('div', { class: 'bar', role: 'progressbar', 'aria-valuenow': String(Math.round(pct)), 'aria-valuemin': '0', 'aria-valuemax': '100', title: Math.round(pct) + '%' }, el('i', { style: 'width: ' + pct + '%' }));
+    }
+    return el('span', { class: 'mono muted', text: JSON.stringify(p).slice(0, 60) });
+  }
+  function pager() {
+    var p = S.page, total = p ? p.total : 0, from = total ? S.offset + 1 : 0, to = Math.min(S.offset + S.limit, total);
+    return el('div', { class: 'pager' }, el('span', { class: 'muted', role: 'status', text: num(from) + '–' + num(to) + ' of ' + num(total) }),
+      el('div', { class: 'nav' },
+        el('button', { class: 'btn', disabled: S.offset === 0, 'aria-label': 'Previous page', onclick: function () { page(-1); } }, icon('chevL'), 'Prev'),
+        el('button', { class: 'btn', disabled: S.offset + S.limit >= total, 'aria-label': 'Next page', onclick: function () { page(1); } }, 'Next', icon('chevR'))));
+  }
+  function page(d) {
+    S.offset = Math.max(0, S.offset + d * S.limit); S.sel = -1; writeHash(); load();
+  }
+
+  // ------------------------------------------------------------ schedulers
+  var schedulers = null;
+  function loadSchedulers() {
+    return api('GET', '/queues/' + enc(S.queue) + '/schedulers').then(function (s) { schedulers = s; renderSchedulers(); })
+      .catch(function (e) { schedulers = e; renderSchedulers(); });
+  }
+  function renderSchedulers() {
+    var box = $('sched'); if (!box) return; clear(box);
+    if (schedulers instanceof ApiError) { box.append(el('div', { class: 'empty', role: 'alert' }, el('strong', { text: 'Could not load schedulers' }), el('span', { text: schedulers.message }))); return; }
+    if (!schedulers) { box.append(el('div', { class: 'empty', role: 'status', text: 'Loading schedulers…' })); return; }
+    if (!schedulers.length) { box.append(el('div', { class: 'empty' }, el('strong', { text: 'No schedulers' }), el('span', { text: 'Job schedulers registered on this queue show up here.' }))); return; }
+    var t = el('table', { class: 'jobs' }, el('caption', { class: 'sr', text: 'Schedulers of ' + S.queue }),
+      el('thead', null, el('tr', null, el('th', { scope: 'col' }, 'Id'), el('th', { scope: 'col' }, 'Repeats'), el('th', { scope: 'col' }, 'Next run'), el('th', { scope: 'col' }, 'Job name'), el('th', { scope: 'col' }, el('span', { class: 'sr' }, 'Actions')))));
+    var b = el('tbody');
+    schedulers.forEach(function (s) {
+      var rep = s.repeat.cron != null ? 'cron ' + s.repeat.cron : 'every ' + dur(s.repeat.every_ms);
+      b.append(el('tr', { style: 'cursor: default' }, el('td', { 'data-k': 'id', class: 'id', text: s.id }), el('td', { 'data-k': 'name', class: 'mono', text: rep }),
+        el('td', { 'data-k': 'when', title: when(s.next_ms), text: ago(s.next_ms) }), el('td', { 'data-k': 'dur', text: s.name }),
+        el('td', { 'data-k': 'extra' }, isAdmin() ? el('button', { class: 'btn danger', onclick: function () {
+          confirmIt('Remove scheduler “' + s.id + '”?', 'Its pending runs are removed and every running instance of it stops.', 'Remove').then(function (ok) {
+            if (!ok) return;
+            api('DELETE', '/queues/' + enc(S.queue) + '/schedulers/' + enc(s.id)).then(function () { toast('Scheduler removed'); loadSchedulers(); }, fail);
+          });
+        } }, 'Remove') : null)));
+    });
+    t.append(b); box.append(el('div', { class: 'card' }, t));
+  }
+
+  // --------------------------------------------------------- queue actions
+  function act(method, suffix, done, body) {
+    return api(method, '/queues/' + enc(S.queue) + suffix, body).then(function (r) { if (done) toast(done); loadQueues(); load(); return r; }, fail);
+  }
+  function promoteAll() { act('POST', '/promote-all', null).then(function (r) { if (r) toast(num(r.count) + ' delayed job' + (r.count === 1 ? '' : 's') + ' will run now'); }); }
+  function cleanDialog() {
+    var sel = el('select', { id: 'cleanState' }); CLEANABLE.forEach(function (s) { sel.append(el('option', { value: s, selected: s === 'completed' }, LABEL[s])); });
+    var lim = el('input', { id: 'cleanLimit', type: 'number', min: '0', value: '0' });
+    confirmIt('Clean ' + S.queue, 'Delete the oldest jobs in a state. A limit of 0 deletes them all.', 'Delete jobs',
+      [el('div', { class: 'field' }, el('label', { for: 'cleanState' }, 'State'), sel), el('div', { class: 'field' }, el('label', { for: 'cleanLimit' }, 'Limit'), lim)])
+      .then(function (ok) {
+        if (ok) act('POST', '/clean', null, { state: sel.value, limit: Math.max(0, parseInt(lim.value, 10) || 0) }).then(function (r) { if (r) toast(num(r.count) + ' job' + (r.count === 1 ? '' : 's') + ' deleted'); });
+      });
+  }
+  function drainDialog() {
+    var cb = el('input', { type: 'checkbox', id: 'drainDelayed' });
+    confirmIt('Drain ' + S.queue + '?', 'Every waiting job is deleted. Running jobs are not touched.', 'Drain',
+      [el('label', { class: 'check' }, cb, 'Delete delayed jobs too')])
+      .then(function (ok) { if (ok) act('POST', '/drain', 'Queue drained', { include_delayed: cb.checked }); });
+  }
+  function obliterateDialog() {
+    var inp = el('input', { id: 'oblName', autocomplete: 'off', 'aria-describedby': 'confirmText' });
+    var force = el('input', { type: 'checkbox', id: 'oblForce' });
+    confirmIt('Delete queue ' + S.queue + '?', 'Every job and key of this queue is deleted for good. Type the queue name to confirm.', 'Delete queue',
+      [el('div', { class: 'field' }, el('label', { for: 'oblName' }, 'Queue name'), inp), el('label', { class: 'check' }, force, 'Even if jobs are running')],
+      function () { return inp.value === S.queue; })
+      .then(function (ok) {
+        if (!ok) return;
+        api('DELETE', '/queues/' + enc(S.queue) + (force.checked ? '?force=true' : '')).then(function () {
+          toast('Queue deleted'); S.queue = null; S.page = null; S.job = null; writeHash(); loadQueues().then(function () { renderAll(); load(); followEvents(); });
+        }, fail);
+      });
+  }
+  function addDialog() {
+    var dlg = $('addDlg'); $('addErr').textContent = ''; S.lastFocus = document.activeElement;
+    dlg.onclose = function () {
+      if (dlg.returnValue !== 'ok') { restoreFocus(); return; }
+      var data, opts;
+      try { data = JSON.parse($('addData').value || 'null'); opts = $('addOpts').value.trim() ? JSON.parse($('addOpts').value) : {}; }
+      catch (e) { $('addErr').textContent = 'Not valid JSON: ' + e.message; dlg.showModal(); return; }
+      var body = { data: data, opts: opts }; if ($('addName').value.trim()) body.name = $('addName').value.trim();
+      api('POST', '/queues/' + enc(S.queue) + '/jobs', body).then(function (r) { toast('Job ' + r.id + ' added'); loadQueues(); load(); restoreFocus(); },
+        function (e) { $('addErr').textContent = e.message; dlg.showModal(); });
+    };
+    dlg.showModal();
+  }
+  function restoreFocus() { if (S.lastFocus && document.contains(S.lastFocus)) S.lastFocus.focus(); }
+
+  function confirmIt(title, text, okLabel, extra, valid) {
+    var dlg = $('confirmDlg'); S.lastFocus = document.activeElement;
+    $('confirmTitle').textContent = title; $('confirmText').textContent = text; $('confirmOk').textContent = okLabel || 'Confirm';
+    var ex = clear($('confirmExtra')); add(ex, extra || []);
+    var ok = $('confirmOk'); ok.disabled = !!valid && !valid();
+    var check = function () { if (valid) ok.disabled = !valid(); };
+    ex.addEventListener('input', check);
+    return new Promise(function (resolve) {
+      dlg.onclose = function () { ex.removeEventListener('input', check); restoreFocus(); resolve(dlg.returnValue === 'ok' && (!valid || valid())); };
+      dlg.returnValue = ''; dlg.showModal();
+      var first = ex.querySelector('input, select'); if (first) first.focus();
+    });
+  }
+
+  // --------------------------------------------------------------- drawer
+  function openJob(queue, id) {
+    S.lastFocus = document.activeElement; S.job = { queue: queue, id: String(id) }; writeHash(); syncDrawer();
+  }
+  function closeJob() { S.job = null; S.jobData = null; writeHash(); syncDrawer(); restoreFocus(); }
+  var drawerSeq = 0;
+  function syncDrawer() {
+    var host = clear($('drawerHost'));
+    if (!S.job) { document.body.style.overflow = ''; return; }
+    var j = S.job, seq = ++drawerSeq;
+    var body = el('div', { class: 'body' }, el('div', { class: 'empty', role: 'status', text: 'Loading job…' }));
+    var title = el('h2', { id: 'drawerTitle', class: 'mono', text: j.id });
+    var drawer = el('aside', { class: 'drawer', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'drawerTitle', tabindex: '-1', onkeydown: trapFocus },
+      el('header', null, el('div', { class: 't' }, el('div', { class: 'muted', text: 'Job · ' + j.queue }), title),
+        el('button', { class: 'btn icon ghost', 'aria-label': 'Copy job id', onclick: function () { copy(j.id); } }, icon('copy')),
+        el('button', { class: 'btn icon ghost', 'aria-label': 'Close (Esc)', id: 'drawerClose', onclick: closeJob }, icon('close'))),
+      body);
+    host.append(el('div', { class: 'scrim', onclick: closeJob }), drawer);
+    if (matchMedia('(max-width: 640px)').matches) document.body.style.overflow = 'hidden';
+    $('drawerClose').focus();
+    loadJob(seq, body);
+  }
+  function trapFocus(e) {
+    if (e.key !== 'Tab') return;
+    var f = this.querySelectorAll('button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
+    if (!f.length) return;
+    var first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
+  function copy(text) {
+    if (navigator.clipboard) navigator.clipboard.writeText(text).then(function () { toast('Copied'); }, function () { toast('Copy failed', true); });
+  }
+  function loadJob(seq, body) {
+    var j = S.job, qp = '/queues/' + enc(j.queue) + '/jobs/' + enc(j.id);
+    Promise.all([api('GET', qp), api('GET', qp + '/logs?order=desc&limit=50').catch(function () { return { logs: [] }; })])
+      .then(function (r) {
+        if (seq !== drawerSeq) return;
+        S.jobData = r[0];
+        renderJob(body, r[0], r[1].logs, null);
+        // The flow section only for jobs that are part of a flow.
+        api('GET', qp + '/flow?depth=3').then(function (f) {
+          if (seq === drawerSeq && (f.children.length || r[0].parent)) renderJob(body, r[0], r[1].logs, f);
+        }, function () {});
+      }, function (e) {
+        if (seq !== drawerSeq) return;
+        clear(body).append(el('div', { class: 'empty', role: 'alert' }, el('strong', { text: e.status === 404 ? 'Job not found' : 'Could not load the job' }),
+          el('span', { text: e.status === 404 ? 'It may have been removed, or its retention cleaned it up.' : e.message })));
+      });
+  }
+  function renderJob(body, job, logs, flow) {
+    clear(body);
+    var acts = el('div', { class: 'acts' });
+    if (isAdmin()) {
+      if (job.state === 'failed') acts.append(el('button', { class: 'btn primary', onclick: function () { jobAct('POST', '/retry', 'Job queued for retry'); } }, 'Retry'));
+      if (job.state === 'delayed') acts.append(el('button', { class: 'btn primary', onclick: function () { jobAct('POST', '/promote', 'Job will run now'); } }, 'Run now'));
+      acts.append(el('button', { class: 'btn danger', disabled: job.locked, title: job.locked ? 'A worker is running it' : null,
+        onclick: function () {
+          confirmIt('Remove job ' + job.id + '?', 'The job, its logs and its flow tree are deleted.', 'Remove').then(function (ok) {
+            if (ok) jobAct('DELETE', '', 'Job removed').then(function () { closeJob(); });
+          });
+        } }, 'Remove'));
+    }
+    var started = job.processed_on_ms, finished = job.finished_on_ms;
+    var kv = el('dl', { class: 'kv' });
+    function row(k, v) { if (v === '' || v == null) return; kv.append(el('dt', { text: k }), el('dd', null, v)); }
+    row('State', stateBadge(job.state));
+    row('Name', job.name);
+    row('Attempts', job.attempts_made + ' of ' + job.attempts_total);
+    if (job.opts && job.opts.priority) row('Priority', String(job.opts.priority));
+    row('Added', el('span', { title: when(job.timestamp_ms), text: when(job.timestamp_ms) + ' (' + ago(job.timestamp_ms) + ')' }));
+    if (started) row(finished ? 'Started' : 'Running since', el('span', { title: when(started), text: when(started) + ' (' + ago(started) + ')' }));
+    if (finished) row('Finished', el('span', { title: when(finished), text: when(finished) }));
+    if (started && finished) row('Took', dur(finished - started));
+    if (started) row('Waited', dur(started - job.timestamp_ms));
+    if (job.locked) row('Worker', 'holds the lock');
+    if (job.parent) row('Parent', el('button', { class: 'btn ghost', style: 'min-height: 0; padding: 0 4px', onclick: function () { openJob(job.parent.queue, job.parent.id); } }, job.parent.queue + ' / ' + job.parent.id));
+    body.append(acts.childNodes.length ? acts : null, el('section', null, el('h3', null, 'Overview'), kv));
+    if (job.progress != null) body.append(el('section', null, el('h3', null, 'Progress'), typeof job.progress === 'number' ? progress(job.progress) : el('pre', { class: 'json', text: pretty(job.progress) })));
+    if (job.state === 'failed' || job.failed_reason || job.stacktrace.length) {
+      var ol = el('ul', { 'aria-label': 'Failed attempts, newest first' }); job.stacktrace.slice().reverse().forEach(function (s) { ol.append(el('li', { text: s })); });
+      body.append(el('section', null, el('h3', null, 'Failure'), el('div', { class: 'failure' }, el('p', { text: job.failed_reason || 'Failed' }), job.stacktrace.length ? ol : null)));
+    }
+    if (job.return_value != null) body.append(el('section', null, el('h3', null, 'Return value'), el('pre', { class: 'json', text: pretty(job.return_value) })));
+    body.append(el('section', null, el('h3', null, 'Data'), el('pre', { class: 'json', text: pretty(job.data) })));
+    if (flow) body.append(el('section', null, el('h3', null, 'Flow'), el('ul', { class: 'tree' }, flowNode(flow, job))));
+    var ul = el('ul', { class: 'logs', 'aria-label': 'Log lines, newest first' });
+    logs.forEach(function (l) { ul.append(el('li', { text: l })); });
+    body.append(el('section', null, el('h3', null, 'Logs'), logs.length ? ul : el('p', { class: 'muted', style: 'margin: 0', text: 'No log lines.' })));
+    body.append(el('details', null, el('summary', { class: 'muted', style: 'cursor: pointer' }, 'Options'), el('pre', { class: 'json', style: 'margin-top: 6px', text: pretty(job.opts) })));
+  }
+  function flowNode(n, job) {
+    var me = n.queue === job.queue && n.id === job.id;
+    var li = el('li', null, el('button', { class: 'node' + (me ? ' me' : ''), 'aria-current': me ? 'true' : null, onclick: function () { if (!me) openJob(n.queue, n.id); } },
+      stateBadge(n.state), el('span', { class: 'mono', text: n.id }), el('span', { text: n.name || '(gone)' }),
+      n.queue !== job.queue ? el('span', { class: 'muted', text: '· ' + n.queue }) : null,
+      n.dependency && n.dependency !== 'pending' ? el('span', { class: 'muted', text: '· ' + n.dependency }) : null));
+    if (n.children.length) { var ul = el('ul', { class: 'tree' }); n.children.forEach(function (c) { ul.append(flowNode(c, job)); }); li.append(ul); }
+    if (n.truncated) li.append(el('div', { class: 'muted', style: 'padding-left: 24px', text: '…more' }));
+    return li;
+  }
+  function jobAct(method, suffix, done) {
+    var j = S.job;
+    return api(method, '/queues/' + enc(j.queue) + '/jobs/' + enc(j.id) + suffix).then(function () { toast(done); loadQueues(); load(); if (method !== 'DELETE') syncDrawer(); }, function (e) { fail(e); throw e; });
+  }
+
+  // --------------------------------------------------------------- events
+  var refreshTimer = null;
+  function scheduleRefresh() {
+    if (refreshTimer) return;
+    refreshTimer = setTimeout(function () { refreshTimer = null; load(); }, 700);
+  }
+  function setLive(state) {
+    S.live = state; $('live').dataset.state = state;
+    $('liveText').textContent = state === 'live' ? 'Live' : state === 'polling' ? 'Polling' : 'Offline';
+  }
+  function followEvents() {
+    if (S.events) S.events.abort();
+    var queue = S.queue; if (!queue || !window.ReadableStream || !window.TextDecoderStream) { setLive('polling'); return; }
+    var ctl = new AbortController(); S.events = ctl;
+    var last = null;
+    (function loop() {
+      if (ctl.signal.aborted) return;
+      var h = headers(false); h.accept = 'text/event-stream'; if (last) h['last-event-id'] = last;
+      fetch(S.base + '/v1/queues/' + enc(queue) + '/events', { headers: h, signal: ctl.signal }).then(function (res) {
+        if (res.status === 401) { askToken(); throw new Error('unauthorized'); }
+        if (!res.ok || !res.body) throw new Error('events ' + res.status);
+        setLive('live');
+        var reader = res.body.pipeThrough(new TextDecoderStream()).getReader(), buf = '';
+        function pump() {
+          return reader.read().then(function (r) {
+            if (r.done) throw new Error('closed');
+            buf += r.value;
+            var i;
+            while ((i = buf.indexOf('\n\n')) >= 0) {
+              var frame = buf.slice(0, i); buf = buf.slice(i + 2);
+              var ev = {}; frame.split('\n').forEach(function (line) { var c = line.indexOf(': '); if (c > 0) ev[line.slice(0, c)] = line.slice(c + 2); });
+              if (ev.id) last = ev.id;
+              if (ev.event) onEvent(ev);
+            }
+            return pump();
+          });
+        }
+        return pump();
+      }).catch(function () {
+        if (ctl.signal.aborted) return;
+        setLive('polling');
+        sleep(3000).then(loop);
+      });
     })();
-
-    async function api(path, opts) {
-      const res = await fetch(BASE + path, opts);
-      if (!res.ok) throw new Error(await res.text());
-      if (res.status === 204) return null;
-      return res.json();
+  }
+  function onEvent(ev) {
+    scheduleRefresh();
+    if (S.job && S.job.queue === S.queue && S.jobData) {
+      try { var d = JSON.parse(ev.data); if (d.id === S.job.id) jobRefresh(); } catch (e) { /* not JSON */ }
     }
+  }
+  var jobRefreshTimer = null;
+  function jobRefresh() {
+    if (jobRefreshTimer) return;
+    jobRefreshTimer = setTimeout(function () { jobRefreshTimer = null; var b = document.querySelector('.drawer .body'); if (b && S.job) loadJob(drawerSeq, b); }, 400);
+  }
+  setInterval(function () {
+    if (document.hidden) return;
+    if (S.live !== 'live') load();
+    loadQueues();
+  }, 5000);
 
-    async function refresh() {
-      const queues = await api('/api/queues');
-      const nav = document.getElementById('queues');
-      nav.innerHTML = '';
-      for (const q of queues) {
-        const total = Object.values(q.counts).reduce((a,b)=>a+b,0);
-        const el = document.createElement('div');
-        el.className = 'q' + (q.paused ? ' paused' : '') + (selectedQueue === q.name ? ' active' : '');
-        el.innerHTML = `<span>${q.name}</span><small>${total}</small>`;
-        el.onclick = () => { selectedQueue = q.name; render(); };
-        nav.appendChild(el);
+  // ----------------------------------------------------------------- auth
+  function askToken() {
+    var dlg = $('tokenDlg'); if (dlg.open) return;
+    $('tokenIn').value = ''; $('tokenClear').hidden = !S.token;
+    dlg.onclose = function () {
+      if (dlg.returnValue === 'ok' && $('tokenIn').value.trim()) {
+        S.token = $('tokenIn').value.trim();
+        write('session', 'oxn.token', S.token); write('local', 'oxn.token', $('tokenRemember').checked ? S.token : null);
+        start();
+      } else if (dlg.returnValue === 'clear') {
+        S.token = null; write('session', 'oxn.token', null); write('local', 'oxn.token', null); S.access = null; start();
       }
-      if (selectedQueue) await render();
+    };
+    dlg.showModal();
+  }
+
+  // ---------------------------------------------------------------- theme
+  var THEMES = ['auto', 'light', 'dark'];
+  function applyTheme(t) {
+    if (t === 'auto') document.documentElement.removeAttribute('data-theme'); else document.documentElement.setAttribute('data-theme', t);
+    var b = clear($('themeBtn')); b.append(icon(t === 'dark' ? 'moon' : t === 'light' ? 'sun' : 'auto'));
+    b.setAttribute('aria-label', 'Theme: ' + t + ' (change)');
+  }
+
+  // -------------------------------------------------------------- startup
+  function start() {
+    return api('GET', '/whoami').then(function (w) { S.access = w.access; }, function (e) { S.access = null; if (e.status !== 401) fail(e); })
+      .then(loadQueues).then(function () { renderAll(); load(); syncDrawer(); followEvents(); });
+  }
+  $('sideToggle').append(icon('menu'));
+  $('refreshBtn').append(icon('refresh'));
+  $('keyBtn').append(icon('key'));
+  $('sideToggle').addEventListener('click', function () {
+    var lay = $('layout'), wide = matchMedia('(min-width: 900px)').matches;
+    setSide(wide ? lay.classList.contains('collapsed') : !lay.classList.contains('open'));
+  });
+  $('qpick').addEventListener('click', function () { setSide(!$('layout').classList.contains('open')); });
+  $('refreshBtn').addEventListener('click', function () { loadQueues(); load(); });
+  $('keyBtn').addEventListener('click', askToken);
+  var theme = read('local', 'oxn.theme') || 'auto'; applyTheme(theme);
+  $('themeBtn').addEventListener('click', function () { theme = THEMES[(THEMES.indexOf(theme) + 1) % 3]; write('local', 'oxn.theme', theme); applyTheme(theme); });
+  $('qfilter').addEventListener('input', function (e) { S.filter = e.target.value; renderQueues(); });
+  S.limit = parseInt(read('local', 'oxn.limit') || '25', 10) || 25;
+  document.addEventListener('keydown', function (e) {
+    var t = e.target, typing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
+    if (e.key === 'Escape') {
+      if (document.querySelector('dialog[open]')) return;
+      if (S.job) { e.preventDefault(); closeJob(); return; }
+      if ($('layout').classList.contains('open')) { setSide(false); $('sideToggle').focus(); }
+      return;
     }
-
-    async function render() {
-      const q = selectedQueue;
-      if (!q) return;
-      const counts = await api('/api/queues/' + encodeURIComponent(q) + '/counts');
-      const detail = document.getElementById('detail');
-      detail.innerHTML = `
-        <h2 style="margin-top:0">${q}</h2>
-        <div class="toolbar">
-          <button class="btn ghost" onclick="pause('${q}')">Pause</button>
-          <button class="btn ghost" onclick="resume('${q}')">Resume</button>
-          <button class="btn danger" onclick="drain('${q}')">Drain</button>
-        </div>
-        <div class="counts">
-          ${STATES.map(s => {
-            const key = s.replace('-','_');
-            const n = counts[key] ?? 0;
-            return `<div class="card ${selectedState === s ? 'selected' : ''}">
-              <button onclick="pickState('${s}')">
-                <small>${s}</small>
-                <b>${n}</b>
-              </button>
-            </div>`;
-          }).join('')}
-        </div>
-        <div id="jobs"></div>
-      `;
-      await renderJobs();
+    if (typing || e.metaKey || e.ctrlKey || e.altKey || document.querySelector('dialog[open]')) return;
+    if (e.key === '/') { var s = $('jobSearch'); if (s) { e.preventDefault(); s.focus(); } }
+    else if (e.key === 'r') { loadQueues(); load(); }
+    else if ((e.key === 'j' || e.key === 'k') && S.page && S.page.jobs.length && !S.job) {
+      S.sel = Math.max(0, Math.min(S.page.jobs.length - 1, S.sel + (e.key === 'j' ? 1 : -1)));
+      renderList(); var rows = document.querySelectorAll('.jobs tbody tr'); if (rows[S.sel]) rows[S.sel].focus();
     }
-
-    function stateActions(q, state, total) {
-      // Bulk actions that depend on the currently-selected state. Empty
-      // string for states where bulk operations don't make sense.
-      if (state === 'completed' || state === 'failed') {
-        if (!total) return '';
-        return `<button class="btn danger" onclick="cleanState('${q}','${state}',${total})">Clean ${total} ${state}</button>`;
-      }
-      if (state === 'delayed') {
-        const help = `<span style="color:var(--muted);font-size:11px;margin-left:8px">Jobs sit in <em>delayed</em> when the producer asked for a delay, when a handler returned <code>Error::Delayed</code>/<code>RateLimited</code>, when a retry is waiting for backoff, or when the scheduler queued them for a future fire time.</span>`;
-        if (!total) return help;
-        return `<button class="btn ghost" onclick="promoteAllDelayed('${q}',${total})">Promote all ${total}</button>` + help;
-      }
-      return '';
-    }
-
-    async function renderJobs() {
-      const q = selectedQueue;
-      const res = await api(`/api/queues/${encodeURIComponent(q)}/jobs?state=${selectedState}&start=0&end=49&desc=true`);
-      const out = document.getElementById('jobs');
-      const actions = stateActions(q, selectedState, res.total);
-      const actionsBar = actions
-        ? `<div class="toolbar" style="margin-bottom:10px">${actions}</div>`
-        : '';
-      if (!res.jobs.length) {
-        out.innerHTML = `${actionsBar}<div class="empty">No ${selectedState} jobs.</div>`;
-        return;
-      }
-      out.innerHTML = `${actionsBar}
-        <table>
-          <thead><tr>
-            <th>ID</th><th>Name</th><th>State</th><th>Attempts</th><th>Created</th><th>Finished</th><th></th>
-          </tr></thead>
-          <tbody>
-            ${res.jobs.map(j => `
-              <tr class="row" onclick="openJob('${q}','${escapeAttr(j.id)}')">
-                <td><code>${j.id}</code></td>
-                <td>${j.name}</td>
-                <td><span class="pill ${j.state}">${j.state ?? '-'}</span></td>
-                <td>${j.attempts_made} / ${j.attempts_total}</td>
-                <td>${new Date(j.timestamp_ms).toISOString().slice(0,19).replace('T',' ')}</td>
-                <td>${j.finished_on_ms ? new Date(j.finished_on_ms).toISOString().slice(0,19).replace('T',' ') : '-'}</td>
-                <td onclick="event.stopPropagation()">
-                  ${j.state === 'failed' ? `<button class="btn ghost" onclick="retryJob('${q}','${j.id}')">Retry</button>` : ''}
-                  ${j.state === 'delayed' ? `<button class="btn ghost" onclick="promoteJob('${q}','${j.id}')">Promote</button>` : ''}
-                  <button class="btn danger" onclick="removeJob('${q}','${j.id}')">Remove</button>
-                </td>
-              </tr>
-              ${j.failed_reason ? `<tr><td colspan="7" class="reason">${j.failed_reason}</td></tr>` : ''}
-            `).join('')}
-          </tbody>
-        </table>
-      `;
-    }
-
-    function escapeHtml(s) {
-      if (s == null) return '';
-      return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-    }
-    function escapeAttr(s) { return escapeHtml(s).replace(/`/g, '&#96;'); }
-    function fmtTs(ms) { return ms ? new Date(ms).toISOString().slice(0,19).replace('T',' ') : '-'; }
-    function fmtJson(s) {
-      if (s == null || s === '') return '<em style="color:var(--muted)">none</em>';
-      try { return `<pre class="code">${escapeHtml(JSON.stringify(JSON.parse(s), null, 2))}</pre>`; }
-      catch { return `<pre class="code">${escapeHtml(s)}</pre>`; }
-    }
-
-    async function openJob(q, id) {
-      openJobId = id;
-      const drawer = document.getElementById('drawer');
-      const backdrop = document.getElementById('drawerBackdrop');
-      drawer.classList.add('open');
-      backdrop.classList.add('open');
-      drawer.setAttribute('aria-hidden', 'false');
-      document.getElementById('drawerTitle').textContent = `Job ${id}`;
-      document.getElementById('drawerBody').innerHTML = `<div class="empty">Loading…</div>`;
-      await renderJob(q, id);
-    }
-
-    function closeJob() {
-      openJobId = null;
-      const drawer = document.getElementById('drawer');
-      const backdrop = document.getElementById('drawerBackdrop');
-      drawer.classList.remove('open');
-      backdrop.classList.remove('open');
-      drawer.setAttribute('aria-hidden', 'true');
-    }
-
-    async function reloadJob() {
-      if (selectedQueue && openJobId) await renderJob(selectedQueue, openJobId);
-    }
-
-    async function renderJob(q, id) {
-      const body = document.getElementById('drawerBody');
-      let job, logs;
-      try {
-        [job, logs] = await Promise.all([
-          api(`/api/queues/${encodeURIComponent(q)}/jobs/${encodeURIComponent(id)}`),
-          api(`/api/queues/${encodeURIComponent(q)}/jobs/${encodeURIComponent(id)}/logs?desc=false`).catch(() => ({logs: [], count: 0})),
-        ]);
-      } catch (e) {
-        body.innerHTML = `<div class="empty">Failed to load: ${escapeHtml(e.message)}</div>`;
-        return;
-      }
-      if (!job) {
-        body.innerHTML = `<div class="empty">Job not found.</div>`;
-        return;
-      }
-      const stateClass = job.state || 'waiting';
-      const durMs = (job.processed_on_ms && job.finished_on_ms) ? (job.finished_on_ms - job.processed_on_ms) : null;
-      body.innerHTML = `
-        <div class="actions">
-          ${job.state === 'failed' ? `<button class="btn ghost" onclick="retryJob('${q}','${escapeAttr(job.id)}'); reloadJob();">Retry</button>` : ''}
-          ${job.state === 'delayed' ? `<button class="btn ghost" onclick="promoteJob('${q}','${escapeAttr(job.id)}'); reloadJob();">Promote</button>` : ''}
-          <button class="btn danger" onclick="removeJob('${q}','${escapeAttr(job.id)}'); closeJob();">Remove</button>
-        </div>
-
-        <h3>Stats</h3>
-        <div class="stats">
-          <div class="k">ID</div><div class="v"><code>${escapeHtml(job.id)}</code></div>
-          <div class="k">Name</div><div class="v">${escapeHtml(job.name)}</div>
-          <div class="k">State</div><div class="v"><span class="pill ${stateClass}">${escapeHtml(job.state ?? '-')}</span></div>
-          <div class="k">Attempts</div><div class="v">${job.attempts_made} / ${job.opts?.attempts ?? '?'}</div>
-          <div class="k">Priority</div><div class="v">${job.opts?.priority ?? 0}</div>
-          <div class="k">Created</div><div class="v">${fmtTs(job.timestamp_ms)}</div>
-          <div class="k">Started</div><div class="v">${fmtTs(job.processed_on_ms)}</div>
-          <div class="k">Finished</div><div class="v">${fmtTs(job.finished_on_ms)}</div>
-          <div class="k">Duration</div><div class="v">${durMs != null ? durMs + ' ms' : '-'}</div>
-          <div class="k">Lock token</div><div class="v">${job.lock_token ? `<code>${escapeHtml(job.lock_token)}</code>` : '-'}</div>
-          <div class="k">Remove on complete</div><div class="v">${escapeHtml(JSON.stringify(job.opts?.remove_on_complete ?? 'Keep'))}</div>
-          <div class="k">Remove on fail</div><div class="v">${escapeHtml(JSON.stringify(job.opts?.remove_on_fail ?? 'Keep'))}</div>
-        </div>
-
-        <h3>Data</h3>
-        ${fmtJson(job.data)}
-
-        <h3>Progress</h3>
-        ${fmtJson(job.progress_json)}
-
-        <h3>Return value</h3>
-        ${fmtJson(job.return_value_json)}
-
-        ${job.failed_reason ? `<h3>Failed reason</h3><pre class="code reason">${escapeHtml(job.failed_reason)}</pre>` : ''}
-        ${job.stacktrace && job.stacktrace.length ? `<h3>Stack trace</h3><pre class="code">${escapeHtml(job.stacktrace.join('\n\n'))}</pre>` : ''}
-
-        <h3>Logs <small style="color:var(--muted);font-weight:400">(${logs.count})</small></h3>
-        ${logs.count
-          ? `<div class="logs">${logs.logs.map(l => `<div class="line">${escapeHtml(l)}</div>`).join('')}</div>`
-          : `<div style="color:var(--muted);font-size:12px">No log lines.</div>`}
-      `;
-    }
-
-    function pickState(s) { selectedState = s; render(); }
-
-    async function pause(q) { await api(`/api/queues/${encodeURIComponent(q)}/pause`, {method:'POST'}); refresh(); }
-    async function resume(q) { await api(`/api/queues/${encodeURIComponent(q)}/resume`, {method:'POST'}); refresh(); }
-    async function drain(q) {
-      if (!confirm('Drain ' + q + '? This removes pending + prioritized jobs.')) return;
-      await api(`/api/queues/${encodeURIComponent(q)}/drain`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({include_delayed:false})});
-      refresh();
-    }
-    async function retryJob(q, id) { await api(`/api/queues/${encodeURIComponent(q)}/jobs/${id}/retry`, {method:'POST'}); renderJobs(); }
-    async function promoteJob(q, id) { await api(`/api/queues/${encodeURIComponent(q)}/jobs/${id}/promote`, {method:'POST'}); renderJobs(); }
-    async function removeJob(q, id) {
-      if (!confirm('Remove job ' + id + '?')) return;
-      await api(`/api/queues/${encodeURIComponent(q)}/jobs/${id}/remove`, {method:'POST'});
-      renderJobs();
-    }
-
-    async function cleanState(q, state, total) {
-      if (!confirm(`Clean ${total} ${state} job${total === 1 ? '' : 's'} from "${q}"? Their hashes, logs, and dependency keys are deleted.`)) return;
-      const res = await api(
-        `/api/queues/${encodeURIComponent(q)}/clean/${encodeURIComponent(state)}`,
-        { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ limit: 0 }) },
-      );
-      refresh();
-      console.info('cleaned', res?.count, state, 'jobs');
-    }
-
-    async function promoteAllDelayed(q, total) {
-      if (!confirm(`Promote all ${total} delayed job${total === 1 ? '' : 's'} on "${q}" to wait?`)) return;
-      const res = await api(
-        `/api/queues/${encodeURIComponent(q)}/promote-all`,
-        { method:'POST' },
-      );
-      refresh();
-      console.info('promoted', res?.count, 'delayed jobs');
-    }
-
-    document.addEventListener('keydown', e => { if (e.key === 'Escape') closeJob(); });
-
-    refresh();
-    setInterval(async () => {
-      await refresh();
-      if (openJobId && selectedQueue) await renderJob(selectedQueue, openJobId);
-    }, 5000);
-  </script>
+  });
+  matchMedia('(min-width: 900px)').addEventListener('change', function () { $('layout').classList.remove('open', 'collapsed'); setSide(matchMedia('(min-width: 900px)').matches); });
+  readHash();
+  setSide(matchMedia('(min-width: 900px)').matches);
+  start();
+})();
+</script>
 </body>
 </html>

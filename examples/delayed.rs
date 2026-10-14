@@ -13,12 +13,13 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let q: Queue<Task> = Queue::builder("demo")
-        .redis("redis://127.0.0.1:6379")
+        .redis(std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into()))
         .build()
         .await?;
 
     // Fires immediately.
-    q.add(Task("now".into()), JobOptions::new().priority(1)).await?;
+    q.add(Task("now".into()), JobOptions::new().priority(1))
+        .await?;
     // Delayed by 2s.
     q.add(
         Task("later".into()),

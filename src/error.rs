@@ -61,9 +61,10 @@ pub enum Error {
     #[error("unrecoverable: {0}")]
     Unrecoverable(String),
 
-    /// The parent job is blocked waiting on child dependencies to finish.
-    #[cfg(feature = "flow")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "flow")))]
+    /// Return this from a handler to park the job until its children (added
+    /// under it with `FlowProducer::add_under`) resolve. The attempt is
+    /// refunded; the job runs again once the last child completes — at once
+    /// if none is pending.
     #[error("waiting on child dependencies")]
     WaitingChildren,
 
@@ -74,6 +75,12 @@ pub enum Error {
     /// The handler returned an error.
     #[error("handler error: {0}")]
     Handler(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    /// The handler panicked. The worker catches the panic and treats it
+    /// like a returned error (retry per the job's policy, else fail), with
+    /// the panic message as the failure reason.
+    #[error("handler panicked: {0}")]
+    Panicked(String),
 
     /// I/O error from the runtime or network.
     #[error(transparent)]
@@ -101,6 +108,32 @@ impl Error {
     /// `true` if re-queueing the job is pointless.
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Unrecoverable(_) | Self::NotFound(_))
+    }
+
+    /// `true` when the operation was refused because the job is in the
+    /// wrong state or another worker owns it — the HTTP layers map this to
+    /// `409 Conflict`.
+    pub fn is_conflict(&self) -> bool {
+        matches!(
+            self,
+            Self::Script(
+                ScriptError::NotInExpectedState
+                    | ScriptError::LockNotFound
+                    | ScriptError::LockMismatch
+                    | ScriptError::JobLocked
+                    | ScriptError::PendingChildren
+                    | ScriptError::JobExists
+            )
+        )
+    }
+
+    /// `true` when the job's lock was lost: the worker no longer owns the
+    /// job and its outcome was discarded.
+    pub fn is_lock_lost(&self) -> bool {
+        matches!(
+            self,
+            Self::Script(ScriptError::LockNotFound | ScriptError::LockMismatch)
+        )
     }
 }
 
@@ -130,6 +163,13 @@ pub enum ScriptError {
     /// The token passed to a finalization script doesn't match the held lock.
     #[error("lock token does not match worker token")]
     LockMismatch,
+    /// The job is active and its lock is held by a worker, so it can't be
+    /// removed out from under it.
+    #[error("job is locked by an active worker")]
+    JobLocked,
+    /// An explicit job id in a flow already names a job; nothing was added.
+    #[error("a job with that explicit id already exists")]
+    JobExists,
     /// A parent has children that failed permanently.
     #[error("parent has failed children")]
     FailedChildren,
@@ -151,6 +191,8 @@ impl ScriptError {
             -4 => Self::PendingChildren,
             -5 => Self::ParentNotFound,
             -6 => Self::LockMismatch,
+            -7 => Self::JobLocked,
+            -8 => Self::JobExists,
             -9 => Self::FailedChildren,
             other => Self::Unknown(other),
         }
@@ -179,13 +221,11 @@ mod tests {
     fn script_error_codes_cover_bullmq_table() {
         assert_eq!(ScriptError::from_code(-1), ScriptError::JobNotFound);
         assert_eq!(ScriptError::from_code(-2), ScriptError::LockNotFound);
-        assert_eq!(
-            ScriptError::from_code(-3),
-            ScriptError::NotInExpectedState
-        );
+        assert_eq!(ScriptError::from_code(-3), ScriptError::NotInExpectedState);
         assert_eq!(ScriptError::from_code(-4), ScriptError::PendingChildren);
         assert_eq!(ScriptError::from_code(-5), ScriptError::ParentNotFound);
         assert_eq!(ScriptError::from_code(-6), ScriptError::LockMismatch);
+        assert_eq!(ScriptError::from_code(-7), ScriptError::JobLocked);
         assert_eq!(ScriptError::from_code(-9), ScriptError::FailedChildren);
         assert_eq!(ScriptError::from_code(-42), ScriptError::Unknown(-42));
     }
@@ -197,6 +237,16 @@ mod tests {
         assert!(!Error::Delayed { delay_ms: 100 }.is_terminal());
         assert!(!Error::RateLimited { delay_ms: 100 }.is_terminal());
         assert!(!Error::Closed.is_terminal());
+    }
+
+    #[test]
+    fn conflict_and_lock_lost_classification() {
+        assert!(Error::Script(ScriptError::NotInExpectedState).is_conflict());
+        assert!(Error::Script(ScriptError::JobLocked).is_conflict());
+        assert!(!Error::NotFound("x".into()).is_conflict());
+        assert!(Error::Script(ScriptError::LockMismatch).is_lock_lost());
+        assert!(Error::Script(ScriptError::LockNotFound).is_lock_lost());
+        assert!(!Error::Script(ScriptError::JobLocked).is_lock_lost());
     }
 
     #[test]
@@ -214,4 +264,3 @@ mod tests {
         assert!(s.contains("750"));
     }
 }
-

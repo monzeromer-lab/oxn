@@ -19,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let queue: Queue<Email> = Queue::builder("emails")
-        .redis("redis://127.0.0.1:6379")
+        .redis(std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into()))
         // Drop jobs from Redis as soon as they finish, so the queue
         // stays tidy. Swap for `Removal::KeepLast(100)` to retain a
         // bounded history.

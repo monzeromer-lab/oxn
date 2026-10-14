@@ -11,8 +11,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use oxn::backend::redis::{RedisBackend, RedisConfig};
 use oxn::backend::Backend;
+use oxn::backend::redis::{RedisBackend, RedisConfig};
 use oxn::{JobOptions, Queue, QueueOptions};
 use serde::{Deserialize, Serialize};
 
@@ -23,9 +23,7 @@ struct Dummy {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
-    let url = std::env::var("REDIS_URL").unwrap_or_else(|_| {
-        "redis://127.0.0.1:6379".into()
-    });
+    let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
     let pool_size = std::env::var("POOL_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -52,13 +50,16 @@ async fn main() -> anyhow::Result<()> {
         "diag-q",
         backend.clone() as Arc<dyn Backend>,
         QueueOptions::default().prefix("oxn-diag"),
-    );
+    )?;
 
     // Force any lingering pool slots open so we measure script cost only.
     let probe_t = Instant::now();
     let probes = (0..pool_size).map(|_| q.counts());
     let _ = futures::future::join_all(probes).await;
-    println!("post-connect counts() x{pool_size}: {:?}", probe_t.elapsed());
+    println!(
+        "post-connect counts() x{pool_size}: {:?}",
+        probe_t.elapsed()
+    );
     println!();
 
     // ── 10 sequential adds — first should be hot if warmup worked
@@ -101,10 +102,7 @@ async fn main() -> anyhow::Result<()> {
     });
     let results = futures::future::join_all(futs).await;
     let parallel_wall = t.elapsed();
-    let mut times: Vec<_> = results
-        .into_iter()
-        .filter_map(|r| r.ok())
-        .collect();
+    let mut times: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
     times.sort_by_key(|(_, d)| *d);
     let min = times.first().map(|(_, d)| *d).unwrap_or_default();
     let max = times.last().map(|(_, d)| *d).unwrap_or_default();
@@ -112,9 +110,7 @@ async fn main() -> anyhow::Result<()> {
         .get(times.len() / 2)
         .map(|(_, d)| *d)
         .unwrap_or_default();
-    println!(
-        "  wall: {parallel_wall:?}  min: {min:?}  median: {median:?}  max: {max:?}"
-    );
+    println!("  wall: {parallel_wall:?}  min: {min:?}  median: {median:?}  max: {max:?}");
     println!();
 
     // ── cold-start scenario: brand new backend, time the *very first* add()
@@ -137,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
         "diag-q",
         backend2.clone() as Arc<dyn Backend>,
         QueueOptions::default().prefix("oxn-diag"),
-    );
+    )?;
 
     let t = Instant::now();
     let id = q2
@@ -194,9 +190,7 @@ async fn main() -> anyhow::Result<()> {
         }
         println!();
     } else {
-        println!(
-            "(skip long-idle test; set IDLE_SECS=120 to exercise the proxy-FIN scenario)"
-        );
+        println!("(skip long-idle test; set IDLE_SECS=120 to exercise the proxy-FIN scenario)");
         println!();
     }
 
@@ -225,9 +219,7 @@ async fn main() -> anyhow::Result<()> {
     println!("  10 sequential SCRIPT LOAD:  {:?}", t.elapsed());
 
     let t = Instant::now();
-    let _: String = redis::cmd("PING")
-        .query_async(&mut conn)
-        .await?;
+    let _: String = redis::cmd("PING").query_async(&mut conn).await?;
     println!("  one PING:                   {:?}", t.elapsed());
 
     let _ = backend2.obliterate("diag-q", true).await;

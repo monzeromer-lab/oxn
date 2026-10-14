@@ -123,11 +123,7 @@ pub async fn queue_counts(state: &DashboardState, queue: &str) -> Result<StateCo
 }
 
 /// Backs `GET /api/queues/{name}/jobs` — paginated listing of jobs in a state.
-pub async fn list_jobs(
-    state: &DashboardState,
-    queue: &str,
-    q: ListQuery,
-) -> Result<ListResponse> {
+pub async fn list_jobs(state: &DashboardState, queue: &str, q: ListQuery) -> Result<ListResponse> {
     let js = JobState::parse(&q.state).unwrap_or(JobState::Waiting);
     let range = JobRange {
         start: q.start,
@@ -153,11 +149,7 @@ pub async fn list_jobs(
 }
 
 /// Backs `GET /api/queues/{name}/jobs/{id}` — full [`RawJob`] record.
-pub async fn get_job(
-    state: &DashboardState,
-    queue: &str,
-    id: &JobId,
-) -> Result<Option<RawJob>> {
+pub async fn get_job(state: &DashboardState, queue: &str, id: &JobId) -> Result<Option<RawJob>> {
     state.backend.get(queue, id).await
 }
 
@@ -238,11 +230,7 @@ pub async fn resume_queue(state: &DashboardState, queue: &str) -> Result<()> {
 
 /// Backs `POST /api/queues/{name}/drain` — remove every pending job.
 /// When `include_delayed` is true, the `delayed` zset is wiped as well.
-pub async fn drain_queue(
-    state: &DashboardState,
-    queue: &str,
-    include_delayed: bool,
-) -> Result<()> {
+pub async fn drain_queue(state: &DashboardState, queue: &str, include_delayed: bool) -> Result<()> {
     state.backend.drain(queue, include_delayed).await
 }
 
@@ -280,10 +268,7 @@ pub async fn clean_state(
 
 /// Backs `POST /api/queues/{name}/promote-all` — move every delayed job
 /// into `wait` immediately. Returns the number of jobs promoted.
-pub async fn promote_all(
-    state: &DashboardState,
-    queue: &str,
-) -> Result<CountResponse> {
+pub async fn promote_all(state: &DashboardState, queue: &str) -> Result<CountResponse> {
     let count = state.backend.promote_all(queue).await?;
     Ok(CountResponse { count })
 }
