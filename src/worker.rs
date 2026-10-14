@@ -25,6 +25,7 @@ use crate::error::{Error, Result};
 use crate::job::Job;
 use crate::options::WorkerOptions;
 use crate::queue::{Queue, decode_job};
+use crate::report::{FailureKind, JobFailure, JobInfo, ReportConfig, Reporter};
 
 /// Boxed future returned by a handler.
 pub type HandlerFuture<R> = Pin<Box<dyn Future<Output = Result<R>> + Send + 'static>>;
@@ -171,6 +172,7 @@ where
     opts: WorkerOptions,
     handler: HandlerFn<D, R>,
     cancel: CancellationToken,
+    report: ReportConfig,
     _data: PhantomData<fn() -> (D, R)>,
 }
 
@@ -305,9 +307,11 @@ where
             opts,
             handler,
             cancel,
+            report,
             _data,
         } = self;
         crate::telemetry::describe();
+        let reporter = Arc::new(Reporter::new(report));
 
         let semaphore = Arc::new(Semaphore::new(opts.concurrency));
         let token_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -323,6 +327,7 @@ where
             let interval = opts.stalled_interval;
             let max_stalled = opts.max_stalled;
             let c = cancel.clone();
+            let reporter = reporter.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -331,7 +336,12 @@ where
                         _ = c.cancelled() => break,
                         _ = tick.tick() => {
                             match backend.scan_stalled(&queue, max_stalled).await {
-                                Ok(ids) => crate::telemetry::stalled(&queue, ids.len()),
+                                Ok(scan) => {
+                                    crate::telemetry::stalled(&queue, scan.len());
+                                    for job in &scan.failed {
+                                        reporter.stalled(&queue, job);
+                                    }
+                                }
                                 Err(e) => tracing::warn!(queue = %queue, error = %e, "stalled scan failed"),
                             }
                         }
@@ -394,13 +404,16 @@ where
                     let queue = queue.clone();
                     let handler = handler.clone();
                     let opts = opts.clone();
+                    let reporter = reporter.clone();
                     let signals = Signals {
                         shutdown: cancel.clone(),
                         abort: abort.clone(),
                     };
                     tokio::spawn(async move {
-                        process_one::<D, R>(backend, queue, raw, token, handler, opts, signals)
-                            .await;
+                        process_one::<D, R>(
+                            backend, queue, raw, token, handler, opts, signals, reporter,
+                        )
+                        .await;
                         drop(permit);
                     });
                 }
@@ -471,6 +484,7 @@ where
 /// be released before `run()` returns anyway.
 const RELEASE_GRACE: Duration = Duration::from_secs(5);
 
+#[allow(clippy::too_many_arguments)]
 async fn process_one<D, R>(
     backend: Arc<dyn Backend>,
     queue: String,
@@ -479,6 +493,7 @@ async fn process_one<D, R>(
     handler: HandlerFn<D, R>,
     opts: WorkerOptions,
     signals: Signals,
+    reporter: Arc<Reporter>,
 ) where
     D: DeserializeOwned + Send + Sync + 'static,
     R: Serialize + Send + 'static,
@@ -509,6 +524,7 @@ async fn process_one<D, R>(
         handler,
         opts,
         signals,
+        &reporter,
         span.clone(),
     )
     .instrument(span.clone())
@@ -526,6 +542,7 @@ async fn process_one_inner<D, R>(
     handler: HandlerFn<D, R>,
     opts: WorkerOptions,
     signals: Signals,
+    reporter: &Reporter,
     span: tracing::Span,
 ) where
     D: DeserializeOwned + Send + Sync + 'static,
@@ -540,6 +557,14 @@ async fn process_one_inner<D, R>(
     // trip to re-read the job hash for them.
     let remove_on_complete = raw.opts.remove_on_complete;
     let remove_on_fail = raw.opts.remove_on_fail;
+    let name = raw.name.clone();
+    let report = reporter.job(JobInfo {
+        queue: &queue,
+        id: &id,
+        name: &name,
+        attempt: attempts_made,
+        attempts: attempts_total,
+    });
     let job: Job<D> = match decode_job::<D>(raw) {
         Ok(j) => j,
         Err(e) => {
@@ -556,7 +581,10 @@ async fn process_one_inner<D, R>(
                     Failure::new(&reason).removal(remove_on_fail).trace(&trace),
                 )
                 .await;
-            log_transition(&queue, "failed", &r);
+            report.transition("failed", &r);
+            if r.is_ok() {
+                report.failed(FailureKind::Decode, &reason, Some(&e), None);
+            }
             return;
         }
     };
@@ -582,13 +610,16 @@ async fn process_one_inner<D, R>(
     // A panic — while building the future or while polling it — becomes
     // `Error::Panicked`, handled like any returned error. Uncaught, it would
     // unwind this task and leave the job locked until its lock expired.
-    let mut handler_fut: BoxFuture<'static, Result<R>> = match std::panic::catch_unwind(
-        std::panic::AssertUnwindSafe(|| (handler)(job, ctx.clone())),
-    ) {
-        Ok(fut) => std::panic::AssertUnwindSafe(fut)
-            .catch_unwind()
-            .map(|r| r.unwrap_or_else(|p| Err(Error::Panicked(panic_message(p.as_ref())))))
-            .boxed(),
+    // Both run with the job's Sentry hub current (feature `sentry`).
+    let mut handler_fut: BoxFuture<'static, Result<R>> = match report.run_sync(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (handler)(job, ctx.clone())))
+    }) {
+        Ok(fut) => report.bind(
+            std::panic::AssertUnwindSafe(fut)
+                .catch_unwind()
+                .map(|r| r.unwrap_or_else(|p| Err(Error::Panicked(panic_message(p.as_ref())))))
+                .boxed(),
+        ),
         Err(p) => {
             let msg = panic_message(p.as_ref());
             futures::future::ready(Err(Error::Panicked(msg))).boxed()
@@ -606,7 +637,7 @@ async fn process_one_inner<D, R>(
                 span.record("transition", "released");
                 tracing::debug!("handler aborted by shutdown_timeout; releasing job");
                 let r = backend.release(&queue, &id, &token).await;
-                log_transition(&queue, "released", &r);
+                report.transition("released", &r);
                 return;
             }
             _ = renew.tick(), if !lock_lost.is_cancelled() => {
@@ -658,9 +689,12 @@ async fn process_one_inner<D, R>(
                         Failure::new(reason).removal(remove_on_fail).trace(&trace),
                     )
                     .await;
-                log_transition(&queue, "failed", &r);
+                report.transition("failed", &r);
+                if r.is_ok() {
+                    report.failed(FailureKind::PendingChildren, reason, None, None);
+                }
             } else {
-                log_transition(&queue, "completed", &r);
+                report.transition("completed", &r);
             }
         }
         // Park until the children added under this job resolve; the
@@ -668,7 +702,7 @@ async fn process_one_inner<D, R>(
         Err(Error::WaitingChildren) => {
             span.record("transition", "waiting-children");
             let r = backend.wait_for_children(&queue, &id, &token).await;
-            log_transition(&queue, "waiting-children", &r.map(|_| ()));
+            report.transition("waiting-children", &r.map(|_| ()));
         }
         // Postponements, not failures: the attempt is refunded and no
         // failedReason is recorded.
@@ -676,51 +710,47 @@ async fn process_one_inner<D, R>(
             let until = chrono_like_now_ms() + delay_ms as i64;
             span.record("transition", "postponed");
             let r = backend.delay(&queue, &id, &token, until).await;
-            log_transition(&queue, "postponed", &r);
+            report.transition("postponed", &r);
         }
-        Err(Error::Unrecoverable(msg)) => {
-            span.record("transition", "failed");
+        Err(err) => {
+            let kind = match &err {
+                Error::Unrecoverable(_) => FailureKind::Unrecoverable,
+                Error::Panicked(_) => FailureKind::Panicked,
+                _ => FailureKind::Error,
+            };
+            // An unrecoverable error stores its message alone as the reason.
+            let reason = match &err {
+                Error::Unrecoverable(msg) => msg.clone(),
+                other => other.to_string(),
+            };
+            // `attempts_made` has already been incremented by `fetch_next`
+            // before the handler ran, so it counts the current attempt.
+            // We still have another attempt if `attempts_made < total`.
+            let retry_at = (kind != FailureKind::Unrecoverable && attempts_made < attempts_total)
+                .then(|| {
+                    let delay = backoff
+                        .map(|b| b.compute(attempts_made))
+                        .unwrap_or(Duration::ZERO);
+                    tracing::debug!(backoff_ms = delay.as_millis() as u64, error = %err, "scheduling retry");
+                    chrono_like_now_ms() + delay.as_millis() as i64
+                });
+            let to = if retry_at.is_some() {
+                "retry-delayed"
+            } else {
+                "failed"
+            };
+            span.record("transition", to);
             let r = backend
                 .fail(
                     &queue,
                     &id,
                     &token,
-                    failure(&msg, None, remove_on_fail, trace),
+                    failure(&reason, retry_at, remove_on_fail, trace),
                 )
                 .await;
-            log_transition(&queue, "failed", &r);
-        }
-        Err(err) => {
-            // `attempts_made` has already been incremented by `fetch_next`
-            // before the handler ran, so it counts the current attempt.
-            // We still have another attempt if `attempts_made < total`.
-            if attempts_made < attempts_total {
-                let delay = backoff
-                    .map(|b| b.compute(attempts_made))
-                    .unwrap_or(Duration::ZERO);
-                let retry_at = chrono_like_now_ms() + delay.as_millis() as i64;
-                span.record("transition", "retry-delayed");
-                tracing::debug!(backoff_ms = delay.as_millis() as u64, error = %err, "scheduling retry");
-                let r = backend
-                    .fail(
-                        &queue,
-                        &id,
-                        &token,
-                        failure(&err.to_string(), Some(retry_at), remove_on_fail, trace),
-                    )
-                    .await;
-                log_transition(&queue, "retry-delayed", &r);
-            } else {
-                span.record("transition", "failed");
-                let r = backend
-                    .fail(
-                        &queue,
-                        &id,
-                        &token,
-                        failure(&err.to_string(), None, remove_on_fail, trace),
-                    )
-                    .await;
-                log_transition(&queue, "failed", &r);
+            report.transition(to, &r);
+            if r.is_ok() {
+                report.failed(kind, &reason, Some(&err), retry_at);
             }
         }
     }
@@ -797,7 +827,7 @@ fn outcome_label<R>(r: &Result<R>) -> &'static str {
 /// worker took the job over) and is a warning: this worker's outcome is
 /// discarded and the job's new owner decides its fate. Anything else is an
 /// error — the outcome was not recorded and nobody else owns the job yet.
-fn log_transition(queue: &str, to: &'static str, r: &Result<()>) {
+pub(crate) fn log_transition(queue: &str, to: &'static str, r: &Result<()>) {
     crate::telemetry::transition(queue, to, r);
     match r {
         Ok(()) => tracing::debug!(to, "transition applied"),
@@ -828,6 +858,7 @@ where
     handler: HandlerFn<D, R>,
     cancel: Option<CancellationToken>,
     id: Option<String>,
+    report: ReportConfig,
 }
 
 impl<D, R> std::fmt::Debug for WorkerBuilder<D, R>
@@ -854,6 +885,7 @@ where
             handler,
             cancel: None,
             id: None,
+            report: ReportConfig::default(),
         }
     }
 
@@ -956,6 +988,35 @@ where
         self
     }
 
+    /// Call `hook` for every failed attempt, once Redis has recorded it:
+    /// with the job, the error, whether it will be retried. Use it to send
+    /// failures to an error tracker or a pager. Call it several times to add
+    /// several hooks.
+    ///
+    /// Hooks run on the worker's task, so they must not block: hand slow
+    /// work to a channel or a spawned task. A hook that panics is logged
+    /// and ignored. Postponements (`Error::Delayed`, `RateLimited`,
+    /// `WaitingChildren`) are not failures and are not reported. See
+    /// [`crate::report`].
+    #[must_use]
+    pub fn on_failure<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(&JobFailure<'_>) + Send + Sync + 'static,
+    {
+        self.report.hooks.push(Arc::new(hook));
+        self
+    }
+
+    /// What this worker reports to Sentry (feature `sentry`). Without this
+    /// call, [`SentryOptions::default`](crate::sentry::SentryOptions):
+    /// final failures and lost outcomes. See [`crate::sentry`].
+    #[cfg(feature = "sentry")]
+    #[must_use]
+    pub fn sentry(mut self, opts: crate::sentry::SentryOptions) -> Self {
+        self.report.sentry = opts;
+        self
+    }
+
     /// Build the worker. Does **not** start the loop — call [`Worker::run`].
     pub fn build(self) -> Worker<D, R> {
         Worker {
@@ -965,6 +1026,7 @@ where
             opts: self.opts,
             handler: self.handler,
             cancel: self.cancel.unwrap_or_default(),
+            report: self.report,
             _data: PhantomData,
         }
     }

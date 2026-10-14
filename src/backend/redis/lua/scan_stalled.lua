@@ -27,7 +27,9 @@
 -- ARGV[2] max stalled
 -- ARGV[3] max stream len
 --
--- Returns the ids that were requeued.
+-- Returns {requeued ids, failed} where failed is a flat list of
+-- (id, name, attemptsMade, attempts) for each job failed for good, read
+-- before its retention policy may delete it.
 
 local activeKey  = KEYS[1]
 local eventsKey  = KEYS[5]
@@ -40,7 +42,7 @@ local maxStream  = tonumber(ARGV[3])
 
 -- run at most once per second per queue; exit early otherwise
 if not redis.call('SET', KEYS[4], nowMs, 'NX', 'PX', 1000) then
-  return {}
+  return {{}, {}}
 end
 
 -- The legacy `stalled` set was write-only; nothing ever read it.
@@ -53,6 +55,7 @@ local ready = {
 local reason = 'job stalled more than allowable limit'
 
 local moved = {}
+local failed = {}
 local active = redis.call('LRANGE', activeKey, 0, -1)
 for i = 1, #active do
   local id = active[i]
@@ -66,7 +69,12 @@ for i = 1, #active do
       local attemptsMade = redis.call('HGET', hashKey, 'attemptsMade') or '0'
       oxnPushStack(hashKey, 'attempt ' .. attemptsMade .. ': ' .. reason
         .. ' (stalled ' .. stalled .. ' times)')
-      local policy = oxnPolicyFromOpts(oxnJobOpts(hashKey)['remove_on_fail'])
+      local opts = oxnJobOpts(hashKey)
+      local policy = oxnPolicyFromOpts(opts['remove_on_fail'])
+      table.insert(failed, id)
+      table.insert(failed, redis.call('HGET', hashKey, 'name') or '')
+      table.insert(failed, attemptsMade)
+      table.insert(failed, tostring(tonumber(opts['attempts']) or 1))
       oxnChildFailed(hashKey, reason, nowMs, maxStream)
       oxnRetain(failedKey, hashPrefix, id, policy, nowMs)
       oxnEmit(eventsKey, maxStream, 'event', 'failed', 'jobId', id,
@@ -82,4 +90,4 @@ for i = 1, #active do
     end
   end
 end
-return moved
+return {moved, failed}

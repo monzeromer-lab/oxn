@@ -188,6 +188,7 @@ If you implement `oxn::backend::Backend` yourself:
 | `delay(queue, id, token, until_ms)` (new, required) | Postpone without consuming an attempt. |
 | `fail(queue, id, token, Failure)` | `Failure { reason, retry_at_ms, removal, trace }`. Build it with `Failure::new(reason).retry_at(ms).removal(r).trace(t)`. |
 | `subscribe(queue, StreamStart) -> RecordStream` | Yield `EventRecord`s, starting where asked. |
+| `scan_stalled(queue, max_stalled) -> StalledScan` | Return the requeued ids **and** the jobs failed for good (`StalledJob { id, name, attempts_made, attempts }`), so workers can report them. |
 | `JobInsert::opts` is `ResolvedJobOptions` | Resolve first: `opts.resolve_with(&defaults)`. |
 | `add_flow`, `wait_for_children`, `dependencies` | Optional. The defaults refuse with `Error::Config`. |
 | `schedule_tick`, `schedulers`, `remove_scheduler` | Optional. Same default. |

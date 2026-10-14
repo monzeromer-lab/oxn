@@ -25,7 +25,8 @@ use tracing::Instrument;
 
 use crate::backend::{
     Backend, Dependencies, EventRecord, Failure, Fetched, FlowJobInsert, JobInsert, JobRange,
-    RawJob, RecordStream, SchedulerInfo, SchedulerTick, StateCounts, StreamStart, TickOutcome,
+    RawJob, RecordStream, SchedulerInfo, SchedulerTick, StalledJob, StalledScan, StateCounts,
+    StreamStart, TickOutcome,
 };
 use crate::error::{Error, Result};
 use crate::events::Event;
@@ -1013,7 +1014,7 @@ impl Backend for RedisBackend {
         Ok(())
     }
 
-    async fn scan_stalled(&self, queue: &str, max_stalled: u32) -> Result<Vec<JobId>> {
+    async fn scan_stalled(&self, queue: &str, max_stalled: u32) -> Result<StalledScan> {
         let keys = self.keys(queue);
         let mut inv = self.scripts.scan_stalled.prepare_invoke();
         inv.key(keys.active())
@@ -1035,8 +1036,19 @@ impl Backend for RedisBackend {
         let reply = self
             .eval(&mut conn, "scan_stalled", queue, None, &inv)
             .await?;
-        let moved: Vec<String> = redis::from_redis_value(&reply)?;
-        Ok(moved.into_iter().map(JobId::new).collect())
+        let (moved, failed): (Vec<String>, Vec<String>) = redis::from_redis_value(&reply)?;
+        Ok(StalledScan {
+            requeued: moved.into_iter().map(JobId::new).collect(),
+            failed: failed
+                .chunks_exact(4)
+                .map(|f| StalledJob {
+                    id: JobId::new(f[0].clone()),
+                    name: f[1].clone(),
+                    attempts_made: f[2].parse().unwrap_or(0),
+                    attempts: f[3].parse().unwrap_or(1),
+                })
+                .collect(),
+        })
     }
 
     async fn pause(&self, queue: &str) -> Result<()> {

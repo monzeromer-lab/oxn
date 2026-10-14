@@ -25,6 +25,7 @@ mod dedup;
 mod delayed;
 mod delayed_precision;
 mod drain_obliterate;
+mod error_reporting;
 mod event_stream;
 mod events;
 mod explicit_ids;

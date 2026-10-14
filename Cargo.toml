@@ -58,6 +58,7 @@ tls-native = [
 scheduler = ["dep:cron", "dep:chrono"]
 flow = []
 metrics = ["dep:metrics"]
+sentry = ["dep:sentry-core"]
 
 # HTTP API (`oxn::api`): the framework-neutral core, and its adapters.
 api = []
@@ -125,6 +126,11 @@ chrono = { version = "0.4", optional = true, default-features = false, features 
 # Metrics
 metrics = { version = "0.24", optional = true }
 
+# Error tracking. `sentry-core` without its client: the app's own `sentry`
+# crate supplies the client, so the range lets Cargo reuse the app's version
+# (0.47+ needs Rust 1.88, above our MSRV, hence the upper bound).
+sentry-core = { version = ">=0.36, <0.47", optional = true, default-features = false, features = ["client"] }
+
 # Dashboard — axum
 axum = { version = "0.7", optional = true, default-features = false, features = [
     "tokio",
@@ -152,6 +158,7 @@ tokio-util = "0.7"
 redis = { version = "0.27", default-features = false, features = ["tokio-comp"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 jsonschema = { version = "0.49", default-features = false }
+sentry = { version = ">=0.36, <0.47", default-features = false, features = ["test"] }
 oxn-testkit = { path = "testkit" }
 
 [[example]]

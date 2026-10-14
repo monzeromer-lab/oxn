@@ -1,10 +1,10 @@
 //! Queue events.
 //!
-//! BullMQ exposes events two ways: EventEmitter for local subscribers, and a
-//! Redis Stream for cross-process subscribers. `oxn` mirrors both, but the
-//! local side is a [`tokio::sync::broadcast`] and the cross-process side is a
-//! [`futures::Stream`] of [`Event`] values — not the dynamic name dispatch
-//! of JavaScript EventEmitters.
+//! Every lifecycle event is written to the queue's Redis Stream, so any
+//! process can follow it. [`QueueEvents::stream`] yields typed [`Event`]
+//! values as a [`futures::Stream`] (and [`QueueEvents::records`] adds each
+//! entry's id, for consumers that resume), instead of the dynamic name
+//! dispatch of BullMQ's EventEmitter.
 
 use std::pin::Pin;
 use std::sync::Arc;

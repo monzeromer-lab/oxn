@@ -293,6 +293,40 @@ impl JobRange {
 /// Event stream type alias to avoid `Pin<Box<...>>` noise at call sites.
 pub use crate::events::{EventRecord, EventStream, RecordStream, StreamStart};
 
+/// What one [`Backend::scan_stalled`] pass did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StalledScan {
+    /// Jobs whose lock had expired, put back to run again.
+    pub requeued: Vec<JobId>,
+    /// Jobs that stalled more than `max_stalled` times and failed for good.
+    pub failed: Vec<StalledJob>,
+}
+
+impl StalledScan {
+    /// Jobs found stalled, requeued or failed.
+    pub fn len(&self) -> usize {
+        self.requeued.len() + self.failed.len()
+    }
+
+    /// `true` if no stalled job was found.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// A job [`Backend::scan_stalled`] failed for good.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StalledJob {
+    /// The job's id.
+    pub id: JobId,
+    /// The job's name.
+    pub name: String,
+    /// Attempts made, counting the one that stalled.
+    pub attempts_made: u32,
+    /// Attempts the job was allowed.
+    pub attempts: u32,
+}
+
 /// Pluggable storage backend.
 ///
 /// All operations are `async` and fail with [`crate::Error`]. A single
@@ -390,9 +424,10 @@ pub trait Backend: Send + Sync + fmt::Debug + 'static {
         duration: Duration,
     ) -> Result<()>;
 
-    /// Scan `active` for jobs whose lock has expired, marking them stalled
-    /// and pushing them back to `wait`. Returns the ids that moved.
-    async fn scan_stalled(&self, queue: &str, max_stalled: u32) -> Result<Vec<JobId>>;
+    /// Scan `active` for jobs whose lock has expired. Each one stalled at
+    /// most `max_stalled` times goes back to its ready container; one that
+    /// stalled more fails for good into `failed`.
+    async fn scan_stalled(&self, queue: &str, max_stalled: u32) -> Result<StalledScan>;
 
     /// Pause `wait` → `paused`. Already-active jobs continue.
     async fn pause(&self, queue: &str) -> Result<()>;

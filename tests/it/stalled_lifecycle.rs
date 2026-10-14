@@ -45,7 +45,7 @@ async fn stall(b: &Arc<RedisBackend>, q: &str) -> JobId {
 /// rate-limit flag between scans.
 async fn scan(b: &Arc<RedisBackend>, q: &str, max_stalled: u32) -> Vec<JobId> {
     tokio::time::sleep(ms(1050)).await;
-    b.scan_stalled(q, max_stalled).await.unwrap()
+    b.scan_stalled(q, max_stalled).await.unwrap().requeued
 }
 
 #[tokio::test(flavor = "multi_thread")]

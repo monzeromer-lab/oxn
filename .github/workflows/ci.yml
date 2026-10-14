@@ -56,7 +56,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p oxn --lib --no-default-features
-      - run: cargo test --workspace --features "scheduler,flow,metrics,dashboard-axum,dashboard-actix"
+      - run: cargo test --workspace --features "scheduler,flow,metrics,sentry,dashboard-axum,dashboard-actix"
       - run: cargo test -p oxn --features dashboard-actix --lib
       - name: timing tests (alone, on an idle Redis)
         run: cargo test --test it -- --ignored --test-threads=1

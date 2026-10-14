@@ -75,7 +75,9 @@ for a checklist and before/after code.
   `fetch_next` takes a trailing `Option<RateLimit>` (B12d); new
   `add_flow`, `wait_for_children` and `dependencies` with default
   implementations that refuse (B13); `schedule_tick`, `schedulers` and
-  `remove_scheduler` (B14).
+  `remove_scheduler` (B14); `scan_stalled` returns a `StalledScan`
+  (`requeued` ids and the `failed` jobs, with name and attempts) instead
+  of the requeued ids only.
 - Scheduler (B14): `RepeatOptions::Cron` is a struct variant
   `{ expr, schedule }`; `every(d)` ticks are aligned to the Unix epoch
   instead of `d` after each enqueue; `run` keeps the *next* tick queued
@@ -91,6 +93,9 @@ for a checklist and before/after code.
 
 ### Fixed
 
+- `oxn_jobs_stalled_total` counted only the stalled jobs that were
+  requeued, although it was documented as "requeued or failed". It now
+  counts both.
 - **Workers pick up new work immediately (B3).** A worker that found the
   queue empty blocked on `BZPOPMIN` for the whole `drain_delay` (5s by
   default) and nothing woke it: plain and prioritized adds never touched
@@ -353,6 +358,33 @@ for a checklist and before/after code.
   lost, outcome discarded"); any other rejection as an error.
 
 ### Added
+
+- **Error tracking.** `WorkerBuilder::on_failure(|f: &JobFailure| …)`
+  reports every failed attempt once Redis has recorded it. A
+  `JobFailure` carries:
+  - the queue, job id and name;
+  - the attempt and the number of attempts allowed;
+  - a `FailureKind`: `Error`, `Panicked`, `Unrecoverable`, `Decode`,
+    `PendingChildren` or `Stalled`;
+  - the reason and the handler's error;
+  - when the job runs again (`None` means it failed for good).
+
+  Jobs that the stalled scanner fails are reported too. A hook that
+  panics is contained. The new **`sentry` feature** reports to the
+  application's Sentry client with no extra code:
+  - **Events:** a final failure is an `error` event whose exception chain
+    starts at the user's own error type. An outcome Redis never recorded is
+    an `error` event. Retries are optional `warning` events.
+  - **Tags and grouping:** events are tagged `oxn.queue`, `oxn.job_name`,
+    `oxn.failure` and `oxn.final`, carry an `oxn job` context, and are
+    grouped per queue and job name.
+  - **A scope per handler:** each handler runs in its own Sentry hub, so
+    its own reports and panics carry the job's tags without mixing between
+    concurrent jobs.
+  - **Versions:** oxn depends on `sentry-core` 0.36 up to, but not
+    including, 0.47 (tested at both ends). It warns when a worker starts
+    with no Sentry client bound, which also happens when Cargo resolved two
+    `sentry-core` copies.
 
 - **A redesigned, responsive dashboard.** Still one embedded HTML file
   with no build step (~60 KB), mounted as before, now on the `/v1` API.

@@ -783,7 +783,10 @@ async fn a_child_failed_by_the_stall_limit_fails_its_parent() {
         .step("scan with max_stalled = 0", b.scan_stalled(&qn, 0))
         .await
         .unwrap();
-    assert!(moved.is_empty());
+    assert!(moved.requeued.is_empty());
+    assert_eq!(moved.failed.len(), 1, "{moved:?}");
+    assert_eq!(moved.failed[0].id, tree.children[0].id);
+    assert_eq!(moved.failed[0].name, "doomed");
     let s = rec.snapshot();
     assert_eq!(s.location(tree.children[0].id.as_str()), "failed");
     assert_eq!(s.location(tree.id.as_str()), "failed");

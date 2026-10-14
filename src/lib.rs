@@ -80,7 +80,9 @@
 //!
 //! Postponements record no failure. For progress, logs, lock-loss and
 //! shutdown signals, build the worker with [`Worker::builder_with_ctx`] and
-//! use the [`JobContext`] it passes to the handler.
+//! use the [`JobContext`] it passes to the handler. To send failures to an
+//! error tracker, see [`report`] (any tracker, via
+//! `WorkerBuilder::on_failure`) and the `sentry` feature.
 //!
 //! ## Feature flags
 //!
@@ -92,11 +94,12 @@
 //! | `scheduler`        | `JobScheduler` — cron and fixed-interval repeats.             |
 //! | `flow`             | `FlowProducer` — parent/child DAGs.                           |
 //! | `metrics`          | `oxn_*` counters/histograms via the `metrics` crate (`oxn::metrics`). |
+//! | `sentry`           | Job failures reported to Sentry, a Sentry scope per handler (`oxn::sentry`). |
 //! | `api-axum`         | `api::axum_router` — the `/v1` HTTP API on any axum app.      |
 //! | `api-actix`        | `api::actix_scope` — the same API on any actix-web app.       |
 //! | `dashboard-axum`   | `dashboard::axum_router` — the API plus the bundled UI.       |
 //! | `dashboard-actix`  | `dashboard::actix_scope` — mount on any actix-web app.        |
-//! | `full`             | All of the above (rustls TLS), with `dashboard-axum` selected.|
+//! | `full`             | All of the above except `sentry` (rustls TLS), with `dashboard-axum` selected.|
 //!
 //! ## TLS (managed Redis)
 //!
@@ -137,7 +140,7 @@
 //!   fixed (queue defaults, instant pickup, graceful shutdown, no leaked
 //!   keys, lossless events, stalled-job lifecycle, …); flows, schedulers,
 //!   rate limiting and metrics implemented for real; a [`JobContext`] for
-//!   handlers; a standalone `/v1` HTTP API (`oxn::api`) with optional auth;
+//!   handlers; failure reporting to Sentry or any error tracker; a standalone `/v1` HTTP API (`oxn::api`) with optional auth;
 //!   a redesigned, responsive dashboard. Breaking: see
 //!   `docs/MIGRATION-0.3.md`.
 //! - **0.2.2** — bulk dashboard ops (`clean`, `promote_all`).
@@ -181,6 +184,7 @@ pub mod events;
 pub mod job;
 pub mod options;
 pub mod queue;
+pub mod report;
 pub mod validate;
 pub mod worker;
 
@@ -203,6 +207,10 @@ pub mod dashboard;
 #[cfg(feature = "metrics")]
 #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
 pub mod metrics;
+
+#[cfg(feature = "sentry")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sentry")))]
+pub mod sentry;
 mod telemetry;
 
 pub mod prelude;
@@ -212,6 +220,7 @@ pub use crate::events::{Event, EventRecord, QueueEvents, StreamStart};
 pub use crate::job::{Backoff, Job, JobId, JobRef, JobState, Progress};
 pub use crate::options::{JobOptions, QueueOptions, ResolvedJobOptions, WorkerOptions};
 pub use crate::queue::Queue;
+pub use crate::report::{FailureKind, JobFailure};
 pub use crate::worker::{JobContext, Worker};
 
 #[cfg(feature = "flow")]

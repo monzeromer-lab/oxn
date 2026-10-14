@@ -5,9 +5,9 @@ A Redis-backed async job queue for Rust.
 `oxn` takes architectural inspiration from Node's [BullMQ][bullmq] — atomic
 Lua state transitions, Redis Streams for cross-process events, stalled-lock
 recovery, parent/child flows — and rebuilds them around Rust idioms:
-generic typed jobs, `tokio::sync::broadcast` semantics, builder patterns,
+generic typed jobs, events as a `futures::Stream`, builder patterns,
 `thiserror`-based errors, `CancellationToken` shutdown, and a pluggable
-[`Backend`] trait so Redis is the default, not a hardcoded assumption.
+`Backend` trait so Redis is the default, not a hardcoded assumption.
 
 [bullmq]: https://github.com/taskforcesh/bullmq
 
@@ -21,8 +21,8 @@ is fixed with a regression test: queue defaults, instant pickup, graceful
 shutdown, leaked keys, lost events, the stalled-job lifecycle, retried
 outcomes after a dropped connection, and more. Flows, schedulers, rate
 limiting and metrics now actually work. New in 0.3: a `JobContext` for
-handlers, a standalone `/v1` HTTP API with optional auth, and a redesigned,
-responsive dashboard. It has breaking changes: see
+handlers, failure reporting to Sentry or any error tracker, a standalone
+`/v1` HTTP API with optional auth, and a redesigned, responsive dashboard. It has breaking changes: see
 **[docs/MIGRATION-0.3.md](docs/MIGRATION-0.3.md)**. Per-version notes are in
 [CHANGELOG.md](CHANGELOG.md).
 
@@ -43,7 +43,7 @@ responsive dashboard. It has breaking changes: see
 | Sandboxed processors via `child_process.fork` | Use `tokio::spawn`, or spawn a sibling binary — the runtime already gives you isolation |
 | `Queue` extends `QueueGetters` extends `QueueBase` | Composition over inheritance: `Queue<D>` holds an `Arc<dyn Backend>` |
 | `opts.removeOnComplete: { count: 100 }` | Typed `Removal::KeepLast(100)` |
-| Lua scripts registered with a version suffix | Lua bundled via `include_str!`, cached by `redis::Script` (EVALSHA) |
+| Lua scripts registered with a version suffix | Lua assembled at build time, embedded with `include_str!`, run with `EVALSHA` |
 | `.close()` to wait on in-flight jobs | `CancellationToken` + `WorkerOptions::shutdown_timeout` |
 
 Jobs are `Serialize + DeserializeOwned`; everything crossing the Redis boundary
@@ -100,11 +100,12 @@ async fn main() -> oxn::Result<()> {
 | `scheduler`       | `JobScheduler` — cron and fixed-interval repeats               |
 | `flow`            | `FlowProducer` — parent/child trees (a parent runs after its children) |
 | `metrics`         | `oxn_*` counters, histograms and a gauge via the `metrics` crate (names in `oxn::metrics`) |
+| `sentry`          | Job failures reported to Sentry; each handler gets its own Sentry scope (`oxn::sentry`) |
 | `api-axum`        | `api::axum_router` — the `/v1` HTTP API on any axum app        |
 | `api-actix`       | `api::actix_scope` — the same API on any actix-web app         |
 | `dashboard-axum`  | `dashboard::axum_router` — the API plus the bundled UI         |
 | `dashboard-actix` | `dashboard::actix_scope` — mount on any actix-web app          |
-| `full`            | Everything above with rustls `tls` and the axum dashboard      |
+| `full`            | Everything above except `sentry` and actix, with rustls `tls` and the axum dashboard |
 
 ```toml
 [dependencies]
@@ -229,7 +230,7 @@ scheduled time arrives.
 ### Retention (delete on completion)
 
 Completed and failed jobs are kept indefinitely by default. To drop them as
-soon as they finish — or keep a bounded window — configure a [`Removal`]
+soon as they finish — or keep a bounded window — configure a `Removal`
 policy at queue setup time:
 
 ```rust
@@ -269,7 +270,7 @@ let mut stream = events.stream().await?;
 while let Some(Ok(event)) = stream.next().await {
     match event {
         Event::Completed { id, .. } => println!("{id} done"),
-        Event::Failed { id, reason, attempts_made } => {
+        Event::Failed { id, reason, attempts_made, .. } => {
             eprintln!("{id} failed after {attempts_made}: {reason}");
         }
         _ => {}
@@ -385,6 +386,58 @@ appear, each labelled with `queue`:
 A transition is counted only after Redis accepts it. The names and their
 meanings are documented in `oxn::metrics`. Without the feature, the
 emitters compile to nothing.
+
+### Error tracking: Sentry and others
+
+Every failed attempt can be sent to an error tracker once Redis has
+recorded it. `on_failure` works with any tracker:
+
+```rust
+let worker = Worker::builder(queue.clone(), handler)
+    .on_failure(|f| {
+        if f.is_final() {
+            bugsnag.notify(f.queue, f.job_name, f.job_id.as_str(), f.reason);
+        }
+    })
+    .build();
+```
+
+A `JobFailure` carries the queue, job id and name, the attempt and the
+number of attempts allowed, a `kind`, the stored reason, the handler's
+error (walk `source()` for its causes) and `retry_at_ms` (`None` means the
+job failed for good). `kind` is one of `Error`, `Panicked`,
+`Unrecoverable`, `Decode`, `PendingChildren` or `Stalled`. Postponements
+are not failures. Jobs the stalled scanner fails are reported too.
+
+**Sentry** is built in. Enable the `sentry` feature and call
+`sentry::init` as usual before starting workers. Nothing else is needed:
+
+```toml
+oxn = { version = "0.3", features = ["sentry"] }
+sentry = "0.46"
+```
+
+- **What becomes an event.** A job that failed for good is an `error`
+  event. The exception chain starts at your own error type, so the issue
+  is titled `CardDeclined: …`, not with oxn's wrapper. Outcomes Redis
+  never recorded are also `error` events. Retried attempts are reported,
+  as `warning` events, only with
+  `.sentry(SentryOptions::default().report_retries(true))`.
+- **Tags and grouping.** Events are tagged `oxn.queue`, `oxn.job_name`,
+  `oxn.failure` and `oxn.final`, and carry an `oxn job` context (id,
+  attempt, reason). Issues are grouped per queue and job name.
+- **A scope per handler.** Each handler runs in its own Sentry scope
+  holding those tags. Anything your handler reports, and any panic that
+  Sentry's panic integration catches, is labelled with its job, even with
+  many jobs running at once.
+- **One `sentry-core`.** oxn accepts `sentry-core` 0.36 up to (not
+  including) 0.47. Cargo may still resolve two copies: `cargo tree -i
+  sentry-core` must show one version. If it shows two, run
+  `cargo update -p sentry-core@<the newer one> --precise <your sentry version>`.
+  A worker that starts without a Sentry client logs a warning that says
+  so.
+
+See `oxn::sentry` for the details.
 
 ## HTTP API
 
@@ -565,7 +618,7 @@ Every fix in 0.3 started as a failing regression test. The suite:
 - **76 unit tests**: types, serde round-trips, key layout, option
   resolution, error-code mapping, cron and interval maths, API routing,
   auth and DTO validation.
-- **191 integration tests** against a live Redis (`TEST_REDIS_URL`),
+- **203 integration tests** against a live Redis (`TEST_REDIS_URL`),
   plus one timing test that runs on its own. Each test uses a unique queue
   name. With `oxn-testkit`, tests record a timeline of backend calls, Lua
   return codes and events, and they check the queue's invariants: every
@@ -573,11 +626,12 @@ Every fix in 0.3 started as a failing regression test. The suite:
   match their owners, and counts match the containers. When a test fails,
   its timeline is written to `target/oxn-reports/`. The tests cover every
   bug fixed in 0.3, flows, schedulers running across processes, rate
-  limits, metrics, and fault injection (a connection cut before or after a
+  limits, metrics, failure reporting (including Sentry events and
+  per-job scopes), and fault injection (a connection cut before or after a
   script runs). An HTTP contract suite runs against both the axum and
   actix adapters and validates every response against the OpenAPI
   document.
-- **21 doctests**.
+- **23 doctests**.
 - **Browser tests** (`e2e/ui`, Playwright): 41 runs of the dashboard at
   375, 768 and 1280 px, covering every action, hostile XSS payloads,
   read-only and token modes, live updates, keyboard use and axe
@@ -595,13 +649,13 @@ scripts/test-redis.sh start
 export TEST_REDIS_URL=redis://127.0.0.1:6390
 
 # everything
-cargo test --workspace --features "scheduler,flow,metrics,dashboard-axum,dashboard-actix"
+cargo test --workspace --features "scheduler,flow,metrics,sentry,dashboard-axum,dashboard-actix"
 
 # unit tests only (no Redis required)
 cargo test --lib --no-default-features
 
 # timing-sensitive test, run alone
-cargo test --test it --features "scheduler,flow,metrics,dashboard-axum,dashboard-actix" -- --ignored --test-threads=1
+cargo test --test it --features "scheduler,flow,metrics,sentry,dashboard-axum,dashboard-actix" -- --ignored --test-threads=1
 
 # load campaign (SOAK=2h for the long soak)
 scripts/load-campaign.sh
