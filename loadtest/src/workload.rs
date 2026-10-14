@@ -348,7 +348,7 @@ pub fn queue_on(backend: Arc<dyn Backend>, name: &str, defaults: JobOptions) -> 
 
 fn removal_for(r: Retention) -> Removal {
     match r {
-        Retention::Keep | Retention::Mixed => Removal::Keep,
+        Retention::Keep | Retention::Mixed | Retention::Bounded => Removal::Keep,
         Retention::Remove => Removal::Remove,
         Retention::Last1000 => Removal::KeepLast(1000),
         Retention::For30s => Removal::KeepFor(Duration::from_secs(30)),
@@ -417,6 +417,9 @@ pub fn plan(cfg: &Config, seq: u64, seed: u64) -> (LoadJob, JobOptions) {
             Retention::Last1000,
             Retention::For30s,
         ][rng.gen_range(0..4)],
+        Retention::Bounded => {
+            [Retention::Remove, Retention::Last1000, Retention::For30s][rng.gen_range(0..3)]
+        }
         r => r,
     });
     let job = LoadJob {

@@ -89,30 +89,37 @@ fn v(rule: &'static str, severity: Severity, job: Option<&str>, detail: String) 
 pub fn check(snap: &Snapshot) -> Vec<Violation> {
     use Severity::*;
     let mut out = Vec::new();
+    // One pass over the containers; per-id scans are quadratic on the
+    // 100k-job snapshots load runs take.
+    let index = snap.container_index();
+    let of = |id: &str| index.get(id).cloned().unwrap_or_default();
+    let loc = |id: &str| location(&index, snap, id);
 
     // Membership: each id in exactly one container, and has a hash.
-    for id in snap.container_ids() {
-        let c = snap.containers_of(&id);
+    let mut ids: Vec<&str> = index.keys().copied().collect();
+    ids.sort_unstable();
+    for id in ids {
+        let c = of(id);
         if c.len() > 1 {
             out.push(v(
                 "single-container",
                 Error,
-                Some(&id),
+                Some(id),
                 format!("present in {}", c.join(" + ")),
             ));
         }
-        if !snap.jobs.contains_key(&id) {
+        if !snap.jobs.contains_key(id) {
             out.push(v(
                 "dangling-entry",
                 Error,
-                Some(&id),
+                Some(id),
                 format!("listed in {} but its job hash does not exist", c.join("+")),
             ));
         }
     }
 
     for (id, job) in &snap.jobs {
-        let containers = snap.containers_of(id);
+        let containers = of(id);
         let active = containers.contains(&"active");
         if containers.is_empty() {
             out.push(v(
@@ -149,7 +156,7 @@ pub fn check(snap: &Snapshot) -> Vec<Violation> {
                 Some(id),
                 format!(
                     "not active (in {}) but lock {token:?} still exists (pttl {pttl}ms)",
-                    snap.location(id)
+                    loc(id)
                 ),
             )),
             (None, false) => {}
@@ -161,7 +168,7 @@ pub fn check(snap: &Snapshot) -> Vec<Violation> {
                 Some(id),
                 format!(
                     "in {} but hash still has lockToken={:?}",
-                    snap.location(id),
+                    loc(id),
                     field_token.unwrap_or(&String::new())
                 ),
             ));
@@ -187,7 +194,7 @@ pub fn check(snap: &Snapshot) -> Vec<Violation> {
                 "finished-without-timestamp",
                 Error,
                 Some(id),
-                format!("in {} without finishedOn", snap.location(id)),
+                format!("in {} without finishedOn", loc(id)),
             ));
         }
     }
@@ -228,7 +235,7 @@ pub fn check(snap: &Snapshot) -> Vec<Violation> {
         .stalled
         .iter()
         .filter(|id| {
-            let c = snap.containers_of(id);
+            let c = of(id);
             !(c.contains(&"active") || c.contains(&"wait") || c.contains(&"paused"))
         })
         .collect();
@@ -244,7 +251,7 @@ pub fn check(snap: &Snapshot) -> Vec<Violation> {
         ));
     }
 
-    flow_rules(snap, &mut out);
+    flow_rules(snap, &index, &mut out);
 
     for (key, ty) in &snap.unknown_keys {
         out.push(v(
@@ -260,14 +267,19 @@ pub fn check(snap: &Snapshot) -> Vec<Violation> {
 }
 
 /// Parent/child bookkeeping (see the module table).
-fn flow_rules(snap: &Snapshot, out: &mut Vec<Violation>) {
+fn flow_rules(
+    snap: &Snapshot,
+    index: &std::collections::HashMap<&str, Vec<&'static str>>,
+    out: &mut Vec<Violation>,
+) {
     use Severity::*;
+    let loc = |id: &str| location(index, snap, id);
     let base = format!("{}:{}:", snap.prefix, snap.queue);
     fn local<'a>(base: &str, key: &'a str) -> Option<&'a str> {
         key.strip_prefix(base).filter(|id| !id.contains(':'))
     }
     for (id, job) in &snap.jobs {
-        let c = snap.containers_of(id);
+        let c = index.get(id.as_str()).cloned().unwrap_or_default();
         let waiting = c.contains(&"waiting-children");
         if waiting && job.deps.is_empty() {
             out.push(v(
@@ -288,7 +300,7 @@ fn flow_rules(snap: &Snapshot, out: &mut Vec<Violation>) {
                 Some(id),
                 format!(
                     "in {} with {} child(ren) pending: {:?}",
-                    snap.location(id),
+                    loc(id),
                     job.deps.len(),
                     job.deps
                 ),
@@ -333,12 +345,22 @@ fn flow_rules(snap: &Snapshot, out: &mut Vec<Violation>) {
                 "child-unlinked",
                 Error,
                 Some(id),
-                format!(
-                    "{p} (parent {parent_id} is in {})",
-                    snap.location(parent_id)
-                ),
+                format!("{p} (parent {parent_id} is in {})", loc(parent_id)),
             ));
         }
+    }
+}
+
+/// [`Snapshot::location`] through a prebuilt index.
+fn location(
+    index: &std::collections::HashMap<&str, Vec<&'static str>>,
+    snap: &Snapshot,
+    id: &str,
+) -> String {
+    match (index.get(id), snap.jobs.contains_key(id)) {
+        (Some(c), _) => c.join("+"),
+        (None, true) => "(hash exists, in no container)".into(),
+        (None, false) => "(gone)".into(),
     }
 }
 

@@ -44,8 +44,10 @@ end
 -- k = { wait=, paused=, prio=, pc=, meta=, marker= }
 -- Returns the container it landed in: 'prioritized' | 'wait' | 'paused'.
 local function oxnPushReady(k, id, hashKey, front)
-  local o = oxnJobOpts(hashKey)
-  local prio = tonumber(o['priority']) or 0
+  -- The priority straight from the opts JSON: no full decode on this hot
+  -- path (every promoted, retried, released or requeued job).
+  local raw = redis.call('HGET', hashKey, 'opts')
+  local prio = raw and tonumber(string.match(raw, '"priority":(%d+)')) or 0
   if prio > 0 then
     local counter = redis.call('INCR', k.pc)
     redis.call('ZADD', k.prio, prio * 0x100000000 + counter, id)
@@ -164,15 +166,20 @@ end
 -- parent is not left waiting for a job that no longer exists.
 local function oxnRemoveJobKeys(hashPrefix, id, maxStream)
   local hashKey = hashPrefix .. id
-  local parentKey = redis.call('HGET', hashKey, 'parentKey')
+  local f = redis.call('HMGET', hashKey, 'parentKey', 'opts')
+  local parentKey, raw = f[1], f[2]
   if parentKey and redis.call('SREM', parentKey .. ':dependencies', hashKey) == 1 then
     oxnReleaseParent(parentKey, maxStream or OXN_DEFAULT_STREAM)
   end
-  local d = oxnJobOpts(hashKey)['deduplication']
-  if type(d) == 'table' and type(d['id']) == 'string' then
-    local dedupKey = hashPrefix .. 'de:' .. d['id']
-    if redis.call('GET', dedupKey) == id then
-      redis.call('DEL', dedupKey)
+  -- Decode the opts only for a job that was added with deduplication.
+  if raw and not string.find(raw, '"deduplication":null', 1, true) then
+    local ok, o = pcall(cjson.decode, raw)
+    local d = ok and type(o) == 'table' and o['deduplication']
+    if type(d) == 'table' and type(d['id']) == 'string' then
+      local dedupKey = hashPrefix .. 'de:' .. d['id']
+      if redis.call('GET', dedupKey) == id then
+        redis.call('DEL', dedupKey)
+      end
     end
   end
   redis.call('DEL', hashKey, hashKey .. ':lock', hashKey .. ':logs',

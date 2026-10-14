@@ -21,17 +21,14 @@ use redis::Script;
 
 use crate::error::Result;
 
-/// Every script body is `includes/common.lua` (shared helpers such as
-/// `oxnWake`) followed by the script itself, assembled at compile time.
+/// Every script body is the helpers it uses from `includes/common.lua`
+/// (such as `oxnWake`) followed by the script itself — assembled by
+/// `build.rs`, which leaves out the helpers a script doesn't reference.
 macro_rules! script {
     ($name:literal) => {
         (
             $name,
-            concat!(
-                include_str!("lua/includes/common.lua"),
-                "\n",
-                include_str!(concat!("lua/", $name, ".lua"))
-            ),
+            include_str!(concat!(env!("OUT_DIR"), "/lua/", $name, ".lua")),
         )
     };
 }
@@ -164,6 +161,38 @@ mod tests {
                 "{name} body missing"
             );
         }
+    }
+
+    /// The build keeps only the helpers a script references: every
+    /// `oxn…` / `OXN_…` name a script uses must be defined in its body.
+    #[test]
+    fn every_helper_a_script_uses_is_defined_in_it() {
+        for (name, body) in ALL_SCRIPTS {
+            let words: std::collections::BTreeSet<&str> = body
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|w| {
+                    w.strip_prefix("oxn")
+                        .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_uppercase()))
+                        || w.starts_with("OXN_")
+                })
+                .collect();
+            for w in words {
+                let defined = body.contains(&format!("local function {w}("))
+                    || body.contains(&format!("local {w} ="));
+                assert!(defined, "{name} uses {w} without defining it");
+            }
+        }
+    }
+
+    #[test]
+    fn hot_path_scripts_carry_only_a_few_helpers() {
+        let count = |n: &str| {
+            let body = ALL_SCRIPTS.iter().find(|(x, _)| *x == n).unwrap().1;
+            body.matches("\nlocal function ").count()
+        };
+        // The whole prelude has ~22; the hot paths need a handful.
+        assert!(count("move_to_active") <= 6, "{}", count("move_to_active"));
+        assert!(count("add_job") <= 6, "{}", count("add_job"));
     }
 
     #[test]

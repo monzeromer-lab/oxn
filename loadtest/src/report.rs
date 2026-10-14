@@ -208,6 +208,27 @@ pub fn render(o: &Outcome) -> String {
         );
     }
 
+    if let Some(p) = &o.plateau {
+        let _ = writeln!(s, "## Plateau (leak check)\n");
+        let _ = writeln!(
+            s,
+            "- keys: {:.0} (t={:.0}–{:.0}s) → {:.0} (t={:.0}–{:.0}s): {:+.1}%",
+            p.early_keys,
+            p.early_window_s.0,
+            p.early_window_s.1,
+            p.late_keys,
+            p.late_window_s.0,
+            p.late_window_s.1,
+            p.key_growth() * 100.0
+        );
+        let _ = writeln!(
+            s,
+            "- used_memory: {:.1}MB → {:.1}MB: {:+.1}%\n",
+            p.early_memory_mb,
+            p.late_memory_mb,
+            p.memory_growth() * 100.0
+        );
+    }
     if let Some(m) = &o.oxn_metrics {
         let _ = writeln!(s, "## oxn metrics\n");
         for (k, v) in m {

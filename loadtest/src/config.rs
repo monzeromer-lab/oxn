@@ -49,6 +49,9 @@ pub enum Retention {
     For30s,
     /// Each job picks one of the above at random.
     Mixed,
+    /// Each job picks a bounded policy at random (remove, last-1000,
+    /// for-30s): what a long run should hold flat.
+    Bounded,
 }
 
 /// Flags shared by `run` and scenario presets. `None` = use the preset.
@@ -166,6 +169,10 @@ pub struct RunArgs {
     /// Fail the run if first-attempt pickup p99 exceeds this (ms).
     #[arg(long)]
     pub slo_pickup_p99_ms: Option<f64>,
+    /// Don't record oxn's metrics (no cross-check): for benchmarks, since
+    /// the capture recorder keeps every sample.
+    #[arg(long)]
+    pub skip_metrics_check: bool,
     /// Worker rate limit `MAX/MS` (e.g. `200/1000`), shared by every
     /// worker; the run fails if starts exceed it.
     #[arg(long, value_parser = parse_rate_limit)]
@@ -223,6 +230,8 @@ pub struct Config {
     pub ctx_ops: bool,
     /// Queue-wide rate limit (max, per ms).
     pub rate_limit: Option<(u32, u64)>,
+    /// Skip installing the metrics capture recorder.
+    pub skip_metrics_check: bool,
 }
 
 fn ser_dur<S: serde::Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
@@ -280,6 +289,7 @@ impl Config {
             oxn_subscriber: a.oxn_subscriber,
             ctx_ops: a.ctx_ops,
             rate_limit: a.rate_limit,
+            skip_metrics_check: a.skip_metrics_check,
         };
         match a.scenario {
             Smoke => {}
@@ -316,7 +326,7 @@ impl Config {
                 c.rate = 300;
                 c.workers = 4;
                 c.concurrency = 8;
-                c.retention = Retention::Mixed;
+                c.retention = Retention::Bounded;
                 c.check_every_s = 0;
             }
             RetryStorm => {
@@ -406,7 +416,7 @@ impl Config {
         if let Some(ch) = &a.chaos {
             c.chaos = parse_chaos(ch)?;
         }
-        if c.options_at_queue && c.retention == Retention::Mixed {
+        if c.options_at_queue && matches!(c.retention, Retention::Mixed | Retention::Bounded) {
             anyhow::bail!("--options-at-queue can't express per-job mixed retention");
         }
         if c.chaos

@@ -273,6 +273,25 @@ impl Snapshot {
             .unwrap_or(0)
     }
 
+    /// Every id → the containers holding it (repeated if a list holds it
+    /// twice), in one pass. [`Self::containers_of`] scans every container
+    /// per call; use this when looking up many ids.
+    pub fn container_index(&self) -> std::collections::HashMap<&str, Vec<&'static str>> {
+        let mut out: std::collections::HashMap<&str, Vec<&'static str>> =
+            std::collections::HashMap::new();
+        for name in LIST_CONTAINERS {
+            for x in self.lists.get(*name).into_iter().flatten() {
+                out.entry(x.as_str()).or_default().push(name);
+            }
+        }
+        for name in ZSET_CONTAINERS {
+            for (m, _) in self.zsets.get(*name).into_iter().flatten() {
+                out.entry(m.as_str()).or_default().push(name);
+            }
+        }
+        out
+    }
+
     /// Ids held in any job container.
     pub fn container_ids(&self) -> BTreeSet<String> {
         let mut out = BTreeSet::new();

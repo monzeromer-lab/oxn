@@ -120,6 +120,14 @@ It contains breaking changes; see the migration notes below.
   immediately and its pool slot is detached instead of being returned with
   a block still pending; the stalled scanner is joined before `run()`
   returns.
+- **Faster hot-path scripts.** Redis runs a script's top level on every
+  `EVALSHA`, so each script re-created all ~22 shared helpers per call
+  (~3.5µs). A `build.rs` now gives each script only the helpers it uses.
+  `move_to_finished` no longer writes fields to a hash that `remove`
+  retention deletes right away, and deletions and requeues no longer
+  decode a job's options JSON to find a dedup pointer or its priority.
+  Hot-path script cost per job 87µs → 71µs; single-add throughput +12%
+  (see `docs/load-results/0.3.0.md`).
 - **A dropped connection no longer loses a job's outcome (B15).**
   `complete` / `fail` / `delay` / `release` / `wait_for_children` failing
   on a connection error were logged and never retried: if the call never

@@ -413,10 +413,12 @@ pub async fn run(a: FlowArgs) -> anyhow::Result<FlowOutcome> {
             let Ok(mut c) = redis::aio::ConnectionManager::new(client).await else {
                 return;
             };
-            let mut tick = tokio::time::interval(Duration::from_secs(every));
-            tick.tick().await;
+            // Paced so checks cost at most ~10% of the time: a snapshot of a
+            // big queue blocks Redis while it is taken.
+            let mut wait = Duration::from_secs(every);
             loop {
-                tokio::select! { _ = stop.cancelled() => break, _ = tick.tick() => {} }
+                tokio::select! { _ = stop.cancelled() => break, _ = tokio::time::sleep(wait) => {} }
+                let checking = std::time::Instant::now();
                 for q in &qs {
                     if let Ok(s) = Snapshot::take(&mut c, PREFIX, q).await {
                         let t = t0.elapsed().as_secs_f64();
@@ -429,6 +431,7 @@ pub async fn run(a: FlowArgs) -> anyhow::Result<FlowOutcome> {
                         }
                     }
                 }
+                wait = Duration::from_secs(every).max(checking.elapsed() * 9);
             }
         })
     });
@@ -444,15 +447,30 @@ pub async fn run(a: FlowArgs) -> anyhow::Result<FlowOutcome> {
         tokio::spawn(async move {
             loop {
                 tokio::select! { _ = stop.cancelled() => break, _ = tokio::time::sleep(Duration::from_millis(250)) => {} }
-                let Ok(failed) = b.list(&cq, JobState::Failed, JobRange::first(1000)).await else {
-                    continue;
-                };
-                for j in failed {
-                    let v: Value = serde_json::from_str(&j.data).unwrap_or_default();
-                    let f = v["f"].as_u64().unwrap_or(0) as usize;
-                    if kinds.get(f) == Some(&Kind::Retry) {
-                        let _ = b.retry(&cq, &j.id).await;
+                // Page through *every* failed child: the permanently failed
+                // ones (fail-parent / ignore flows) pile up at the front.
+                let mut start = 0i64;
+                loop {
+                    let range = JobRange {
+                        start,
+                        end: start + 999,
+                        descending: false,
+                    };
+                    let Ok(page) = b.list(&cq, JobState::Failed, range).await else {
+                        break;
+                    };
+                    let n = page.len();
+                    for j in page {
+                        let v: Value = serde_json::from_str(&j.data).unwrap_or_default();
+                        let f = v["f"].as_u64().unwrap_or(0) as usize;
+                        if kinds.get(f) == Some(&Kind::Retry) {
+                            let _ = b.retry(&cq, &j.id).await;
+                        }
                     }
+                    if n < 1000 {
+                        break;
+                    }
+                    start += 1000;
                 }
             }
         })
@@ -564,12 +582,15 @@ pub async fn run(a: FlowArgs) -> anyhow::Result<FlowOutcome> {
         }
     }
     let total_secs = t0.elapsed().as_secs_f64();
+    let phase = |what: &str| eprintln!("  ⚑ {:>6.1}s {what}", t0.elapsed().as_secs_f64());
+    phase("stopping workers");
     workers.stop().await;
     stop.cancel();
     let _ = retrier.await;
     if let Some(c) = checker {
         let _ = c.await;
     }
+    phase("final invariant check");
     // A final check on the settled state.
     for q in [&pq, &cq] {
         if let Ok(s) = Snapshot::take(&mut direct, PREFIX, q).await {
@@ -581,6 +602,7 @@ pub async fn run(a: FlowArgs) -> anyhow::Result<FlowOutcome> {
         }
     }
 
+    phase("verifying every flow");
     // ---- verify --------------------------------------------------------
     let mut failures = Vec::new();
     if !done {
@@ -720,6 +742,7 @@ pub async fn run(a: FlowArgs) -> anyhow::Result<FlowOutcome> {
         ));
     }
 
+    phase("cleanup");
     let keys_left = if a.keep {
         0
     } else {
@@ -736,6 +759,7 @@ pub async fn run(a: FlowArgs) -> anyhow::Result<FlowOutcome> {
             "{keys_left} key(s) left after obliterating both queues"
         ));
     }
+    phase("done");
     let jobs = child_runs + parent_runs;
     let outcome = FlowOutcome {
         args: a.clone(),

@@ -178,10 +178,12 @@ pub async fn run(a: SchedArgs) -> anyhow::Result<SchedOutcome> {
             let Ok(mut c) = redis::aio::ConnectionManager::new(client).await else {
                 return;
             };
-            let mut tick = tokio::time::interval(Duration::from_secs(every));
-            tick.tick().await;
+            // Paced so checks cost at most ~10% of the time: a snapshot of a
+            // big queue blocks Redis while it is taken.
+            let mut wait = Duration::from_secs(every);
             loop {
-                tokio::select! { _ = stop.cancelled() => break, _ = tick.tick() => {} }
+                tokio::select! { _ = stop.cancelled() => break, _ = tokio::time::sleep(wait) => {} }
+                let checking = std::time::Instant::now();
                 if let Ok(s) = Snapshot::take(&mut c, PREFIX, &q).await {
                     for x in invariants::check(&s) {
                         if x.severity >= oxn_testkit::Severity::Error && v.lock().len() < 200 {
@@ -190,6 +192,7 @@ pub async fn run(a: SchedArgs) -> anyhow::Result<SchedOutcome> {
                         }
                     }
                 }
+                wait = Duration::from_secs(every).max(checking.elapsed() * 9);
             }
         })
     });

@@ -61,6 +61,9 @@ pub struct Outcome {
     pub health_after_cleanup: Option<RedisHealth>,
     pub rows: Vec<Row>,
     pub kills: u32,
+    /// Long runs (≥ 5 min of load): keys and memory early vs late, after a
+    /// warm-up. A leak shows up as growth.
+    pub plateau: Option<Plateau>,
     /// oxn `metrics` counters for the queue (in-process workers only).
     pub oxn_metrics: Option<BTreeMap<String, f64>>,
     /// `--rate-limit`: the most starts seen in any sliding window of the
@@ -73,6 +76,69 @@ pub struct Outcome {
     pub loadavg_end: Option<String>,
     pub passed: bool,
     pub failures: Vec<String>,
+}
+
+/// Mean Redis keys / memory in an early and a late window of the load
+/// phase (see [`plateau`]).
+#[derive(Debug, Clone, Serialize)]
+pub struct Plateau {
+    pub early_window_s: (f64, f64),
+    pub late_window_s: (f64, f64),
+    pub early_keys: f64,
+    pub late_keys: f64,
+    pub early_memory_mb: f64,
+    pub late_memory_mb: f64,
+}
+
+impl Plateau {
+    pub fn key_growth(&self) -> f64 {
+        growth(self.early_keys, self.late_keys)
+    }
+    pub fn memory_growth(&self) -> f64 {
+        growth(self.early_memory_mb, self.late_memory_mb)
+    }
+}
+
+fn growth(early: f64, late: f64) -> f64 {
+    if early <= 0.0 {
+        0.0
+    } else {
+        (late - early) / early
+    }
+}
+
+/// Compare an early window (just after the warm-up) with the last stretch
+/// of the load phase. The warm-up is the first 20% (at least 3 min): the
+/// events stream fills to its cap and `KeepFor` windows reach steady state.
+/// `None` for runs shorter than 5 minutes of load.
+fn plateau(rows: &[crate::stats::Row], load_secs: f64) -> Option<Plateau> {
+    if load_secs < 300.0 {
+        return None;
+    }
+    let warm = (load_secs * 0.2).max(180.0);
+    let span = (load_secs * 0.15).max(30.0);
+    let early = (warm, warm + span);
+    let late = (load_secs - span, load_secs);
+    let mean = |w: (f64, f64), f: &dyn Fn(&crate::stats::Row) -> f64| {
+        let v: Vec<f64> = rows
+            .iter()
+            .filter(|r| r.t_s >= w.0 && r.t_s <= w.1)
+            .map(f)
+            .collect();
+        if v.is_empty() {
+            0.0
+        } else {
+            v.iter().sum::<f64>() / v.len() as f64
+        }
+    };
+    Some(Plateau {
+        early_window_s: early,
+        late_window_s: late,
+        early_keys: mean(early, &|r| r.keys as f64),
+        late_keys: mean(late, &|r| r.keys as f64),
+        early_memory_mb: mean(early, &|r| r.used_memory_mb),
+        late_memory_mb: mean(late, &|r| r.used_memory_mb),
+    })
 }
 
 /// Keys left behind relative to what retention says should remain.
@@ -91,7 +157,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
     workload::MAX_STREAM_LEN.store(cfg.max_stream_len, std::sync::atomic::Ordering::Relaxed);
     // oxn's own metrics, cross-checked against the ledger and the raw
     // stream at the end (in-process workers only: children have their own).
-    let metrics = (!cfg.processes).then(oxn_testkit::metrics::install);
+    let metrics = (!cfg.processes && !cfg.skip_metrics_check).then(oxn_testkit::metrics::install);
     let cfg = Arc::new(cfg);
     let client = redis::Client::open(cfg.redis.as_str())?;
     // Auto-reconnecting: the harness must keep observing across Redis
@@ -208,13 +274,16 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
             let Ok(mut c) = redis::aio::ConnectionManager::new(client).await else {
                 return;
             };
-            let mut tick = tokio::time::interval(Duration::from_secs(every));
-            tick.tick().await;
+            // Paced so checks cost at most ~10% of the time: a snapshot of a
+            // big queue blocks Redis while it is taken.
+            let mut wait = Duration::from_secs(every);
             loop {
-                tokio::select! { _ = stop.cancelled() => break, _ = tick.tick() => {} }
+                tokio::select! { _ = stop.cancelled() => break, _ = tokio::time::sleep(wait) => {} }
+                let checking = std::time::Instant::now();
                 if let Ok(s) = Snapshot::take(&mut c, PREFIX, &q).await {
                     record_violations(&v, started.elapsed().as_secs_f64(), invariants::check(&s));
                 }
+                wait = Duration::from_secs(every).max(checking.elapsed() * 9);
             }
         })
     });
@@ -576,6 +645,26 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
         }
         out
     });
+    let plateau = plateau(&rows.lock(), load_secs);
+    if let Some(p) = &plateau {
+        // ±5%, ignoring tiny absolute changes on small numbers.
+        if p.key_growth() > 0.05 && p.late_keys - p.early_keys > 1000.0 {
+            failures.push(format!(
+                "keys grew {:.1}% between the early and late windows ({:.0} → {:.0})",
+                p.key_growth() * 100.0,
+                p.early_keys,
+                p.late_keys
+            ));
+        }
+        if p.memory_growth() > 0.05 && p.late_memory_mb - p.early_memory_mb > 2.0 {
+            failures.push(format!(
+                "used_memory grew {:.1}% between the early and late windows ({:.1}MB → {:.1}MB)",
+                p.memory_growth() * 100.0,
+                p.early_memory_mb,
+                p.late_memory_mb
+            ));
+        }
+    }
     let pickup = stats.pickup.summary();
     if let Some(slo) = cfg.slo_pickup_p99_ms
         && pickup.p99_ms > slo
@@ -610,6 +699,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
         rate_limit_peak,
         rate_limit_mean_per_window,
         oxn_metrics,
+        plateau,
         stream_events: stream_counts.lock().clone(),
         final_sizes,
         retention_findings,
@@ -837,7 +927,7 @@ fn check_retention(
                 out.push(format!("FAIL last-1000: completed={c} failed={f}"));
             }
         }
-        Retention::For30s | Retention::Mixed => {}
+        Retention::For30s | Retention::Mixed | Retention::Bounded => {}
     }
     if leak.snapshot_taken {
         if leak.orphan_hashes > 0 {

@@ -48,20 +48,32 @@ local maxStream = tonumber(ARGV[8])
 
 -- the job hash vanished while the job was active: clean up the dangling
 -- active entry and lock, and report it.
-if redis.call('EXISTS', hashKey) == 0 then
-  if ARGV[10] == '1' then return 1 end
+-- the job hash vanished while the job was active (force-obliterated):
+-- clean up the dangling active entry and lock, and report it.
+local function vanished()
   redis.call('LREM', activeKey, 0, id)
   redis.call('DEL', lockKey)
   return -1
 end
 
--- verify lock ownership
+-- verify lock ownership (checked first: the hot path is "it's ours")
 local held = redis.call('GET', lockKey)
 if held ~= token then
+  if redis.call('EXISTS', hashKey) == 0 then
+    if ARGV[10] == '1' then return 1 end
+    return vanished()
+  end
   if redis.call('HGET', hashKey, 'doneToken') == token then return 1 end
   if not held then return -2 end
   return -6
 end
+
+-- read before retention may delete the hash; every job has attemptsMade,
+-- so its absence means the hash is gone
+local f = redis.call('HMGET', hashKey, 'attemptsMade', 'parentKey')
+if not f[1] then return vanished() end
+local attemptsMade, parentKey = f[1], f[2]
+
 if event == 'completed' and redis.call('SCARD', hashKey .. ':dependencies') > 0 then
   return -4
 end
@@ -70,29 +82,30 @@ end
 redis.call('LREM', activeKey, 1, id)
 redis.call('DEL', lockKey)
 
--- persist outcome on the job hash
-redis.call('HSET', hashKey,
-  'finishedOn', nowMs)
-if event == 'completed' then
-  if ret and ret ~= '' then
-    redis.call('HSET', hashKey, 'returnvalue', ret)
+-- Persist the outcome — unless retention deletes the hash right away
+-- (`remove`, the common high-throughput setting): writing fields to it
+-- first is wasted work. A retry then finds the hash gone and, with its
+-- retry flag, succeeds; so `doneToken` is only needed on a kept hash.
+if policy ~= 'remove' then
+  local fields = { 'finishedOn', nowMs, 'doneToken', token }
+  if event == 'completed' then
+    if ret and ret ~= '' then
+      table.insert(fields, 'returnvalue'); table.insert(fields, ret)
+    end
+  elseif reason and reason ~= '' then
+    table.insert(fields, 'failedReason'); table.insert(fields, reason)
   end
-else
-  if reason and reason ~= '' then
-    redis.call('HSET', hashKey, 'failedReason', reason)
-  end
-  oxnPushStack(hashKey, ARGV[9])
+  redis.call('HSET', hashKey, unpack(fields))
+  redis.call('HDEL', hashKey, 'lockToken')
+  if event ~= 'completed' then oxnPushStack(hashKey, ARGV[9]) end
 end
-redis.call('HDEL', hashKey, 'lockToken')
-redis.call('HSET', hashKey, 'doneToken', token)
 
--- event payload read before retention may delete the hash
-local attemptsMade = redis.call('HGET', hashKey, 'attemptsMade') or '0'
-
-if event == 'completed' then
-  oxnChildDone(hashKey, redis.call('HGET', hashKey, 'parentKey'), ret, maxStream)
-else
-  oxnChildFailed(hashKey, reason, nowMs, maxStream)
+if parentKey then
+  if event == 'completed' then
+    oxnChildDone(hashKey, parentKey, ret, maxStream)
+  else
+    oxnChildFailed(hashKey, reason, nowMs, maxStream)
+  end
 end
 
 oxnRetain(targetKey, hashPrefix, id, policy, nowMs)
