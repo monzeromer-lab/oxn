@@ -11,7 +11,8 @@ may break public API, patch bumps are fixes/additions only).
 0.3.0 is a correctness release: every bug found in the 0.2.2 review is
 fixed with a regression test, and the repo gains `oxn-testkit` (step
 recorder + invariant checker) and `oxn-load` (load/soak/chaos harness).
-It contains breaking changes; see the migration notes below.
+It contains breaking changes: **see [docs/MIGRATION-0.3.md](docs/MIGRATION-0.3.md)**
+for a checklist and before/after code.
 
 ### Changed (breaking)
 
@@ -394,6 +395,15 @@ It contains breaking changes; see the migration notes below.
   `ApiConfig`); the 0.2 `/api/*` routes remain as deprecated aliases with
   their 0.2 shapes.
 
+- `docs/MIGRATION-0.3.md`, a 0.2 → 0.3 migration guide.
+- Examples `api_actix`, `flow`, `graceful_shutdown` and `rate_limit`;
+  every example reads `REDIS_URL`.
+- The `LICENSE-MIT` and `LICENSE-APACHE` files the README always pointed
+  to. The published crate now holds only the library, examples and docs
+  (`include` in `Cargo.toml`).
+- Documented: **Redis Cluster is not supported**, including cluster-mode
+  managed endpoints such as ElastiCache Serverless, which the 0.2 docs
+  listed as a target.
 - `oxn-testkit` and `oxn-load` workspace crates (unpublished), CI
   workflow, `scripts/test-redis.sh`. See `docs/load-results/`.
 - Tracing spans on every Lua call (`oxn.script`), fetch, blocking wait
@@ -515,6 +525,7 @@ No functional changes from 0.2.0.
   write after the first call per queue per process via an in-memory
   `DashSet` cache.
 
+[0.3.0]: https://github.com/monzeromer-lab/oxn/compare/v0.2.1...HEAD
 [0.2.2]: https://github.com/monzeromer-lab/oxn/compare/v0.2.1...HEAD
 [0.2.1]: https://github.com/monzeromer-lab/oxn/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/monzeromer-lab/oxn/compare/v0.1.3...v0.2.0

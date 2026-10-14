@@ -1,14 +1,27 @@
 [package]
 name = "oxn"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Redis-backed async job queue for Rust, with optional web dashboard."
+description = "Redis-backed async job queue for Rust: typed jobs, flows, distributed schedulers, rate limits, metrics, an HTTP API and a web dashboard."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/monzeromer-lab/oxn"
 readme = "README.md"
 keywords = ["queue", "redis", "jobs", "async", "tokio"]
 categories = ["asynchronous", "database"]
+# The published crate: the library, its examples and docs. The workspace's
+# test kit, load harness, browser tests and scripts stay in the repo.
+include = [
+    "/src/**/*",
+    "/build.rs",
+    "/examples/**/*",
+    "/Cargo.toml",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+    "/docs/MIGRATION-0.3.md",
+]
 
 [workspace]
 members = [".", "testkit", "loadtest"]
@@ -155,6 +168,26 @@ required-features = ["redis-backend"]
 name = "api_axum"
 path = "examples/api_axum.rs"
 required-features = ["redis-backend", "api-axum"]
+
+[[example]]
+name = "api_actix"
+path = "examples/api_actix.rs"
+required-features = ["redis-backend", "api-actix"]
+
+[[example]]
+name = "flow"
+path = "examples/flow.rs"
+required-features = ["redis-backend", "flow"]
+
+[[example]]
+name = "graceful_shutdown"
+path = "examples/graceful_shutdown.rs"
+required-features = ["redis-backend"]
+
+[[example]]
+name = "rate_limit"
+path = "examples/rate_limit.rs"
+required-features = ["redis-backend"]
 
 [[example]]
 name = "e2e_dashboard"

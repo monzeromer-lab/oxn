@@ -48,10 +48,9 @@ pub struct RedisConfig {
     /// every XADD.
     pub max_stream_length: usize,
     /// How often a background task PINGs every pool slot to keep the TCP
-    /// connection alive. Managed-Redis providers (DigitalOcean, AWS
-    /// ElastiCache Serverless, Upstash, Redis Cloud) close idle TCP
-    /// connections at the proxy after 60–300s; without keepalive, the
-    /// first command on a stale slot hangs for seconds while the kernel
+    /// connection alive. Managed-Redis providers (DigitalOcean, Upstash,
+    /// Redis Cloud) close idle TCP connections at the proxy after
+    /// 60–300s; without keepalive, the first command on a stale slot hangs for seconds while the kernel
     /// detects the dead socket and a fresh TLS handshake is paid. Set
     /// to `None` to disable. Default: `Some(Duration::from_secs(25))`.
     pub keepalive_interval: Option<Duration>,
@@ -232,8 +231,7 @@ impl RedisBackend {
     /// On standalone Redis, `SCRIPT LOAD` populates a server-wide cache, so
     /// preloading on one connection is enough. On managed Redis services
     /// that front multiple backend nodes through a proxy
-    /// (DigitalOcean Managed Redis, AWS ElastiCache Serverless, Upstash,
-    /// Redis Cloud, …), each TCP connection may land on a different
+    /// (DigitalOcean Managed Redis, Upstash, Redis Cloud, …), each TCP connection may land on a different
     /// backend node and the script cache is **per-node**. Preloading on a
     /// single connection leaves the rest of the pool cold; the first
     /// `Queue::add()` that lands on an unprimed node still pays the

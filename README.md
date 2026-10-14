@@ -13,18 +13,25 @@ generic typed jobs, `tokio::sync::broadcast` semantics, builder patterns,
 
 ```toml
 [dependencies]
-oxn = "0.2.2"
+oxn = "0.3"
 ```
 
-See [CHANGELOG.md](CHANGELOG.md) for the per-version notes. The most
-recent two:
+**0.3.0** is a correctness release. Every bug found in a review of 0.2.2
+is fixed with a regression test: queue defaults, instant pickup, graceful
+shutdown, leaked keys, lost events, the stalled-job lifecycle, retried
+outcomes after a dropped connection, and more. Flows, schedulers, rate
+limiting and metrics now actually work. New in 0.3: a `JobContext` for
+handlers, a standalone `/v1` HTTP API with optional auth, and a redesigned,
+responsive dashboard. It has breaking changes: see
+**[docs/MIGRATION-0.3.md](docs/MIGRATION-0.3.md)**. Per-version notes are in
+[CHANGELOG.md](CHANGELOG.md).
 
-- **0.2.2** — Bulk dashboard ops (`Backend::clean`, `Backend::promote_all`,
-  matching `POST /clean/{state}` and `POST /promote-all` routes, state-aware
-  buttons in the bundled UI). Subscriber now decodes `Event::Cleaned`. 18 new
-  tests; suite at 116.
-- **0.2.1** — Documentation refresh of the dashboard work that landed in
-  0.2.0 (drawer, retention shortcuts, route table). No code changes.
+> **Redis Cluster is not supported.** All of a queue's keys must live on
+> one node, because the Lua scripts touch several keys per call and flows
+> span queues. Cluster-mode endpoints, such as Redis Cluster, ElastiCache
+> Serverless, or cluster-mode ElastiCache and MemoryDB, will not work. Use a
+> single primary that is not clustered. Standalone managed Redis works, over
+> TLS with the `tls` feature.
 
 ## Why another queue crate?
 
@@ -88,6 +95,8 @@ async fn main() -> oxn::Result<()> {
 | Feature           | Adds                                                           |
 | ----------------- | -------------------------------------------------------------- |
 | `redis-backend`   | **Default.** `backend::redis::RedisBackend`                    |
+| `tls`             | `rediss://` URLs via rustls (recommended)                      |
+| `tls-native`      | `rediss://` URLs via native-tls                                |
 | `scheduler`       | `JobScheduler` — cron and fixed-interval repeats               |
 | `flow`            | `FlowProducer` — parent/child trees (a parent runs after its children) |
 | `metrics`         | `oxn_*` counters, histograms and a gauge via the `metrics` crate (names in `oxn::metrics`) |
@@ -95,11 +104,11 @@ async fn main() -> oxn::Result<()> {
 | `api-actix`       | `api::actix_scope` — the same API on any actix-web app         |
 | `dashboard-axum`  | `dashboard::axum_router` — the API plus the bundled UI         |
 | `dashboard-actix` | `dashboard::actix_scope` — mount on any actix-web app          |
-| `full`            | Everything above except actix (choose one dashboard)           |
+| `full`            | Everything above with rustls `tls` and the axum dashboard      |
 
 ```toml
 [dependencies]
-oxn = { version = "0.2.2", features = ["scheduler", "dashboard-axum", "tls"] }
+oxn = { version = "0.3", features = ["scheduler", "dashboard-axum", "tls"] }
 ```
 
 ## Core concepts
@@ -111,7 +120,7 @@ pub struct Job<D, R = ()> {
     pub id: JobId,
     pub name: String,
     pub data: D,
-    pub opts: JobOptions,
+    pub opts: ResolvedJobOptions,  // per-job options merged with queue defaults
     pub timestamp_ms: i64,
     pub processed_on_ms: Option<i64>,
     pub finished_on_ms: Option<i64>,
@@ -120,6 +129,7 @@ pub struct Job<D, R = ()> {
     pub stacktrace: Vec<String>,
     pub progress: Option<Progress>,
     pub return_value: Option<R>,
+    pub parent: Option<JobRef>,      // set for a child in a flow
     pub lock_token: Option<String>,
     // ...
 }
@@ -154,6 +164,55 @@ async fn handler(job: Job<Payload>) -> Result<(), Error> {
     }
 }
 ```
+
+| Handler returns | Worker does |
+| --- | --- |
+| `Ok(value)` | `completed`, return value recorded |
+| `Err(Error::Delayed { delay_ms })` / `Err(Error::RateLimited { delay_ms })` | **postpone**: `delayed` until now + delay, attempt refunded, no failure recorded |
+| `Err(Error::WaitingChildren)` | park in `waiting-children` until the children it added resolve (attempt refunded) |
+| `Err(Error::Unrecoverable(msg))` | `failed` at once, no retries |
+| any other `Err`, or a panic | retry after `Backoff` while attempts remain, else `failed`; each failure appends to `stacktrace` |
+
+`JobOptions` fields are `Option`s: anything you don't set comes from the
+queue's `default_job_options` (e.g. `QueueBuilder::remove_on_complete`),
+then the built-in default. An explicit value always wins.
+
+### Job context: progress, logs, lock loss, shutdown
+
+```rust
+let worker = Worker::builder_with_ctx(queue.clone(), |job: Job<Export>, ctx: JobContext| async move {
+    for (i, chunk) in job.data.chunks().enumerate() {
+        if ctx.shutdown_requested() || ctx.lock_lost() {
+            return Err(Error::Delayed { delay_ms: 0 }); // checkpoint; run again later
+        }
+        write(chunk).await?;
+        ctx.progress((i * 100 / job.data.len()) as u8).await?;
+    }
+    ctx.log("export written").await?;
+    Ok::<_, Error>(())
+})
+.build();
+```
+
+Progress and log lines appear in the dashboard and the API. `lock_lost()`
+fires when another worker took the job over (its result would be
+discarded). `shutdown_requested()` / `cancelled()` fire as soon as the
+worker is cancelled, before `shutdown_timeout` aborts the handler.
+`Worker::builder` is unchanged for handlers that don't need any of this.
+
+### Rate limiting
+
+```rust
+let worker = Worker::builder(queue.clone(), handler)
+    .rate_limit(100, Duration::from_secs(1)) // at most 100 starts per second, queue-wide
+    .build();
+```
+
+The limit is a fixed window counted in Redis (`{queue}:limiter`), so it
+holds across every worker and process that sets it: up to `2 × max` can
+start across a window boundary. A limited worker sleeps until the window
+reopens instead of polling. Configure the same limit on every worker of the
+queue; a worker without one is not limited.
 
 ### Priority and delay
 
@@ -296,7 +355,7 @@ let tree = FlowNode::new("reports", "generate", &pdf_task, JobOptions::default()
     .child(FlowNode::new("extract", "a", &task_a, JobOptions::default())?)
     .child(FlowNode::new("extract", "b", &task_b, JobOptions::default())?.fail_parent_on_failure());
 
-let added = FlowProducer::new(queue.backend()).add(tree).await?; // ids of the whole tree
+let added = FlowProducer::new(queue.backend()).add(tree).await?; // FlowJob: ids of the whole tree
 
 // in the parent's handler (Worker::builder_with_ctx):
 let parts: Vec<(JobRef, Extracted)> = ctx.children_values().await?;
@@ -308,6 +367,24 @@ or is skipped (`ignore_dependency_on_failure`). Removing a parent removes
 its whole tree. A handler can also add children to its own job with
 `FlowProducer::add_under(&ctx.as_parent(), node)` and return
 `Error::WaitingChildren` to run again once they finish.
+
+### Metrics (feature `metrics`)
+
+oxn records through the [`metrics`](https://docs.rs/metrics) facade. Install
+any recorder, for example `metrics-exporter-prometheus`, and these series
+appear, each labelled with `queue`:
+
+- **Counters:** `oxn_jobs_{added,started,completed,failed,retried,postponed,released,stalled}_total`,
+  `oxn_lock_lost_total`, `oxn_transition_errors_total{to}`,
+  `oxn_transition_retries_total{script}`, `oxn_fetch_errors_total`,
+  `oxn_rate_limited_total`.
+- **Histograms:** `oxn_job_duration_seconds{outcome}` and
+  `oxn_job_wait_seconds` (from enqueue to start).
+- **Gauge:** `oxn_jobs_active`.
+
+A transition is counted only after Redis accepts it. The names and their
+meanings are documented in `oxn::metrics`. Without the feature, the
+emitters compile to nothing.
 
 ## HTTP API
 
@@ -397,20 +474,51 @@ around your app if you want both to work. The 0.2 dashboard routes
 
 ## Custom backends
 
-`Backend` is object-safe and small (~25 async methods). Implement it for an
-alternative store — in-memory for tests, SQL for single-node deployments,
-NATS JetStream for at-least-once delivery — and pass the `Arc<dyn Backend>`
-to `Queue::builder(name).backend(b).build()`.
+`Backend` is object-safe (33 async methods, six of them optional).
+Implement it for an alternative store (in-memory for tests, SQL for
+single-node deployments, NATS JetStream for at-least-once delivery) and pass
+the `Arc<dyn Backend>` to `Queue::builder(name).backend(b).build()`.
 
 ```rust
 #[async_trait::async_trait]
 impl Backend for MyBackend {
     async fn add(&self, queue: &str, insert: JobInsert) -> oxn::Result<JobId> { /* ... */ }
-    async fn fetch_next(&self, queue: &str, token: &str, lock: Duration, block: Duration)
-        -> oxn::Result<Option<Fetched>> { /* ... */ }
+    async fn fetch_next(
+        &self,
+        queue: &str,
+        worker_token: &str,
+        lock_duration: Duration,
+        block_for: Duration,
+        cancel: &CancellationToken,          // honor only while waiting
+        rate_limit: Option<RateLimit>,
+    ) -> oxn::Result<Option<Fetched>> { /* ... */ }
+    async fn fail(&self, queue: &str, id: &JobId, token: &str, failure: Failure<'_>) -> oxn::Result<()> { /* ... */ }
+    async fn delay(&self, queue: &str, id: &JobId, token: &str, until_ms: i64) -> oxn::Result<()> { /* ... */ }
+    async fn release(&self, queue: &str, id: &JobId, token: &str) -> oxn::Result<()> { /* ... */ }
     // ...
 }
 ```
+
+Rejected transitions must return the matching error (`NotFound`,
+`Script(LockMismatch)`, …) rather than `Ok`. Flows (`add_flow`,
+`wait_for_children`, `dependencies`) and schedulers (`schedule_tick`,
+`schedulers`, `remove_scheduler`) have default implementations that refuse
+with `Error::Config`, so a backend only implements them if it supports
+those features.
+
+## Examples
+
+Every example reads `REDIS_URL` (default `redis://127.0.0.1:6379`).
+
+| Example | Shows | Run |
+| --- | --- | --- |
+| `basic` | producer and worker in one process | `cargo run --example basic` |
+| `delayed` | delayed jobs | `cargo run --example delayed` |
+| `graceful_shutdown` | grace period, checkpointing with `JobContext`, release on timeout | `cargo run --example graceful_shutdown` |
+| `rate_limit` | a queue-wide limit across two workers | `cargo run --example rate_limit` |
+| `flow` | a parent that sums its children's results | `cargo run --example flow --features flow` |
+| `api_axum` / `api_actix` | the `/v1` API with optional bearer tokens | `cargo run --example api_axum --features api-axum` |
+| `dashboard_axum` | the dashboard at `/admin` | `cargo run --example dashboard_axum --features dashboard-axum` |
 
 ## Redis key layout
 
@@ -418,54 +526,85 @@ Mirrors BullMQ so existing tooling (RedisInsight, `redis-cli KEYS`) still
 works. Default prefix is `oxn`.
 
 ```
-oxn:{queue}:wait              list of ready job ids
-oxn:{queue}:paused            list of ids while paused
-oxn:{queue}:active            list of ids currently being processed
-oxn:{queue}:delayed           zset of future jobs, score = ts ms
-oxn:{queue}:prioritized       zset of prioritized jobs
-oxn:{queue}:completed         zset of completed jobs
-oxn:{queue}:failed            zset of failed jobs
-oxn:{queue}:events            stream of lifecycle events
-oxn:{queue}:meta              hash (paused flag, version, ...)
-oxn:{queue}:{id}              hash — the job record
-oxn:{queue}:{id}:lock         string token, TTL = lockDuration
-oxn:{queue}:{id}:logs         list of user-emitted log lines
-oxn:{queue}:de:{dedupId}      dedup pointer, TTL = dedup ttl
-oxn:queues                    registry of known queue names
+oxn:{queue}:wait                  list of ready job ids
+oxn:{queue}:paused                list of ids while paused
+oxn:{queue}:active                list of ids currently being processed
+oxn:{queue}:delayed               zset of future jobs, score = due time (ms)
+oxn:{queue}:prioritized           zset of prioritized jobs
+oxn:{queue}:waiting-children      zset of flow parents waiting for children
+oxn:{queue}:completed             zset of completed jobs, score = finish time
+oxn:{queue}:failed                zset of failed jobs, score = finish time
+oxn:{queue}:events                stream of lifecycle events (capped)
+oxn:{queue}:meta                  hash (paused flag, version, ...)
+oxn:{queue}:marker                zset that wakes workers blocked in BZPOPMIN
+oxn:{queue}:id                    counter for auto-generated job ids
+oxn:{queue}:pc                    counter breaking priority ties
+oxn:{queue}:limiter               rate-limit window counter (with rate_limit)
+oxn:{queue}:stalled-check         throttle flag for the stalled scanner
+oxn:{queue}:schedulers            hash: scheduler id → record (scheduler)
+oxn:{queue}:schedulers:{id}       zset of a scheduler's pending ticks
+oxn:{queue}:{id}                  hash — the job record
+oxn:{queue}:{id}:lock             string token, TTL = lockDuration
+oxn:{queue}:{id}:logs             list of user-emitted log lines
+oxn:{queue}:{id}:dependencies     set of a flow parent's pending children
+oxn:{queue}:{id}:processed        hash: child → return value
+oxn:{queue}:{id}:failed           hash: child → failure reason
+oxn:{queue}:de:{dedupId}          dedup pointer, TTL = dedup ttl
+oxn:queues                        registry of known queue names
 ```
 
-Every state transition is a single `EVAL` — scripts live under
-`src/backend/redis/lua/`.
+Every state transition is a single `EVALSHA`. The scripts live under
+`src/backend/redis/lua/`, with shared helpers in `lua/includes/common.lua`,
+and `build.rs` gives each script only the helpers it uses. Queue names and
+explicit job ids may not contain `:` (or whitespace), so keys never alias.
 
 ## Testing
 
-The crate ships with **116 tests** (5-run stress passes 580/580):
+Every fix in 0.3 started as a failing regression test. The suite:
 
-- **42 unit tests** — types, serde round-trips, key layout, option
-  builders, error-code mapping, progress clamping, flow-tree building,
-  dashboard API serde.
-- **62 integration tests** hitting a live Redis (`redis://127.0.0.1:6379`
-  by default; override with `TEST_REDIS_URL`), each isolated by a unique
-  queue name and cleaned up via `obliterate(true)`. Coverage spans
-  add/process/complete, delayed/priority ordering, retry+backoff, stalled
-  recovery, pause/resume, drain/obliterate, dedup, flow trees, scheduler
-  ticks, dashboard HTTP round-trips, script-cache preload regression,
-  and the new bulk `clean`/`promote_all` ops (including event emission and
-  worker-wakeup behaviour).
-- **12 doctests** keep the inline examples honest.
+- **76 unit tests**: types, serde round-trips, key layout, option
+  resolution, error-code mapping, cron and interval maths, API routing,
+  auth and DTO validation.
+- **191 integration tests** against a live Redis (`TEST_REDIS_URL`),
+  plus one timing test that runs on its own. Each test uses a unique queue
+  name. With `oxn-testkit`, tests record a timeline of backend calls, Lua
+  return codes and events, and they check the queue's invariants: every
+  job hash is in exactly one container, there are no orphan keys, locks
+  match their owners, and counts match the containers. When a test fails,
+  its timeline is written to `target/oxn-reports/`. The tests cover every
+  bug fixed in 0.3, flows, schedulers running across processes, rate
+  limits, metrics, and fault injection (a connection cut before or after a
+  script runs). An HTTP contract suite runs against both the axum and
+  actix adapters and validates every response against the OpenAPI
+  document.
+- **21 doctests**.
+- **Browser tests** (`e2e/ui`, Playwright): 41 runs of the dashboard at
+  375, 768 and 1280 px, covering every action, hostile XSS payloads,
+  read-only and token modes, live updates, keyboard use and axe
+  accessibility scans.
+- **A load, soak and chaos campaign** (`oxn-load`, `scripts/load-campaign.sh`).
+  It covers throughput, latency, retry storms, `kill -9` of workers,
+  `CLIENT KILL`, Redis restarts, network faults, graceful shutdown, flow
+  fan-out, distributed schedulers and the HTTP API under load. Each run
+  checks a per-job ledger: no job lost or completed twice. Results are in
+  [docs/load-results/0.3.0.md](docs/load-results/0.3.0.md).
 
 ```bash
-# run everything (default: per-test backend, stable + ~4s locally)
-cargo test --features "scheduler,flow,dashboard-axum"
+# a throwaway Redis on :6390 for tests (docker)
+scripts/test-redis.sh start
+export TEST_REDIS_URL=redis://127.0.0.1:6390
+
+# everything
+cargo test --workspace --features "scheduler,flow,metrics,dashboard-axum,dashboard-actix"
 
 # unit tests only (no Redis required)
 cargo test --lib --no-default-features
 
-# point at a different Redis (managed Redis CI: shared per-binary backend
-# avoids connect storms and the deadpool conn-recycle race)
-TEST_REDIS_URL=rediss://... \
-OXN_TEST_SHARED_BACKEND=1 \
-  cargo test --features "tls,scheduler,flow,dashboard-axum" -- --test-threads=1
+# timing-sensitive test, run alone
+cargo test --test it --features "scheduler,flow,metrics,dashboard-axum,dashboard-actix" -- --ignored --test-threads=1
+
+# load campaign (SOAK=2h for the long soak)
+scripts/load-campaign.sh
 ```
 
 ## Minimum Rust version

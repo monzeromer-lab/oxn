@@ -68,14 +68,19 @@
 //! Your handler returns `Result<R, Error>`. A few [`Error`] variants have
 //! special meaning when returned from a handler:
 //!
-//! | Return value                                 | Worker does                                     |
-//! | -------------------------------------------- | ----------------------------------------------- |
-//! | `Ok(value)`                                  | Mark job `completed`, record return value       |
-//! | `Err(Error::Delayed { delay_ms })`           | Move job to `delayed`, due at now + delay       |
-//! | `Err(Error::RateLimited { delay_ms })`       | Same as `Delayed`, but emitted as a rate event  |
-//! | `Err(Error::Unrecoverable(msg))`             | Skip retries, go straight to `failed`           |
-//! | `Err(other)` with attempts remaining         | Requeue to `delayed` using the configured `Backoff` |
-//! | `Err(other)` with no attempts remaining      | Move to `failed` with `reason = msg`            |
+//! | Return value                            | Worker does                                                   |
+//! | --------------------------------------- | ------------------------------------------------------------- |
+//! | `Ok(value)`                             | Mark job `completed`, record return value                     |
+//! | `Err(Error::Delayed { delay_ms })`      | Postpone: `delayed` until now + delay, attempt refunded       |
+//! | `Err(Error::RateLimited { delay_ms })`  | Same postponement, reported as `rate-limited` in metrics      |
+//! | `Err(Error::WaitingChildren)`           | Park in `waiting-children` until its children resolve, attempt refunded |
+//! | `Err(Error::Unrecoverable(msg))`        | Skip retries, go straight to `failed`                         |
+//! | `Err(other)` or a panic, attempts left  | Requeue to `delayed` using the configured `Backoff`           |
+//! | `Err(other)` or a panic, none left      | Move to `failed` with `reason = msg`                          |
+//!
+//! Postponements record no failure. For progress, logs, lock-loss and
+//! shutdown signals, build the worker with [`Worker::builder_with_ctx`] and
+//! use the [`JobContext`] it passes to the handler.
 //!
 //! ## Feature flags
 //!
@@ -95,13 +100,13 @@
 //!
 //! ## TLS (managed Redis)
 //!
-//! Connecting to managed Redis services (DigitalOcean Managed Redis, AWS
-//! ElastiCache Serverless, Upstash, Redis Cloud, …) typically requires TLS
-//! and a `rediss://` URL. Enable the `tls` feature:
+//! Connecting to managed Redis services (DigitalOcean Managed Redis,
+//! Upstash, Redis Cloud, …) typically requires TLS and a `rediss://` URL.
+//! Enable the `tls` feature:
 //!
 //! ```toml
 //! [dependencies]
-//! oxn = { version = "0.2", features = ["tls"] }
+//! oxn = { version = "0.3", features = ["tls"] }
 //! ```
 //!
 //! Then build the queue exactly the same way:
@@ -123,22 +128,28 @@
 //!
 //! ```toml
 //! [dependencies]
-//! oxn = { version = "0.2", features = ["scheduler", "flow", "dashboard-axum"] }
+//! oxn = { version = "0.3", features = ["scheduler", "flow", "dashboard-axum"] }
 //! ```
 //!
 //! ## Recent releases
 //!
-//! - **0.2.2** — bulk dashboard ops: `Backend::clean(state, limit)` and
-//!   `Backend::promote_all` plus matching `POST /clean/{state}` and
-//!   `POST /promote-all` routes. State-aware buttons in the bundled UI.
-//!   Subscriber decodes `Event::Cleaned` (was silently ignored).
-//! - **0.2.1** — documentation refresh of the dashboard work. No code
-//!   changes.
-//! - **0.2.0** — job-detail drawer + per-job logs endpoint;
-//!   `QueueBuilder::remove_on_complete` / `remove_on_fail` shortcuts;
-//!   pool keepalive task to survive managed-Redis idle FINs;
-//!   `BZPOPMIN` moved to a regular pool slot to stop blocking-call
-//!   head-of-line starvation; honored `cfg.pool_size`.
+//! - **0.3.0** — correctness release: every bug from the 0.2.2 review
+//!   fixed (queue defaults, instant pickup, graceful shutdown, no leaked
+//!   keys, lossless events, stalled-job lifecycle, …); flows, schedulers,
+//!   rate limiting and metrics implemented for real; a [`JobContext`] for
+//!   handlers; a standalone `/v1` HTTP API (`oxn::api`) with optional auth;
+//!   a redesigned, responsive dashboard. Breaking: see
+//!   `docs/MIGRATION-0.3.md`.
+//! - **0.2.2** — bulk dashboard ops (`clean`, `promote_all`).
+//! - **0.2.0 / 0.2.1** — job-detail drawer and logs endpoint; pool
+//!   keepalive; `BZPOPMIN` on a regular pool slot.
+//!
+//! ## Redis Cluster
+//!
+//! Not supported. Every key of a queue must live on one node: scripts touch
+//! several keys per call and flows span queues. Cluster-mode endpoints
+//! (Redis Cluster, ElastiCache Serverless, cluster-mode ElastiCache or
+//! MemoryDB) will not work; use a single, non-clustered primary.
 //!
 //! See `CHANGELOG.md` in the repo for the full per-version history.
 //!

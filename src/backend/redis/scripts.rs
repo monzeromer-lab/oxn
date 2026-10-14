@@ -9,7 +9,7 @@
 //! `redis::Script::invoke_async` is lazy: on the first call it tries
 //! `EVALSHA`, gets `NOSCRIPT`, then runs `SCRIPT LOAD` and retries. Against
 //! a managed Redis sitting behind a TLS-terminating proxy
-//! (DigitalOcean Managed Redis, AWS ElastiCache Serverless, Upstash, …)
+//! (DigitalOcean Managed Redis, Upstash, Redis Cloud, …)
 //! that one-time `SCRIPT LOAD` round-trip can stall for **seconds** —
 //! enough to make the first `Queue::add()` of a fresh process visibly hang.
 //!

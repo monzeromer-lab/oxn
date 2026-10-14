@@ -13,7 +13,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let q: Queue<Task> = Queue::builder("demo")
-        .redis("redis://127.0.0.1:6379")
+        .redis(std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into()))
         .build()
         .await?;
 
