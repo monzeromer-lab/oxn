@@ -17,6 +17,7 @@ type Q = String;
 pub(crate) enum Route {
     Health,
     OpenApi,
+    Whoami,
     Queues,
     Queue(Q),
     Obliterate(Q),
@@ -134,6 +135,7 @@ impl Route {
         match s.as_slice() {
             ["v1", "health"] => pick(vec![("GET", Health)]),
             ["v1", "openapi.json"] => pick(vec![("GET", OpenApi)]),
+            ["v1", "whoami"] => pick(vec![("GET", Whoami)]),
             ["v1", "queues"] => pick(vec![("GET", Queues)]),
             ["v1", "queues", n] => pick(vec![("GET", Queue(q(n)?)), ("DELETE", Obliterate(q(n)?))]),
             ["v1", "queues", n, "counts"] => pick(vec![("GET", Counts(q(n)?))]),
@@ -214,8 +216,8 @@ impl Route {
         use Route::*;
         match self {
             Health => Needs::Nothing,
-            OpenApi | Queues | Queue(_) | Counts(_) | ListJobs(_) | GetJob(..) | Logs(..)
-            | Flow(..) | Schedulers(_) | Events(_) | LegacyQueues | LegacyCounts(_)
+            OpenApi | Whoami | Queues | Queue(_) | Counts(_) | ListJobs(_) | GetJob(..)
+            | Logs(..) | Flow(..) | Schedulers(_) | Events(_) | LegacyQueues | LegacyCounts(_)
             | LegacyJobs(_) | LegacyJob(..) | LegacyLogs(..) => Needs::Read,
             _ => Needs::Admin,
         }
@@ -340,6 +342,7 @@ async fn handle(api: &Api, route: Route, req: &ApiRequest) -> Result<ApiResponse
                 &json!({ "status": "unavailable", "error": e.to_string() }),
             ),
         },
+        Whoami => unreachable!("answered by Api::handle"),
         OpenApi => ApiResponse {
             status: 200,
             headers: vec![("content-type".into(), "application/json".into())],

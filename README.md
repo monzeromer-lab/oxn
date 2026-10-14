@@ -377,10 +377,14 @@ use oxn::dashboard::actix_scope;
 App::new().service(actix_scope(queue.backend()))
 ```
 
-Clicking a row in the bundled UI opens a side drawer with the job's
-**data**, **stats** (state, attempts, priority, timestamps, duration, lock
-token, retention policies), **progress**, **return value**, **failed reason
-+ stack trace** when present, and the captured **log lines**.
+The UI is responsive (phone, tablet, desktop; light and dark), updates
+live, and links straight to a queue, state or job from the URL. Clicking a
+job opens its **data**, **progress**, **return value**, **failure and stack
+trace**, **log lines** and **flow tree**, with retry / run now / remove.
+Admin actions only appear when the API grants admin access (`/v1/whoami`);
+with `Auth::Bearer` the page asks for a token. Browser tests:
+`cd e2e/ui && npm ci && npx playwright test` (uses your installed Chrome
+and `TEST_REDIS_URL`).
 
 `cargo run --example dashboard_axum --features dashboard-axum` →
 `http://localhost:8080/admin`.

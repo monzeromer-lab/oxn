@@ -353,6 +353,29 @@ It contains breaking changes; see the migration notes below.
 
 ### Added
 
+- **A redesigned, responsive dashboard.** Still one embedded HTML file
+  with no build step (~60 KB), mounted as before, now on the `/v1` API.
+  Phones get a queue sheet, scrollable state chips, job cards, a
+  full-screen job view and an Actions menu; tablets a slide-over queue
+  list; desktops a collapsible sidebar, sticky toolbar, dense table and a
+  side drawer. Columns follow the listed state (progress for active jobs,
+  duration for finished ones, the reason for failed ones). Live updates
+  over SSE (with bearer tokens; polling as a fallback), deep links in the
+  URL (back/forward work), job search by id, pagination, light/dark
+  theme, a flow tree, a schedulers tab, confirmations for destructive
+  actions (deleting a queue means typing its name), toasts, and loading /
+  empty / error states. Admin actions appear only when `GET /v1/whoami`
+  (new) says the viewer may use them; a token dialog appears when the API
+  asks for one. Keyboard: `/` open a job by id, `j`/`k` move, Enter
+  open, Esc close; dialogs and the drawer trap focus. No HTML is ever
+  built from strings: every value is set with `textContent` (a test
+  forbids `innerHTML` and its relatives in the page). Tested with
+  Playwright at 375 / 768 / 1280 px against a fixture server
+  (`examples/e2e_dashboard.rs`): every action, hostile payloads in names,
+  data, failure reasons and logs, read-only and token modes, live
+  updates, deep links, keyboard, no sideways scrolling, and axe
+  accessibility scans in light and dark themes (which caught a
+  low-contrast count in the sidebar).
 - **A standalone HTTP API (`oxn::api`, features `api-axum` / `api-actix`).**
   Everything the dashboard does, versioned under `/v1`: queues, counts,
   pause/resume/drain/clean/promote-all/obliterate; add and bulk-add jobs

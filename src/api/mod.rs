@@ -25,6 +25,7 @@
 //! |---|---|---|
 //! | GET | `/v1/health` | Redis reachable (no auth) |
 //! | GET | `/v1/openapi.json` | OpenAPI description |
+//! | GET | `/v1/whoami` | the caller's access: `read` or `admin` (what a UI may offer) |
 //! | GET | `/v1/queues` | every queue with counts and pause flag |
 //! | GET / DELETE | `/v1/queues/{queue}` | one queue · obliterate (`?force=true` even with active jobs) |
 //! | GET | `/v1/queues/{queue}/counts` | per-state counts |
@@ -379,8 +380,26 @@ impl Api {
             path: &req.path,
             headers: &req.headers,
         };
-        if let Err(resp) = self.authorize(route.needs(), &parts) {
-            return resp;
+        let access = match self.authorize(route.needs(), &parts) {
+            Ok(a) => a,
+            Err(resp) => return resp,
+        };
+        if matches!(route, routes::Route::Whoami) {
+            let auth = match &self.config.auth {
+                Auth::None => "none",
+                Auth::Bearer { .. } => "bearer",
+                Auth::Custom(_) => "custom",
+            };
+            let can_write = access == Access::Admin && !self.config.read_only;
+            return ApiResponse::json(
+                200,
+                &serde_json::json!({
+                    "access": if can_write { "admin" } else { "read" },
+                    "read_only": self.config.read_only,
+                    "auth": auth,
+                }),
+            )
+            .header("cache-control", "no-store");
         }
         let legacy = route.is_legacy();
         let read = route.needs() == Needs::Read;
@@ -402,9 +421,9 @@ impl Api {
         resp.header("cache-control", "no-store")
     }
 
-    fn authorize(&self, needs: Needs, parts: &RequestParts<'_>) -> Result<(), ApiResponse> {
+    fn authorize(&self, needs: Needs, parts: &RequestParts<'_>) -> Result<Access, ApiResponse> {
         if needs == Needs::Nothing {
-            return Ok(());
+            return Ok(Access::Read);
         }
         let access = match &self.config.auth {
             Auth::None => Access::Admin,
@@ -437,7 +456,7 @@ impl Api {
                 ));
             }
         }
-        Ok(())
+        Ok(access)
     }
 }
 

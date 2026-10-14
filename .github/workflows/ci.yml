@@ -107,3 +107,41 @@ jobs:
           name: load-reports
           path: target/oxn-reports/load/
           if-no-files-found: ignore
+
+  dashboard-ui:
+    name: dashboard (Playwright, 375/768/1280)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7.4
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s
+          --health-timeout 2s --health-retries 15
+    env:
+      TEST_REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/ui/package-lock.json
+      - run: cargo build --example e2e_dashboard --features dashboard-axum,flow,scheduler
+      - run: npm ci
+        working-directory: e2e/ui
+      - run: npx playwright install chrome
+        working-directory: e2e/ui
+      - run: npx playwright test
+        working-directory: e2e/ui
+      - name: Upload report and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-ui
+          path: |
+            e2e/ui/report/
+            e2e/ui/screenshots/
+            e2e/ui/results/

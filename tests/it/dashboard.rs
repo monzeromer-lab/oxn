@@ -406,82 +406,41 @@ async fn dashboard_maps_rejected_operations_to_http_status() {
     common::teardown(&q).await;
 }
 
-/// B10 — every value interpolated into the dashboard's HTML goes through an
-/// escaping helper, or is on the short, reviewed list of values that are
-/// numbers / fixed state names. A new raw `${…}` fails this test until it
-/// is escaped or consciously allow-listed.
+/// B10 / Phase 4 — the dashboard never builds HTML from strings: every
+/// node is created with `document.createElement` and every value is set
+/// with `textContent` (or an attribute). So no `innerHTML`-style sink and
+/// no template-literal interpolation may appear in the page at all; the
+/// browser tests check the behaviour with hostile job data.
 #[test]
-fn dashboard_html_escapes_every_interpolation() {
+fn dashboard_never_builds_html_from_strings() {
     const HTML: &str = include_str!("../../src/dashboard/assets/index.html");
-    // Helpers whose output is safe in the context they're used in:
-    // esc() → HTML text/attributes, js() → a JS string literal inside an
-    // inline handler attribute, the rest produce escaped/encoded output.
-    const SAFE_CALLS: &[&str] = &[
-        "esc(",
-        "js(",
-        "escapeHtml(",
-        "fmtJson(",
-        "fmtTs(",
-        "encodeURIComponent(",
-    ];
-    // Reviewed raw interpolations: numbers, booleans and values drawn from
-    // the fixed STATES list or built from already-escaped pieces.
-    const ALLOWED_RAW: &[&str] = &[
-        "total",
-        "n",
-        "s",
-        "state",
-        "selectedState",
-        "actions",
-        "actionsBar",
-        "help",
-        "logs.count",
-        "j.attempts_made",
-        "j.attempts_total",
-        "job.attempts_made",
-        "job.opts?.attempts ?? '?'",
-        "job.opts?.priority ?? 0",
-        "durMs != null ? durMs + ' ms' : '-'",
-        "total === 1 ? '' : 's'",
-        "selectedState === s ? 'selected' : ''",
-    ];
-    let mut raw = Vec::new();
-    let bytes = HTML.as_bytes();
-    let mut i = 0;
-    while let Some(off) = HTML[i..].find("${") {
-        let start = i + off + 2;
-        let (mut depth, mut j) = (1, start);
-        while depth > 0 && j < bytes.len() {
-            match bytes[j] {
-                b'{' => depth += 1,
-                b'}' => depth -= 1,
-                _ => {}
-            }
-            j += 1;
-        }
-        let expr = HTML[start..j - 1].trim();
-        let line = HTML[..start].lines().count();
-        let nested = expr.contains('`'); // conditional template: inner ${} are checked on their own
-        let safe = nested
-            || SAFE_CALLS.iter().any(|f| expr.starts_with(f))
-            || ALLOWED_RAW.contains(&expr)
-            || expr.starts_with("STATES.map(")
-            || expr.starts_with("new Date(")
-            || expr.starts_with("j.finished_on_ms ?")
-            || expr.starts_with("logs.count");
-        if !safe {
-            raw.push(format!("line {line}: ${{{expr}}}"));
-        }
-        i = start;
+    for sink in [
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+        "eval(",
+        "new Function",
+        "${",
+        "javascript:",
+    ] {
+        assert!(!HTML.contains(sink), "index.html contains `{sink}`");
     }
-    assert!(
-        raw.is_empty(),
-        "unescaped interpolations in index.html:\n{}",
-        raw.join("\n")
-    );
+    // Inline event-handler attributes are strings evaluated as code.
+    for attr in [
+        " onclick=",
+        " onload=",
+        " onerror=",
+        " oninput=",
+        " onchange=",
+    ] {
+        assert!(
+            !HTML.contains(attr),
+            "index.html has an inline `{attr}` handler"
+        );
+    }
 }
 
-/// B17 — the UI derives its API base from its own URL. Runs the page's
 /// `dashboardBase` (extracted from the shipped HTML) under Node for every
 /// mount shape; skipped when `node` isn't installed.
 #[test]

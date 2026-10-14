@@ -175,6 +175,15 @@
     "/v1/openapi.json": {
       "get": { "summary": "This document.", "responses": { "200": { "description": "OpenAPI 3.1.", "content": { "application/json": { "schema": { "type": "object" } } } } } }
     },
+    "/v1/whoami": {
+      "get": {
+        "summary": "What the caller may do: `admin` (everything) or `read` (GET routes only). A UI uses it to offer only the actions that will work.",
+        "responses": {
+          "200": { "description": "The caller's access.", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["access", "read_only", "auth"], "properties": { "access": { "enum": ["read", "admin"] }, "read_only": { "type": "boolean" }, "auth": { "enum": ["none", "bearer", "custom"] } } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
     "/v1/queues": {
       "get": {
         "summary": "Every queue, with its counts and pause flag.",

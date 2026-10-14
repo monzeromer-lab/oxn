@@ -157,6 +157,11 @@ path = "examples/api_axum.rs"
 required-features = ["redis-backend", "api-axum"]
 
 [[example]]
+name = "e2e_dashboard"
+path = "examples/e2e_dashboard.rs"
+required-features = ["redis-backend", "dashboard-axum", "flow", "scheduler"]
+
+[[example]]
 name = "dashboard_axum"
 path = "examples/dashboard_axum.rs"
 required-features = ["redis-backend", "dashboard-axum"]

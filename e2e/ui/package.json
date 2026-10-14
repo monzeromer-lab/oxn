@@ -1,0 +1,12 @@
+{
+  "name": "oxn-dashboard-e2e",
+  "private": true,
+  "description": "Browser tests for the oxn dashboard (Playwright, driving the installed Google Chrome).",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.10.1",
+    "@playwright/test": "1.49.1"
+  }
+}

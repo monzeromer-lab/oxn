@@ -774,6 +774,15 @@ async fn auth_matrix(a: Adapter) {
         200,
         "health needs no credentials"
     );
+    for (token, want) in [(Some("reader"), "read"), (Some("admin"), "admin")] {
+        let r = s.call("GET", "/v1/whoami", None, token).await;
+        conforms("GET", "/v1/whoami", &r);
+        assert_eq!(
+            (r.json["access"].clone(), r.json["auth"].clone()),
+            (json!(want), json!("bearer"))
+        );
+    }
+    assert_eq!(s.get("/v1/whoami").await.status, 401);
 
     let ro = serve(a, ApiConfig::default().read_only(true)).await;
     let r = ro.post(&format!("/v1/queues/{n}/pause"), json!({})).await;
@@ -782,6 +791,11 @@ async fn auth_matrix(a: Adapter) {
         (403, json!("read_only"))
     );
     assert_eq!(ro.get("/v1/queues").await.status, 200);
+    let r = ro.get("/v1/whoami").await;
+    assert_eq!(
+        (r.json["access"].clone(), r.json["read_only"].clone()),
+        (json!("read"), json!(true))
+    );
 
     let custom = serve(
         a,
