@@ -10,7 +10,9 @@ name = "oxn-load"
 path = "src/main.rs"
 
 [dependencies]
-oxn = { path = "..", features = ["redis-backend", "metrics", "flow", "scheduler"] }
+oxn = { path = "..", features = ["redis-backend", "metrics", "flow", "scheduler", "api-axum"] }
+axum = { version = "0.7", default-features = false, features = ["tokio", "http1", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 oxn-testkit = { path = "../testkit" }
 tokio = { version = "1.40", features = ["full"] }
 tokio-util = "0.7"

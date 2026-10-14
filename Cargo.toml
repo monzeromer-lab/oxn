@@ -46,10 +46,16 @@ scheduler = ["dep:cron", "dep:chrono"]
 flow = []
 metrics = ["dep:metrics"]
 
-# Dashboards (mutually compatible, but most users will pick one)
-dashboard = []
-dashboard-axum = ["dashboard", "dep:axum", "dep:tower", "dep:tower-http"]
-dashboard-actix = ["dashboard", "dep:actix-web"]
+# HTTP API (`oxn::api`): the framework-neutral core, and its adapters.
+api = []
+api-axum = ["api", "dep:axum", "dep:tower", "dep:tower-http"]
+api-actix = ["api", "dep:actix-web"]
+
+# Dashboards: the API plus the bundled UI (mutually compatible, but most
+# users will pick one)
+dashboard = ["api"]
+dashboard-axum = ["dashboard", "api-axum"]
+dashboard-actix = ["dashboard", "api-actix"]
 
 # Convenience bundle
 full = [
@@ -131,7 +137,8 @@ uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 tokio-util = "0.7"
 redis = { version = "0.27", default-features = false, features = ["tokio-comp"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+jsonschema = { version = "0.49", default-features = false }
 oxn-testkit = { path = "testkit" }
 
 [[example]]
@@ -143,6 +150,11 @@ required-features = ["redis-backend"]
 name = "delayed"
 path = "examples/delayed.rs"
 required-features = ["redis-backend"]
+
+[[example]]
+name = "api_axum"
+path = "examples/api_axum.rs"
+required-features = ["redis-backend", "api-axum"]
 
 [[example]]
 name = "dashboard_axum"

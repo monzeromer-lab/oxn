@@ -1561,13 +1561,21 @@ impl Backend for RedisBackend {
     async fn get_logs(&self, queue: &str, id: &JobId, range: JobRange) -> Result<Vec<String>> {
         let keys = self.keys(queue);
         let mut conn = self.conn().await?;
-        let v: Vec<String> = conn
-            .lrange(
-                keys.job_logs(id.as_str()),
-                range.start as isize,
-                range.end as isize,
-            )
+        // Lines are appended, oldest first. Newest-first [start, end] is
+        // list indices [-(end+1), -(start+1)], reversed (end < 0: to the
+        // oldest). 0.2 ignored `descending`.
+        let (lo, hi) = if range.descending {
+            let lo = if range.end < 0 { 0 } else { -(range.end + 1) };
+            (lo, -(range.start + 1))
+        } else {
+            (range.start, range.end)
+        };
+        let mut v: Vec<String> = conn
+            .lrange(keys.job_logs(id.as_str()), lo as isize, hi as isize)
             .await?;
+        if range.descending {
+            v.reverse();
+        }
         Ok(v)
     }
 

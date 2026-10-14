@@ -465,6 +465,7 @@ pub async fn producer(
     seed: u64,
     started: Instant,
     stop: CancellationToken,
+    api: Option<Arc<crate::api::ApiTarget>>,
 ) {
     let per_producer_rate = if cfg.rate > 0 {
         cfg.rate as f64 / cfg.producers as f64
@@ -531,7 +532,15 @@ pub async fn producer(
                 .collect();
             let jobs: Vec<LoadJob> = planned.iter().map(|(j, _)| j.clone()).collect();
             let t0 = Instant::now();
-            let result = if planned.len() == 1 {
+            let result = if let Some(api) = &api {
+                api.add(queue.name(), &planned)
+                    .await
+                    .map(|ids| ids.into_iter().map(JobId::new).collect::<Vec<_>>())
+                    .map_err(|e| {
+                        api.add_errors.fetch_add(1, Ordering::Relaxed);
+                        oxn::Error::Config(e.to_string())
+                    })
+            } else if planned.len() == 1 {
                 let (job, opts) = planned.into_iter().next().expect("one job");
                 queue.add(job, opts).await.map(|id| vec![id])
             } else {

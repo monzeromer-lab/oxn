@@ -56,7 +56,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p oxn --lib --no-default-features
-      - run: cargo test --workspace --features "scheduler,flow,dashboard-axum"
+      - run: cargo test --workspace --features "scheduler,flow,metrics,dashboard-axum,dashboard-actix"
       - run: cargo test -p oxn --features dashboard-actix --lib
       - name: timing tests (alone, on an idle Redis)
         run: cargo test --test it -- --ignored --test-threads=1
@@ -96,6 +96,10 @@ jobs:
         run: >-
           target/release/oxn-load schedule --redis redis://127.0.0.1:6379 --schedulers 20
           --instances 5 --every-ms 200 --duration-s 8 --restart-every-s 3 --label ci
+      - name: through the HTTP API (API and workers in separate processes)
+        run: >-
+          target/release/oxn-load run --redis redis://127.0.0.1:6379 --scenario smoke --jobs 10000
+          --rate 2000 --bulk 20 --processes true --workers 3 --via-api --api-readers 4 --label ci-api
       - name: Upload load reports
         if: always()
         uses: actions/upload-artifact@v4

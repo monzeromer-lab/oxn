@@ -208,6 +208,21 @@ pub fn render(o: &Outcome) -> String {
         );
     }
 
+    if let Some(a) = &o.api {
+        let _ = writeln!(s, "## HTTP API\n");
+        let _ = writeln!(
+            s,
+            "- every job added through the API (separate process); {} add error(s)",
+            a.add_errors
+        );
+        let h = &a.read_latency;
+        let _ = writeln!(
+            s,
+            "- reads: {} requests, p50 {:.2}ms · p99 {:.2}ms · max {:.2}ms; {} error(s)",
+            h.count, h.p50_ms, h.p99_ms, h.max_ms, a.read_errors
+        );
+        let _ = writeln!(s, "- SSE events received: {:?}\n", a.sse_events);
+    }
     if let Some(p) = &o.plateau {
         let _ = writeln!(s, "## Plateau (leak check)\n");
         let _ = writeln!(

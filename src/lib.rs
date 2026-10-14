@@ -87,7 +87,9 @@
 //! | `scheduler`        | `JobScheduler` — cron and fixed-interval repeats.             |
 //! | `flow`             | `FlowProducer` — parent/child DAGs.                           |
 //! | `metrics`          | `oxn_*` counters/histograms via the `metrics` crate (`oxn::metrics`). |
-//! | `dashboard-axum`   | `dashboard::axum_router` — mount on any axum app.             |
+//! | `api-axum`         | `api::axum_router` — the `/v1` HTTP API on any axum app.      |
+//! | `api-actix`        | `api::actix_scope` — the same API on any actix-web app.       |
+//! | `dashboard-axum`   | `dashboard::axum_router` — the API plus the bundled UI.       |
 //! | `dashboard-actix`  | `dashboard::actix_scope` — mount on any actix-web app.        |
 //! | `full`             | All of the above (rustls TLS), with `dashboard-axum` selected.|
 //!
@@ -178,6 +180,10 @@ pub mod flow;
 #[cfg(feature = "scheduler")]
 #[cfg_attr(docsrs, doc(cfg(feature = "scheduler")))]
 pub mod scheduler;
+
+#[cfg(feature = "api")]
+#[cfg_attr(docsrs, doc(cfg(feature = "api")))]
+pub mod api;
 
 #[cfg(feature = "dashboard")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dashboard")))]

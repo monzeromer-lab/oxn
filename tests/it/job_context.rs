@@ -236,3 +236,28 @@ async fn handlers_can_wind_down_cooperatively_on_shutdown() {
     rec.assert_clean();
     common::teardown(&q).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn log_pages_read_oldest_or_newest_first() {
+    let (q, b) = common::fresh_queue::<T>("logs-order").await;
+    let id = q.add(T(1), JobOptions::new()).await.unwrap();
+    for i in 1..=5 {
+        b.log(q.name(), &id, &format!("l{i}")).await.unwrap();
+    }
+    let page = |start, end, descending| JobRange {
+        start,
+        end,
+        descending,
+    };
+    let get = |r| {
+        let (b, q, id) = (b.clone(), q.name().to_string(), id.clone());
+        async move { b.get_logs(&q, &id, r).await.unwrap() }
+    };
+    assert_eq!(get(page(0, 1, false)).await, ["l1", "l2"]);
+    assert_eq!(get(page(0, 1, true)).await, ["l5", "l4"], "newest first");
+    assert_eq!(get(page(2, 3, true)).await, ["l3", "l2"]);
+    assert_eq!(get(page(3, -1, true)).await, ["l2", "l1"], "to the oldest");
+    assert_eq!(get(page(0, -1, true)).await, ["l5", "l4", "l3", "l2", "l1"]);
+    assert!(get(page(9, 10, true)).await.is_empty());
+    common::teardown(&q).await;
+}

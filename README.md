@@ -91,7 +91,9 @@ async fn main() -> oxn::Result<()> {
 | `scheduler`       | `JobScheduler` — cron and fixed-interval repeats               |
 | `flow`            | `FlowProducer` — parent/child trees (a parent runs after its children) |
 | `metrics`         | `oxn_*` counters, histograms and a gauge via the `metrics` crate (names in `oxn::metrics`) |
-| `dashboard-axum`  | `dashboard::axum_router` — mount on any axum app               |
+| `api-axum`        | `api::axum_router` — the `/v1` HTTP API on any axum app        |
+| `api-actix`       | `api::actix_scope` — the same API on any actix-web app         |
+| `dashboard-axum`  | `dashboard::axum_router` — the API plus the bundled UI         |
 | `dashboard-actix` | `dashboard::actix_scope` — mount on any actix-web app          |
 | `full`            | Everything above except actix (choose one dashboard)           |
 
@@ -307,41 +309,78 @@ its whole tree. A handler can also add children to its own job with
 `FlowProducer::add_under(&ctx.as_parent(), node)` and return
 `Error::WaitingChildren` to run again once they finish.
 
+## HTTP API
+
+Enable `api-axum` or `api-actix` to manage queues over HTTP: everything the
+dashboard does, versioned under `/v1`. The router is plain, so you mount it
+like the dashboard and put your own middleware in front of it, or use the
+built-in bearer tokens.
+
+```rust
+use oxn::api::{ApiConfig, axum_router, actix_scope};
+
+// axum — behind your middleware…
+let app = axum::Router::new()
+    .nest("/oxn", axum_router(queue.backend(), ApiConfig::default()).layer(my_auth));
+// …or with built-in tokens (read for GET routes, admin for the rest)
+let cfg = ApiConfig::default().bearer(["reader-token"], ["admin-token"]);
+let app = axum::Router::new().nest("/oxn", axum_router(queue.backend(), cfg));
+
+// actix
+App::new().service(web::scope("/oxn").wrap(my_mw).service(actix_scope(queue.backend(), ApiConfig::default())))
+```
+
+| Method | Path | |
+|---|---|---|
+| GET | `/v1/health` | Redis reachable (no auth) |
+| GET | `/v1/openapi.json` | OpenAPI 3.1 description of everything below |
+| GET | `/v1/queues` · `/v1/queues/{q}` · `/v1/queues/{q}/counts` | queues, one queue, per-state counts |
+| POST | `/v1/queues/{q}/pause` · `resume` · `drain` · `clean` · `promote-all` | queue operations |
+| DELETE | `/v1/queues/{q}?force=true` | obliterate |
+| GET · POST | `/v1/queues/{q}/jobs` | list (`?state=&offset=&limit=&order=`, with `total`) · add a job |
+| POST | `/v1/queues/{q}/jobs/bulk` | add many, all or nothing |
+| GET · DELETE | `/v1/queues/{q}/jobs/{id}` | one job · remove it (and its flow tree) |
+| GET | `/v1/queues/{q}/jobs/{id}/logs` · `/flow` | log lines · flow tree |
+| POST | `/v1/queues/{q}/jobs/{id}/retry` · `/promote` | retry a failed job · run a delayed one now |
+| GET · DELETE | `/v1/queues/{q}/schedulers` · `/schedulers/{id}` | job schedulers |
+| GET | `/v1/queues/{q}/events` | live events, server-sent; resumes from `Last-Event-ID` |
+
+```bash
+curl -X POST localhost:8080/oxn/v1/queues/emails/jobs \
+  -H 'authorization: Bearer admin-token' -H 'content-type: application/json' \
+  -d '{"data": {"to": "a@b.c"}, "opts": {"attempts": 3, "backoff": {"type": "exponential", "delay_ms": 500}}}'
+```
+
+Errors are `{"error": {"code": "...", "message": "..."}}` with `404` for a
+missing job, queue or scheduler, `409` for a job in the wrong state or held
+by a worker, `400` for invalid input, `401`/`403` for auth and `503` when
+Redis is unreachable. Auth options: `Auth::None` (default; your middleware
+decides), `Auth::Bearer` (constant-time token check), `Auth::Custom` (your
+function gets the request's method, path and headers: JWT, sessions, …),
+and `ApiConfig::read_only(true)` to refuse every write. For other
+frameworks, `oxn::api::Api::handle` takes a plain request and returns a
+plain response.
+
 ## Dashboard
 
-Enable `dashboard-axum` or `dashboard-actix`. Both export a framework-native
-factory that mounts the same set of endpoints and serves a zero-dependency
-HTML UI at `/`.
-
-| Method | Path                                        | Purpose                                  |
-| ------ | ------------------------------------------- | ---------------------------------------- |
-| GET    | `/api/queues`                               | List queues with pause flag + counts     |
-| GET    | `/api/queues/{name}/counts`                 | Per-state job counts                     |
-| GET    | `/api/queues/{name}/jobs?state=failed`      | Page through jobs in a state             |
-| GET    | `/api/queues/{name}/jobs/{id}`              | Full job record (data, opts, stats, …)   |
-| GET    | `/api/queues/{name}/jobs/{id}/logs`         | Log lines attached via `Backend::log`    |
-| POST   | `/api/queues/{name}/jobs/{id}/retry`        | Move a failed job back to `wait`         |
-| POST   | `/api/queues/{name}/jobs/{id}/promote`      | Skip a delayed job's wait time           |
-| POST   | `/api/queues/{name}/jobs/{id}/remove`       | Delete a job and its auxiliary keys      |
-| POST   | `/api/queues/{name}/pause`/`resume`/`drain` | Queue-wide controls                      |
-| POST   | `/api/queues/{name}/clean/{state}`          | Bulk-delete jobs in `completed` / `failed` / `delayed` / `prioritized` / `waiting-children`. Body: `{"limit": N}` (`0` = all). Returns `{"count": N}`. |
-| POST   | `/api/queues/{name}/promote-all`            | Move every delayed job to `wait` immediately. Returns `{"count": N}`. |
-
-Clicking a row in the bundled UI opens a side drawer with the job's
-**data**, **stats** (state, attempts, priority, timestamps, duration, lock
-token, retention policies), **progress**, **return value**, **failed reason
-+ stack trace** when present, and the captured **log lines** — all backed
-by the endpoints above.
+Enable `dashboard-axum` or `dashboard-actix`: the HTTP API above plus a
+zero-dependency HTML UI at `/`.
 
 ```rust
 // axum
 use oxn::dashboard::axum_router;
 let app = axum::Router::new().nest("/admin", axum_router(queue.backend()));
+// with API auth: oxn::dashboard::axum_router_with(backend, ApiConfig::default().bearer(...))
 
 // actix
 use oxn::dashboard::actix_scope;
 App::new().service(actix_scope(queue.backend()))
 ```
+
+Clicking a row in the bundled UI opens a side drawer with the job's
+**data**, **stats** (state, attempts, priority, timestamps, duration, lock
+token, retention policies), **progress**, **return value**, **failed reason
++ stack trace** when present, and the captured **log lines**.
 
 `cargo run --example dashboard_axum --features dashboard-axum` →
 `http://localhost:8080/admin`.
@@ -349,8 +388,8 @@ App::new().service(actix_scope(queue.backend()))
 The UI derives its API base from the path it is served at, so it works
 wherever you nest it. Axum's `nest` does not route the trailing-slash form
 (`/admin/`); add `tower_http::normalize_path::NormalizePathLayer::trim_trailing_slash()`
-around your app if you want both to work. The dashboard has no
-authentication of its own — mount it behind your auth middleware.
+around your app if you want both to work. The 0.2 dashboard routes
+(`/api/queues/...`) still answer in 0.3, deprecated, with their 0.2 shapes.
 
 ## Custom backends
 

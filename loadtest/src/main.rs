@@ -14,6 +14,7 @@
 //! The exit code is non-zero when anything is wrong, so a run doubles as a
 //! CI gate.
 
+mod api;
 mod chaos;
 mod config;
 mod flow;
@@ -41,6 +42,12 @@ enum Cmd {
     Flow(Box<flow::FlowArgs>),
     /// Many instances of many schedulers: one run per tick, no gaps.
     Schedule(Box<sched::SchedArgs>),
+    /// Internal: the HTTP API server child (used by `--via-api`).
+    #[command(hide = true)]
+    ApiServe {
+        #[arg(long)]
+        redis: String,
+    },
     /// Internal: a worker child process (used by `--processes true`).
     #[command(hide = true)]
     Worker {
@@ -109,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
             };
             workload::child_worker_main(redis, queue, spec).await
         }
+        Cmd::ApiServe { redis } => api::serve(redis).await,
         Cmd::Schedule(args) => {
             let o = sched::run(*args).await?;
             let path = sched::write(&o)?;

@@ -120,6 +120,8 @@ It contains breaking changes; see the migration notes below.
   immediately and its pool slot is detached instead of being returned with
   a block still pending; the stalled scanner is joined before `run()`
   returns.
+- `Backend::get_logs` ignored `JobRange::descending`: newest-first pages
+  returned the oldest lines (the dashboard's `desc` flag never worked).
 - **Faster hot-path scripts.** Redis runs a script's top level on every
   `EVALSHA`, so each script re-created all ~22 shared helpers per call
   (~3.5µs). A `build.rs` now gives each script only the helpers it uses.
@@ -350,6 +352,24 @@ It contains breaking changes; see the migration notes below.
   lost, outcome discarded"); any other rejection as an error.
 
 ### Added
+
+- **A standalone HTTP API (`oxn::api`, features `api-axum` / `api-actix`).**
+  Everything the dashboard does, versioned under `/v1`: queues, counts,
+  pause/resume/drain/clean/promote-all/obliterate; add and bulk-add jobs
+  (JSON options mapped onto `JobOptions`, validated, unknown fields
+  refused); paginated listing with `total`; a job, its logs, its flow tree;
+  retry/promote/remove; schedulers; live events as server-sent events that
+  resume from `Last-Event-ID`; `/v1/health`; an OpenAPI 3.1 description at
+  `/v1/openapi.json`. One framework-neutral core (`Api::handle`) behind thin
+  axum and actix adapters, so both behave identically. The routers are
+  plain (`.layer` / `.wrap` middleware works); built-in auth is optional:
+  `Auth::Bearer` (read/admin tokens, constant-time), `Auth::Custom`, or
+  `read_only`. Errors are `{"error":{"code","message"}}` with 400/401/403/
+  404/405/409/413/503. Idempotent reads retry once on a dropped
+  connection. The dashboards are now the API plus the UI
+  (`dashboard::axum_router_with` / `actix_scope_with` take an
+  `ApiConfig`); the 0.2 `/api/*` routes remain as deprecated aliases with
+  their 0.2 shapes.
 
 - `oxn-testkit` and `oxn-load` workspace crates (unpublished), CI
   workflow, `scripts/test-redis.sh`. See `docs/load-results/`.

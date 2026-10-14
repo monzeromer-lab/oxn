@@ -14,6 +14,7 @@
 mod common;
 
 mod add_and_complete;
+mod api;
 mod bulk;
 mod bulk_atomic;
 mod clean_and_promote_all;

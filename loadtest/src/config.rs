@@ -169,6 +169,13 @@ pub struct RunArgs {
     /// Fail the run if first-attempt pickup p99 exceeds this (ms).
     #[arg(long)]
     pub slo_pickup_p99_ms: Option<f64>,
+    /// Drive the run through the HTTP API: it runs in its own process and
+    /// producers add every job with `POST …/jobs/bulk`.
+    #[arg(long)]
+    pub via_api: bool,
+    /// With `--via-api`: concurrent clients hammering the read routes.
+    #[arg(long, default_value_t = 4)]
+    pub api_readers: usize,
     /// Don't record oxn's metrics (no cross-check): for benchmarks, since
     /// the capture recorder keeps every sample.
     #[arg(long)]
@@ -232,6 +239,10 @@ pub struct Config {
     pub rate_limit: Option<(u32, u64)>,
     /// Skip installing the metrics capture recorder.
     pub skip_metrics_check: bool,
+    /// Producers go through the HTTP API.
+    pub via_api: bool,
+    /// Read-route clients with `via_api`.
+    pub api_readers: usize,
 }
 
 fn ser_dur<S: serde::Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
@@ -290,6 +301,8 @@ impl Config {
             ctx_ops: a.ctx_ops,
             rate_limit: a.rate_limit,
             skip_metrics_check: a.skip_metrics_check,
+            via_api: a.via_api,
+            api_readers: a.api_readers,
         };
         match a.scenario {
             Smoke => {}
@@ -415,6 +428,11 @@ impl Config {
         }
         if let Some(ch) = &a.chaos {
             c.chaos = parse_chaos(ch)?;
+        }
+        if c.via_api && c.options_at_queue {
+            anyhow::bail!(
+                "--via-api adds jobs over HTTP, which has no queue defaults: drop --options-at-queue"
+            );
         }
         if c.options_at_queue && matches!(c.retention, Retention::Mixed | Retention::Bounded) {
             anyhow::bail!("--options-at-queue can't express per-job mixed retention");

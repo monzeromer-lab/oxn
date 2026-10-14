@@ -1,4 +1,4 @@
-//! Axum dashboard adapter.
+//! Axum dashboard: the [`crate::api`] routes plus the bundled UI at `/`.
 //!
 //! ```no_run
 //! # async fn demo() -> anyhow::Result<()> {
@@ -15,179 +15,25 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Router;
+use axum::response::Html;
+use axum::routing::get;
 
+use crate::api::{Api, ApiConfig};
 use crate::backend::Backend;
-use crate::dashboard::api::{self, CleanBody, ListQuery, LogsQuery};
-use crate::dashboard::{DASHBOARD_HTML, DashboardState};
-use crate::error::Error;
-use crate::job::JobId;
+use crate::dashboard::DASHBOARD_HTML;
 
-/// Build a [`Router`] mountable on any axum app.
+/// The dashboard with the API unauthenticated (protect it with middleware).
 pub fn router(backend: Arc<dyn Backend>) -> Router {
-    let state = DashboardState::new(backend);
-    Router::new()
-        .route("/", get(index))
-        .route("/api/queues", get(get_queues))
-        .route("/api/queues/:queue/counts", get(get_counts))
-        .route("/api/queues/:queue/jobs", get(get_jobs))
-        .route("/api/queues/:queue/jobs/:id", get(get_job))
-        .route("/api/queues/:queue/jobs/:id/logs", get(get_job_logs))
-        .route("/api/queues/:queue/jobs/:id/retry", post(retry_job))
-        .route("/api/queues/:queue/jobs/:id/promote", post(promote_job))
-        .route("/api/queues/:queue/jobs/:id/remove", post(remove_job))
-        .route("/api/queues/:queue/pause", post(pause_queue))
-        .route("/api/queues/:queue/resume", post(resume_queue))
-        .route("/api/queues/:queue/drain", post(drain_queue))
-        .route("/api/queues/:queue/clean/:state", post(clean_state))
-        .route("/api/queues/:queue/promote-all", post(promote_all_delayed))
-        .with_state(state)
+    router_with(backend, ApiConfig::default())
+}
+
+/// The dashboard with an API configuration (e.g. bearer tokens). The page
+/// itself is static; the data behind it comes from the API.
+pub fn router_with(backend: Arc<dyn Backend>, config: ApiConfig) -> Router {
+    crate::api::axum::router_for(Api::new(backend, config)).route("/", get(index))
 }
 
 async fn index() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
-}
-
-async fn get_queues(State(s): State<DashboardState>) -> Result<Json<serde_json::Value>, AppError> {
-    let v = api::list_queues(&s).await?;
-    Ok(Json(serde_json::to_value(v)?))
-}
-
-async fn get_counts(
-    State(s): State<DashboardState>,
-    Path(queue): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let v = api::queue_counts(&s, &queue).await?;
-    Ok(Json(serde_json::to_value(v)?))
-}
-
-async fn get_jobs(
-    State(s): State<DashboardState>,
-    Path(queue): Path<String>,
-    Query(q): Query<ListQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let v = api::list_jobs(&s, &queue, q).await?;
-    Ok(Json(serde_json::to_value(v)?))
-}
-
-async fn get_job(
-    State(s): State<DashboardState>,
-    Path((queue, id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let v = api::get_job(&s, &queue, &JobId::new(id)).await?;
-    Ok(Json(serde_json::to_value(v)?))
-}
-
-async fn get_job_logs(
-    State(s): State<DashboardState>,
-    Path((queue, id)): Path<(String, String)>,
-    Query(q): Query<LogsQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let v = api::get_job_logs(&s, &queue, &JobId::new(id), q).await?;
-    Ok(Json(serde_json::to_value(v)?))
-}
-
-async fn retry_job(
-    State(s): State<DashboardState>,
-    Path((queue, id)): Path<(String, String)>,
-) -> Result<StatusCode, AppError> {
-    api::retry_job(&s, &queue, &JobId::new(id)).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn promote_job(
-    State(s): State<DashboardState>,
-    Path((queue, id)): Path<(String, String)>,
-) -> Result<StatusCode, AppError> {
-    api::promote_job(&s, &queue, &JobId::new(id)).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn remove_job(
-    State(s): State<DashboardState>,
-    Path((queue, id)): Path<(String, String)>,
-) -> Result<StatusCode, AppError> {
-    api::remove_job(&s, &queue, &JobId::new(id)).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn pause_queue(
-    State(s): State<DashboardState>,
-    Path(queue): Path<String>,
-) -> Result<StatusCode, AppError> {
-    api::pause_queue(&s, &queue).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn resume_queue(
-    State(s): State<DashboardState>,
-    Path(queue): Path<String>,
-) -> Result<StatusCode, AppError> {
-    api::resume_queue(&s, &queue).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(serde::Deserialize, Default)]
-struct DrainBody {
-    #[serde(default)]
-    include_delayed: bool,
-}
-
-async fn drain_queue(
-    State(s): State<DashboardState>,
-    Path(queue): Path<String>,
-    body: Option<Json<DrainBody>>,
-) -> Result<StatusCode, AppError> {
-    let include_delayed = body.map(|b| b.include_delayed).unwrap_or(false);
-    api::drain_queue(&s, &queue, include_delayed).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn clean_state(
-    State(s): State<DashboardState>,
-    Path((queue, job_state)): Path<(String, String)>,
-    body: Option<Json<CleanBody>>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let body = body.map(|b| b.0).unwrap_or_default();
-    let r = api::clean_state(&s, &queue, &job_state, body).await?;
-    Ok(Json(serde_json::to_value(r)?))
-}
-
-async fn promote_all_delayed(
-    State(s): State<DashboardState>,
-    Path(queue): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let r = api::promote_all(&s, &queue).await?;
-    Ok(Json(serde_json::to_value(r)?))
-}
-
-struct AppError(Error);
-
-impl From<Error> for AppError {
-    fn from(e: Error) -> Self {
-        Self(e)
-    }
-}
-
-impl From<serde_json::Error> for AppError {
-    fn from(e: serde_json::Error) -> Self {
-        Self(Error::Serde(e))
-    }
-}
-
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        let status = match &self.0 {
-            Error::NotFound(_) => StatusCode::NOT_FOUND,
-            Error::Config(_) => StatusCode::BAD_REQUEST,
-            e if e.is_conflict() => StatusCode::CONFLICT,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        let body = serde_json::json!({ "error": self.0.to_string() });
-        (status, Json(body)).into_response()
-    }
 }

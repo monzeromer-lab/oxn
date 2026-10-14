@@ -61,6 +61,8 @@ pub struct Outcome {
     pub health_after_cleanup: Option<RedisHealth>,
     pub rows: Vec<Row>,
     pub kills: u32,
+    /// `--via-api`: the API side of the run.
+    pub api: Option<crate::api::ApiReport>,
     /// Long runs (≥ 5 min of load): keys and memory early vs late, after a
     /// warm-up. A leak shows up as growth.
     pub plateau: Option<Plateau>,
@@ -311,6 +313,33 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
     let pq = workload::queue_on(backend.clone(), &queue, workload::queue_defaults(&cfg));
     let next = Arc::new(AtomicU64::new(0));
     let stop_producers = CancellationToken::new();
+    // --via-api: the API in its own process, readers and an SSE follower.
+    let api = if cfg.via_api {
+        Some(Arc::new(crate::api::ApiTarget::start(&oxn_url).await?))
+    } else {
+        None
+    };
+    let stop_api = CancellationToken::new();
+    let sse_counts = Arc::new(Mutex::new(BTreeMap::new()));
+    let mut api_tasks = Vec::new();
+    if let Some(t) = &api {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        api_tasks.push(tokio::spawn(crate::api::follow_events(
+            t.clone(),
+            queue.clone(),
+            sse_counts.clone(),
+            tx,
+            stop_api.clone(),
+        )));
+        let _ = tokio::time::timeout(Duration::from_secs(10), rx).await;
+        for _ in 0..cfg.api_readers {
+            api_tasks.push(tokio::spawn(crate::api::reader(
+                t.clone(),
+                queue.clone(),
+                stop_api.clone(),
+            )));
+        }
+    }
     let mut producers = Vec::new();
     for _ in 0..cfg.producers {
         producers.push(tokio::spawn(workload::producer(
@@ -322,6 +351,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
             seed,
             started,
             stop_producers.clone(),
+            api.clone(),
         )));
     }
 
@@ -634,6 +664,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
                 ),
             ];
             for (name, want, what) in checks {
+                // Via the API, jobs are added in the API server's process,
+                // whose metrics this process doesn't see.
+                if cfg.via_api && name == oxn::metrics::ADDED {
+                    continue;
+                }
                 let got = out[name];
                 if (got - want).abs() > f64::EPSILON {
                     failures.push(format!("oxn metric {name} = {got} but {what} = {want}"));
@@ -645,6 +680,42 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
         }
         out
     });
+    // The API side: its SSE stream must have seen what the raw observer saw.
+    let api_report = if let Some(t) = &api {
+        tokio::time::sleep(Duration::from_millis(500)).await; // last events
+        stop_api.cancel();
+        for task in api_tasks.drain(..) {
+            let _ = task.await;
+        }
+        let sse = sse_counts.lock().clone();
+        let raw = stream_counts.lock().clone();
+        for kind in ["added", "completed", "failed"] {
+            let (a, b) = (
+                sse.get(kind).copied().unwrap_or(0),
+                raw.get(kind).copied().unwrap_or(0),
+            );
+            if a != b && cfg.chaos.is_empty() {
+                failures.push(format!(
+                    "API event stream delivered {a} `{kind}` events, the raw stream has {b}"
+                ));
+            }
+        }
+        let read_errors = t.read_errors.load(std::sync::atomic::Ordering::Relaxed);
+        let add_errors = t.add_errors.load(std::sync::atomic::Ordering::Relaxed);
+        if cfg.chaos.is_empty() && read_errors + add_errors > 0 {
+            failures.push(format!(
+                "{read_errors} API read error(s), {add_errors} add error(s)"
+            ));
+        }
+        Some(crate::api::ApiReport {
+            read_latency: t.reads.summary(),
+            read_errors,
+            add_errors,
+            sse_events: sse,
+        })
+    } else {
+        None
+    };
     let plateau = plateau(&rows.lock(), load_secs);
     if let Some(p) = &plateau {
         // ±5%, ignoring tiny absolute changes on small numbers.
@@ -700,6 +771,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<Outcome> {
         rate_limit_mean_per_window,
         oxn_metrics,
         plateau,
+        api: api_report,
         stream_events: stream_counts.lock().clone(),
         final_sizes,
         retention_findings,
