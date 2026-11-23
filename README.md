@@ -13,7 +13,7 @@ generic typed jobs, events as a `futures::Stream`, builder patterns,
 
 ```toml
 [dependencies]
-oxn = "0.3"
+oxn = "0.4"
 ```
 
 **0.3.0** is a correctness release. Every bug found in a review of 0.2.2
@@ -109,7 +109,7 @@ async fn main() -> oxn::Result<()> {
 
 ```toml
 [dependencies]
-oxn = { version = "0.3", features = ["scheduler", "dashboard-axum", "tls"] }
+oxn = { version = "0.4", features = ["scheduler", "dashboard-axum", "tls"] }
 ```
 
 ## Core concepts
@@ -413,7 +413,7 @@ are not failures. Jobs the stalled scanner fails are reported too.
 `sentry::init` as usual before starting workers. Nothing else is needed:
 
 ```toml
-oxn = { version = "0.3", features = ["sentry"] }
+oxn = { version = "0.4", features = ["sentry"] }
 sentry = "0.46"
 ```
 
@@ -663,7 +663,7 @@ scripts/load-campaign.sh
 
 ## Minimum Rust version
 
-1.85 (edition 2024).
+1.88 (edition 2024).
 
 ## License
 

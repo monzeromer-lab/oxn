@@ -27,7 +27,7 @@ async fn connect_preloads_every_script_so_first_add_is_warm() {
     // Wipe any previously-cached scripts so the test is hermetic.
     let mut admin = redis::Client::open(common::redis_url())
         .unwrap()
-        .get_multiplexed_tokio_connection()
+        .get_multiplexed_async_connection()
         .await
         .unwrap();
     let _: redis::Value = redis::cmd("SCRIPT")
@@ -77,7 +77,7 @@ async fn warmup_is_idempotent_and_recovers_from_script_flush() {
     // Flush the cache out from under the backend.
     let mut admin = redis::Client::open(common::redis_url())
         .unwrap()
-        .get_multiplexed_tokio_connection()
+        .get_multiplexed_async_connection()
         .await
         .unwrap();
     let _: redis::Value = redis::cmd("SCRIPT")
@@ -104,7 +104,7 @@ async fn warmup_preloads_scripts_on_every_pool_connection() {
 
     let mut admin = redis::Client::open(common::redis_url())
         .unwrap()
-        .get_multiplexed_tokio_connection()
+        .get_multiplexed_async_connection()
         .await
         .unwrap();
 

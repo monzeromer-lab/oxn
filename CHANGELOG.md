@@ -6,6 +6,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [SemVer](https://semver.org/) (pre-1.0: minor bumps
 may break public API, patch bumps are fixes/additions only).
 
+## [0.4.0] — Unreleased
+
+0.4.0 moves the Redis backend to `redis` 1.x. Behaviour is unchanged; the
+version is breaking because a `redis` type is part of oxn's public API:
+`Error::Redis` carries a `redis::RedisError`.
+
+### Changed (breaking)
+
+- **`redis` 0.27 → 1.8, `deadpool-redis` 0.18 → 0.23.** Code that
+  matches on the `redis::RedisError` inside `Error::Redis` must use
+  `redis` 1.x as well. redis 0.27 pulled in `rustls-pemfile`, which is
+  unmaintained (RUSTSEC-2025-0134) and fails `cargo deny`; redis 1.x does
+  not depend on it.
+- **MSRV 1.85 → 1.88**, the minimum of `redis` 1.8.
+
+### Changed
+
+- A reply that does not decode into the expected type now converts into
+  `Error::Redis` through a new `From<redis::ParsingError> for Error`
+  (redis 1.x reports decode failures as `ParsingError`, not `RedisError`).
+  Its `kind()` is now `redis::ErrorKind::Parse` instead of `TypeError`.
+- Transient server errors still retry: `LOADING`, `TRYAGAIN` and
+  `MASTERDOWN` — in redis 1.x `ErrorKind::Server(ServerErrorKind::…)` —
+  are treated as transient exactly as before; nothing else was added.
+
 ## [0.3.0] — Unreleased
 
 0.3.0 is a correctness release: every bug found in the 0.2.2 review is

@@ -248,10 +248,10 @@ impl JobReport<'_> {
     pub(crate) fn transition(&self, to: &'static str, r: &crate::Result<()>) {
         crate::worker::log_transition(self.job.queue, to, r);
         #[cfg(feature = "sentry")]
-        if let (Err(e), Some(hub), Some((opts, _))) = (r, &self.hub, &self.reporter.sentry) {
-            if !e.is_lock_lost() {
-                crate::sentry::capture_lost_outcome(hub, opts, &self.job, to, e);
-            }
+        if let (Err(e), Some(hub), Some((opts, _))) = (r, &self.hub, &self.reporter.sentry)
+            && !e.is_lock_lost()
+        {
+            crate::sentry::capture_lost_outcome(hub, opts, &self.job, to, e);
         }
     }
 }
