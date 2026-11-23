@@ -428,7 +428,7 @@ impl Recorder {
             self.stream_cursor = Some(entry.id.clone());
             let mut fields = BTreeMap::new();
             for (k, v) in &entry.map {
-                if let Ok(s) = redis::from_redis_value::<String>(v) {
+                if let Ok(s) = redis::from_redis_value_ref::<String>(v) {
                     fields.insert(k.clone(), s);
                 }
             }

@@ -199,6 +199,16 @@ impl ScriptError {
     }
 }
 
+/// A reply that did not decode into the expected type. redis 1.x reports
+/// these as [`redis::ParsingError`]; they surface as [`Error::Redis`], as
+/// they did before.
+#[cfg(feature = "redis-backend")]
+impl From<redis::ParsingError> for Error {
+    fn from(e: redis::ParsingError) -> Self {
+        Self::Redis(e.into())
+    }
+}
+
 #[cfg(feature = "redis-backend")]
 impl From<deadpool_redis::PoolError> for Error {
     fn from(e: deadpool_redis::PoolError) -> Self {

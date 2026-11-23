@@ -408,12 +408,12 @@ impl Api {
         // command that finds it dead: retry an idempotent read once rather
         // than hand the client a 503. The event stream is long-lived and
         // the backend's subscription reconnects by itself.
-        if read && resp.status == 503 {
-            if let Ok(route) = routes::Route::parse(&req.method, &req.path) {
-                if !matches!(route, routes::Route::Events(_)) {
-                    resp = routes::run(self, route, &req).await;
-                }
-            }
+        if read
+            && resp.status == 503
+            && let Ok(route) = routes::Route::parse(&req.method, &req.path)
+            && !matches!(route, routes::Route::Events(_))
+        {
+            resp = routes::run(self, route, &req).await;
         }
         if legacy && resp.status >= 400 {
             resp = legacy_error(resp);

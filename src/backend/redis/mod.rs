@@ -591,9 +591,11 @@ fn is_transient(e: &Error) -> bool {
                 || r.is_timeout()
                 || matches!(
                     r.kind(),
-                    redis::ErrorKind::BusyLoadingError
-                        | redis::ErrorKind::TryAgain
-                        | redis::ErrorKind::MasterDown
+                    redis::ErrorKind::Server(
+                        redis::ServerErrorKind::BusyLoading
+                            | redis::ServerErrorKind::TryAgain
+                            | redis::ServerErrorKind::MasterDown
+                    )
                 )
         }
         _ => false,
@@ -694,7 +696,7 @@ impl Backend for RedisBackend {
         let reply = self
             .eval(&mut conn, "add_job", queue, explicit, &inv)
             .await?;
-        let id: String = redis::from_redis_value(&reply)?;
+        let id: String = redis::from_redis_value_ref(&reply)?;
         Ok(JobId::new(id))
     }
 
@@ -742,7 +744,7 @@ impl Backend for RedisBackend {
                 .arg(serde_json::to_string(&jobs)?);
             let mut conn = self.conn().await?;
             let reply = self.eval(&mut conn, "add_bulk", queue, None, &inv).await?;
-            let chunk_ids: Vec<String> = redis::from_redis_value(&reply)?;
+            let chunk_ids: Vec<String> = redis::from_redis_value_ref(&reply)?;
             ids.extend(chunk_ids.into_iter().map(JobId::new));
         }
         Ok(ids)
@@ -1036,11 +1038,13 @@ impl Backend for RedisBackend {
         let reply = self
             .eval(&mut conn, "scan_stalled", queue, None, &inv)
             .await?;
-        let (moved, failed): (Vec<String>, Vec<String>) = redis::from_redis_value(&reply)?;
+        let (moved, failed): (Vec<String>, Vec<String>) = redis::from_redis_value_ref(&reply)?;
         Ok(StalledScan {
             requeued: moved.into_iter().map(JobId::new).collect(),
             failed: failed
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|f| StalledJob {
                     id: JobId::new(f[0].clone()),
                     name: f[1].clone(),
@@ -1082,7 +1086,7 @@ impl Backend for RedisBackend {
         loop {
             let mut conn = self.conn().await?;
             let reply = self.eval(&mut conn, "drain", queue, None, &inv).await?;
-            let n: u64 = redis::from_redis_value(&reply)?;
+            let n: u64 = redis::from_redis_value_ref(&reply)?;
             total += n;
             if n < SCRIPT_BATCH {
                 break;
@@ -1113,7 +1117,7 @@ impl Backend for RedisBackend {
         let reply = self
             .eval(&mut conn, "obliterate_begin", queue, None, &inv)
             .await?;
-        let active: u64 = redis::from_redis_value(&reply)?;
+        let active: u64 = redis::from_redis_value_ref(&reply)?;
         if active > 0 {
             return Err(Error::Config(format!(
                 "obliterate: {active} active jobs — pass force=true to proceed"
@@ -1196,7 +1200,7 @@ impl Backend for RedisBackend {
             let reply = self
                 .eval(&mut conn, "promote_all", queue, None, &inv)
                 .await?;
-            let n: u64 = redis::from_redis_value(&reply)?;
+            let n: u64 = redis::from_redis_value_ref(&reply)?;
             total += n;
             if n < SCRIPT_BATCH {
                 return Ok(total);
@@ -1238,7 +1242,7 @@ impl Backend for RedisBackend {
                 .arg(want);
             let mut conn = self.conn().await?;
             let reply = self.eval(&mut conn, "clean", queue, None, &inv).await?;
-            let n: u64 = redis::from_redis_value(&reply)?;
+            let n: u64 = redis::from_redis_value_ref(&reply)?;
             removed += n;
             if n < want {
                 break;
@@ -1334,7 +1338,7 @@ impl Backend for RedisBackend {
         let reply = self
             .eval(&mut conn, "flow", &root_queue, None, &inv)
             .await?;
-        let ids: Vec<String> = redis::from_redis_value(&reply)?;
+        let ids: Vec<String> = redis::from_redis_value_ref(&reply)?;
         Ok(ids.into_iter().map(JobId::new).collect())
     }
 
@@ -1354,7 +1358,7 @@ impl Backend for RedisBackend {
                 inv
             })
             .await?;
-        Ok(redis::from_redis_value::<i64>(&reply)? == 1)
+        Ok(redis::from_redis_value_ref::<i64>(&reply)? == 1)
     }
 
     async fn schedule_tick(&self, queue: &str, tick: SchedulerTick) -> Result<TickOutcome> {
@@ -1409,7 +1413,7 @@ impl Backend for RedisBackend {
         let reply = self
             .eval(&mut conn, "schedule", queue, Some(id.as_str()), &inv)
             .await?;
-        let (status, latest): (String, i64) = redis::from_redis_value(&reply)?;
+        let (status, latest): (String, i64) = redis::from_redis_value_ref(&reply)?;
         Ok(match status.as_str() {
             "added" => TickOutcome::Added(id),
             "removed" => TickOutcome::Removed,
@@ -1449,7 +1453,7 @@ impl Backend for RedisBackend {
         let reply = self
             .eval(&mut conn, "remove_scheduler", queue, None, &inv)
             .await?;
-        Ok(redis::from_redis_value::<i64>(&reply)? >= 1)
+        Ok(redis::from_redis_value_ref::<i64>(&reply)? >= 1)
     }
 
     async fn dependencies(&self, queue: &str, id: &JobId) -> Result<Dependencies> {
@@ -1687,7 +1691,7 @@ impl RedisBackend {
 
 async fn zrange<C>(conn: &mut C, key: String, range: JobRange) -> Result<Vec<String>>
 where
-    C: redis::aio::ConnectionLike + Send,
+    C: redis::aio::ConnectionLike + Send + Sync,
 {
     use redis::AsyncCommands;
     let v: Vec<String> = if range.descending {
@@ -1744,7 +1748,7 @@ where
 /// means rightmost — the next job to run — and descending means newest.
 async fn list_ids<C>(conn: &mut C, key: String, range: JobRange) -> Result<Vec<String>>
 where
-    C: redis::aio::ConnectionLike + Send,
+    C: redis::aio::ConnectionLike + Send + Sync,
 {
     use redis::AsyncCommands;
     if range.descending {
@@ -1834,14 +1838,14 @@ fn parse_fetched(reply: redis::Value, token: &str) -> Result<Moved> {
         Value::Array(a) if a.is_empty() => return Ok(Moved::Empty { next_due: None }),
         // [ 'rl', retryInMs ] — the queue's rate limit is exhausted.
         Value::Array(a) if a.len() == 2 && matches!(a[1], Value::Int(_)) => {
-            let ms: u64 = redis::from_redis_value(&a[1])?;
+            let ms: u64 = redis::from_redis_value_ref(&a[1])?;
             return Ok(Moved::RateLimited {
                 retry_in: Duration::from_millis(ms),
             });
         }
         // [ nextDueMs ] — nothing ready, a delayed job is due in that long.
         Value::Array(a) if a.len() == 1 => {
-            let ms: u64 = redis::from_redis_value(&a[0])?;
+            let ms: u64 = redis::from_redis_value_ref(&a[0])?;
             return Ok(Moved::Empty {
                 next_due: Some(Duration::from_millis(ms)),
             });
@@ -1855,9 +1859,9 @@ fn parse_fetched(reply: redis::Value, token: &str) -> Result<Moved> {
     };
     // Script shape: [ id, hashFieldsArray ]
     let mut it = arr.into_iter();
-    let id: String = redis::from_redis_value(&it.next().unwrap_or(Value::Nil))?;
+    let id: String = redis::from_redis_value_ref(&it.next().unwrap_or(Value::Nil))?;
     let hash_arr: Vec<String> =
-        redis::from_redis_value(&it.next().unwrap_or(Value::Array(vec![])))?;
+        redis::from_redis_value_ref(&it.next().unwrap_or(Value::Array(vec![])))?;
     let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut iter = hash_arr.into_iter();
     while let (Some(k), Some(v)) = (iter.next(), iter.next()) {

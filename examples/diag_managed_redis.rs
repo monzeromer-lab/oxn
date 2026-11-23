@@ -197,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
     // ── isolated SCRIPT LOAD timing — establishes a baseline
     println!("-- raw SCRIPT LOAD timing (no oxn) --");
     let mut conn = redis::Client::open(url.as_str())?
-        .get_multiplexed_tokio_connection()
+        .get_multiplexed_async_connection()
         .await?;
     let body = include_str!("../src/backend/redis/lua/add_job.lua");
     let t = Instant::now();

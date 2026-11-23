@@ -839,7 +839,7 @@ pub async fn observe_stream(
                     let get = |f: &str| {
                         e.map
                             .get(f)
-                            .and_then(|v| redis::from_redis_value::<String>(v).ok())
+                            .and_then(|v| redis::from_redis_value_ref::<String>(v).ok())
                     };
                     let mut event = get("event").unwrap_or_default();
                     // A worker shutting down hands unfinished jobs back:
